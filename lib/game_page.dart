@@ -1,9 +1,10 @@
-// lib/game_page.dart
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
+import 'package:flutter/services.dart' show rootBundle;
 
-import 'engine/game_engine.dart' as eng; // >>>
+// Runtime NN inference (no training here)
+import 'package:flutter_application_1/ai/runtime_policy.dart';
 
 class GamePage extends StatefulWidget {
   const GamePage({super.key});
@@ -14,10 +15,10 @@ class GamePage extends StatefulWidget {
 enum GameStatus { playing, landed, crashed }
 
 class Tunables {
-  double gravity;      // base gravity strength
-  double thrustAccel;  // engine acceleration
-  double rotSpeed;     // radians per second
-  double maxFuel;      // fuel units
+  double gravity;
+  double thrustAccel;
+  double rotSpeed;
+  double maxFuel;
   Tunables({
     this.gravity = 0.18,
     this.thrustAccel = 0.42,
@@ -36,16 +37,18 @@ class Particle {
 class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin {
   late final Ticker _ticker;
 
-  // HUD/controls tunables (mirrors engine Tunables)
+  // Tunables
   final Tunables t = Tunables();
 
-  // World & engine
+  // World & entities
   Size? _worldSize;
-  late eng.GameEngine _engine;               // >>>
-  late eng.EngineConfig _cfg;                // >>>
-
-  // Render/adapter state
-  GameStatus status = GameStatus.playing;
+  Terrain? _terrain;
+  Lander lander = const Lander(
+    position: Offset(160, 120),
+    velocity: Offset.zero,
+    angle: 0,
+    fuel: 100,
+  );
   final List<Particle> _particles = [];
 
   // Input
@@ -53,36 +56,42 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   bool left = false;
   bool right = false;
 
+  // Game state
+  GameStatus status = GameStatus.playing;
+
   // Timing
   late DateTime _last;
+
+  // AI runtime
+  bool aiPlay = false;
+  RuntimePolicy? _ai;
 
   @override
   void initState() {
     super.initState();
     _ticker = createTicker(_onTick)..start();
     _last = DateTime.now();
+    _loadAi();
+  }
+
+  Future<void> _loadAi() async {
+    try {
+      final js = await rootBundle.loadString('assets/ai/policy.json');
+      setState(() {
+        _ai = RuntimePolicy.fromJson(
+          js,
+          fe: RuntimeFeatureExtractor(groundSamples: 3, stridePx: 48),
+        );
+      });
+    } catch (e) {
+      debugPrint('AI policy load failed (ok if you haven\'t trained yet): $e');
+    }
   }
 
   @override
   void dispose() {
     _ticker.dispose();
     super.dispose();
-  }
-
-  void _ensureEngine(Size size, {int seed = 42}) {
-    // Build engine config based on current tunables
-    _cfg = eng.EngineConfig(
-      worldW: size.width,
-      worldH: size.height,
-      t: eng.Tunables(
-        gravity: t.gravity,
-        thrustAccel: t.thrustAccel,
-        rotSpeed: t.rotSpeed,
-        maxFuel: t.maxFuel,
-      ),
-      seed: seed,
-    );
-    _engine = eng.GameEngine(_cfg);
   }
 
   void setPreset(String name) {
@@ -94,19 +103,22 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       } else if (name == 'Hard') {
         t.gravity = 0.22; t.thrustAccel = 0.38; t.rotSpeed = 1.3; t.maxFuel = 80;
       }
-      // Recreate engine with new tunables but same world size
-      final sz = _worldSize ?? const Size(360, 640);
-      _ensureEngine(sz, seed: 42);
-      _particles.clear();
-      status = GameStatus.playing;
+      _reset();
     });
   }
 
   void _reset() {
+    final size = _worldSize ?? const Size(360, 640);
     setState(() {
-      _engine.reset(seed: 42);
-      _particles.clear();
       status = GameStatus.playing;
+      _particles.clear();
+      lander = Lander(
+        position: Offset(size.width * 0.2, 120),
+        velocity: Offset.zero,
+        angle: 0,
+        fuel: t.maxFuel,
+      );
+      if (aiPlay) { thrust = left = right = false; }
     });
   }
 
@@ -116,19 +128,57 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     dt = dt.clamp(0, 1 / 20); // max 50 ms step
     _last = now;
 
-    if (!mounted || _worldSize == null) return;
-    if (status != GameStatus.playing) return;
+    if (!mounted || status != GameStatus.playing || _terrain == null) return;
 
     setState(() {
-      final info = _engine.step(dt, eng.ControlInput(thrust: thrust, left: left, right: right));
+      // AI control
+      if (aiPlay && _ai != null && _terrain != null && _worldSize != null) {
+        try {
+          final (thA, leftA, rightA) = _ai!.act(
+            lander: lander,
+            terrain: _terrain!,
+            worldW: _worldSize!.width,
+            worldH: _worldSize!.height,
+          );
+          thrust = thA;
+          left = leftA;
+          right = rightA;
+        } catch (e, st) {
+          debugPrint('AI act error, disabling AI: $e\n$st');
+          aiPlay = false;
+        }
+      }
 
-      // Particles (UI-only)
-      final lander = _engine.lander;
-      if (thrust && lander.fuel > 0) {
-        final c = math.cos(lander.angle);
-        final s = math.sin(lander.angle);
-        final axis = Offset(-s, c);
-        final flameBase = Offset(lander.pos.x, lander.pos.y) + axis * Lander.halfHeight;
+      // Rotation
+      double angle = lander.angle;
+      final rot = t.rotSpeed * 0.5;
+      if (left && !right) angle -= rot * dt;
+      if (right && !left) angle += rot * dt;
+
+      // Acceleration
+      Offset accel = Offset(0, t.gravity * 0.05);
+      double fuel = lander.fuel;
+      final thrustingNow = thrust && fuel > 0;
+      if (thrustingNow) {
+        accel += Offset(math.sin(angle), -math.cos(angle)) * (t.thrustAccel * 0.05);
+        fuel = (fuel - 20 * dt).clamp(0, t.maxFuel);
+      }
+
+      // Integrate
+      Offset vel = lander.velocity + accel * dt * 60;
+      Offset pos = lander.position + vel * dt * 60;
+
+      // Wrap X
+      final w = _worldSize?.width ?? 360.0;
+      if (pos.dx < 0) pos = Offset(w + pos.dx, pos.dy);
+      if (pos.dx > w) pos = Offset(pos.dx - w, pos.dy);
+
+      // Particles
+      if (thrustingNow) {
+        final c = math.cos(angle);
+        final s = math.sin(angle);
+        final axis = Offset(-s, c); // down in ship frame
+        final flameBase = pos + axis * Lander.halfHeight;
         final rnd = math.Random();
         for (int i = 0; i < 6; i++) {
           final perp = Offset(-c, -s);
@@ -138,135 +188,40 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
           _particles.add(Particle(pos: flameBase, vel: dir * speed, life: 1.0));
         }
       }
+
+      // Update particles
       for (int i = _particles.length - 1; i >= 0; i--) {
         final p = _particles[i];
         p.life -= dt * 1.8;
-        p.vel += const Offset(0, 1.0) * (t.gravity * 0.05 * 0.2); // tiny gravity
+        p.vel += Offset(0, t.gravity * 0.05 * 0.2);
         p.pos += p.vel * dt;
         if (p.life <= 0) _particles.removeAt(i);
       }
 
-      if (info.terminal) {
-        status = (info.status == eng.GameStatus.landed) ? GameStatus.landed : GameStatus.crashed;
+      // Collision
+      final feet = lander.footPoints(pos, angle);
+      final groundYLeft = _terrain!.heightAt(feet.left.dx);
+      final groundYRight = _terrain!.heightAt(feet.right.dx);
+      final groundYCenter = _terrain!.heightAt(pos.dx);
+
+      final collided = feet.left.dy >= groundYLeft ||
+          feet.right.dy >= groundYRight ||
+          pos.dy >= groundYCenter - 2;
+
+      if (collided) {
+        final onPad = _terrain!.isOnPad(pos.dx);
+        final speed = vel.distance;
+        final gentle = speed < 40 && angle.abs() < 0.25;
+        if (onPad && gentle) {
+          status = GameStatus.landed;
+          pos = Offset(pos.dx, _terrain!.padY - Lander.halfHeight);
+          vel = Offset.zero;
+        } else {
+          status = GameStatus.crashed;
+        }
       }
-    });
-  }
 
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(builder: (context, constraints) {
-      final size = Size(constraints.maxWidth, constraints.maxHeight);
-      if (_worldSize == null) {
-        _worldSize = size;
-        _ensureEngine(size, seed: 42);
-      } else {
-        _worldSize = size;
-      }
-
-      // Adapter lander/terrain to painter
-      final lander = _engine.lander;
-      final terrain = _engine.terrain;
-
-      return Stack(
-        children: [
-          // Game canvas
-          Positioned.fill(
-            child: CustomPaint(
-              painter: GamePainter(
-                lander: Lander(
-                  position: Offset(lander.pos.x, lander.pos.y),
-                  velocity: Offset(lander.vel.x, lander.vel.y),
-                  angle: lander.angle,
-                  fuel: lander.fuel,
-                ),
-                terrain: Terrain(
-                  points: terrain.ridge
-                      .map((v) => Offset(v.x, v.y))
-                      .toList(growable: false),
-                  padX1: terrain.padX1,
-                  padX2: terrain.padX2,
-                  padY: terrain.padY,
-                ),
-                thrusting: thrust && lander.fuel > 0 && status == GameStatus.playing,
-                status: status,
-                particles: _particles,
-              ),
-            ),
-          ),
-
-          // HUD
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.all(12.0),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.all(12.0),
-                    child: _menuButton(),
-                  ),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      _hudBox(title: 'Fuel', value: _engine.lander.fuel.toStringAsFixed(0)),
-                      _hudBox(
-                        title: 'Vx/Vy',
-                        value:
-                        '${_engine.lander.vel.x.toStringAsFixed(1)} / ${_engine.lander.vel.y.toStringAsFixed(1)}',
-                      ),
-                      _hudBox(
-                        title: 'Angle',
-                        value: '${(_engine.lander.angle * 180 / math.pi).toStringAsFixed(0)}°',
-                      ),
-                      PopupMenuButton<String>(
-                        icon: const Icon(Icons.tune),
-                        onSelected: setPreset,
-                        itemBuilder: (context) => const [
-                          PopupMenuItem(value: 'Easy', child: Text('Easy')),
-                          PopupMenuItem(value: 'Classic', child: Text('Classic')),
-                          PopupMenuItem(value: 'Hard', child: Text('Hard')),
-                        ],
-                      ),
-                    ],
-                  ),
-                  if (status != GameStatus.playing)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 8.0),
-                      child: Center(
-                        child: ElevatedButton.icon(
-                          onPressed: _reset,
-                          icon: const Icon(Icons.refresh),
-                          label: const Text('Reset'),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ),
-
-          // Controls
-          _buildControls(),
-
-          // Status banner
-          if (status == GameStatus.landed || status == GameStatus.crashed)
-            Center(
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.6),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.white24),
-                ),
-                child: Text(
-                  status == GameStatus.landed ? 'Touchdown! 🟢' : 'Crashed 💥',
-                  style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-                ),
-              ),
-            ),
-        ],
-      );
+      lander = lander.copyWith(position: pos, velocity: vel, angle: angle, fuel: fuel);
     });
   }
 
@@ -297,9 +252,144 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     );
   }
 
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _worldSize = Size(constraints.maxWidth, constraints.maxHeight);
+
+        if (!_worldSize!.width.isFinite || !_worldSize!.height.isFinite) {
+          return const SizedBox.shrink();
+        }
+
+        _terrain ??= Terrain.generate(_worldSize!);
+        if (_terrain == null) {
+          return const SizedBox.shrink();
+        }
+
+        final stack = Stack(
+          children: [
+            // Game canvas
+            Positioned.fill(
+              child: CustomPaint(
+                painter: GamePainter(
+                  lander: lander,
+                  terrain: _terrain!,
+                  thrusting: thrust && lander.fuel > 0 && status == GameStatus.playing,
+                  status: status,
+                  particles: _particles,
+                ),
+              ),
+            ),
+
+            // HUD (top)
+            SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(12.0),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.all(12.0),
+                      child: _menuButton(),
+                    ),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        _hudBox(title: 'Fuel', value: lander.fuel.toStringAsFixed(0)),
+                        _hudBox(
+                          title: 'Vx/Vy',
+                          value: '${lander.velocity.dx.toStringAsFixed(1)} / ${lander.velocity.dy.toStringAsFixed(1)}',
+                        ),
+                        _hudBox(
+                          title: 'Angle',
+                          value: '${(lander.angle * 180 / math.pi).toStringAsFixed(0)}°',
+                        ),
+                        PopupMenuButton<String>(
+                          icon: const Icon(Icons.tune),
+                          onSelected: setPreset,
+                          itemBuilder: (context) => const [
+                            PopupMenuItem(value: 'Easy', child: Text('Easy')),
+                            PopupMenuItem(value: 'Classic', child: Text('Classic')),
+                            PopupMenuItem(value: 'Hard', child: Text('Hard')),
+                          ],
+                        ),
+                        // AI Play toggle (disabled until policy is loaded)
+                        IconButton.filledTonal(
+                          onPressed: (_ai == null)
+                              ? null
+                              : () => setState(() {
+                            aiPlay = !aiPlay;
+                            if (aiPlay) { thrust = left = right = false; }
+                          }),
+                          icon: Icon(aiPlay ? Icons.smart_toy : Icons.smart_toy_outlined),
+                          tooltip: _ai == null ? 'AI policy not loaded' : (aiPlay ? 'Stop AI' : 'AI Play'),
+                        ),
+                      ],
+                    ),
+                    if (status != GameStatus.playing)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8.0),
+                        child: Center(
+                          child: ElevatedButton.icon(
+                            onPressed: _reset,
+                            icon: const Icon(Icons.refresh),
+                            label: const Text('Reset'),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+
+            // Controls (disabled while AI plays)
+            _buildControls(),
+
+            // Status banner
+            if (status == GameStatus.landed || status == GameStatus.crashed)
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.6),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  child: Text(
+                    status == GameStatus.landed ? 'Touchdown! 🟢' : 'Crashed 💥',
+                    style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+
+            // AI status chip (now under a Scaffold -> has Material ancestor)
+            Positioned(
+              top: 8,
+              right: 8,
+              child: Chip(
+                label: Text(_ai == null ? 'AI: not loaded' : (aiPlay ? 'AI: playing' : 'AI: idle')),
+                avatar: Icon(Icons.smart_toy, size: 16, color: aiPlay ? Colors.greenAccent : Colors.white70),
+                backgroundColor: Colors.black.withOpacity(0.35),
+                shape: const StadiumBorder(side: BorderSide(color: Colors.white24)),
+              ),
+            ),
+          ],
+        );
+
+        // ✅ Wrap in Scaffold to provide a Material ancestor (fixes Chip error)
+        return Scaffold(
+          backgroundColor: const Color(0xFF0E141B),
+          body: stack,
+        );
+      },
+    );
+  }
+
   Widget _buildControls() {
     return IgnorePointer(
-      ignoring: status != GameStatus.playing,
+      ignoring: status != GameStatus.playing || aiPlay,
       child: Align(
         alignment: Alignment.bottomCenter,
         child: Padding(
@@ -360,11 +450,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   }
 }
 
-/// ====== Painter layer (unchanged from yours, uses adapter structs) ======
 class Lander {
-  final Offset position; // center
+  final Offset position; // center of mass
   final Offset velocity;
-  final double angle; // radians
+  final double angle; // radians, 0 = up
   final double fuel;
 
   static const double halfWidth = 14;
@@ -376,6 +465,13 @@ class Lander {
     required this.angle,
     required this.fuel,
   });
+
+  Lander copyWith({Offset? position, Offset? velocity, double? angle, double? fuel}) => Lander(
+    position: position ?? this.position,
+    velocity: velocity ?? this.velocity,
+    angle: angle ?? this.angle,
+    fuel: fuel ?? this.fuel,
+  );
 
   ({Offset left, Offset right}) footPoints(Offset pos, double ang) {
     final c = math.cos(ang);
@@ -389,11 +485,47 @@ class Lander {
 }
 
 class Terrain {
-  final List<Offset> points;
+  final List<Offset> points; // polyline ridge
   final double padX1;
   final double padX2;
   final double padY;
+
   Terrain({required this.points, required this.padX1, required this.padX2, required this.padY});
+
+  static Terrain generate(Size size) {
+    final rnd = math.Random(42);
+    final width = size.width;
+    final height = size.height;
+
+    // Ridge
+    final List<Offset> pts = [];
+    const int segments = 24;
+    for (int i = 0; i <= segments; i++) {
+      final x = width * i / segments;
+      final base = height * 0.78;
+      final noise = (math.sin(i * 0.8) + rnd.nextDouble() * 0.5) * 24.0;
+      pts.add(Offset(x, base + noise));
+    }
+
+    // Landing pad
+    final padWidth = width * 0.16;
+    final padCenterX = width * (0.35 + rnd.nextDouble() * 0.3);
+    final padX1 = (padCenterX - padWidth / 2).clamp(10.0, width - padWidth - 10.0);
+    final padX2 = padX1 + padWidth;
+    final padY = height * 0.76;
+
+    for (int i = 0; i < pts.length; i++) {
+      if (pts[i].dx >= padX1 && pts[i].dx <= padX2) {
+        pts[i] = Offset(pts[i].dx, padY);
+      }
+    }
+
+    // Ends lower for valley look
+    pts[0] = Offset(0, height * 0.92);
+    pts[pts.length - 1] = Offset(width, height * 0.92);
+
+    return Terrain(points: pts, padX1: padX1, padX2: padX2, padY: padY);
+  }
 
   double heightAt(double x) {
     final pts = points;
@@ -428,11 +560,16 @@ class GamePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    _paintStars(canvas, size);
-    _paintTerrain(canvas, size);
-    _paintPad(canvas);
-    _paintParticles(canvas);
-    _paintLander(canvas);
+    try {
+      _paintStars(canvas, size);
+      _paintTerrain(canvas, size);
+      _paintPad(canvas);
+      _paintParticles(canvas);
+      _paintLander(canvas);
+    } catch (e, st) {
+      // Debug aid: avoid the red overlay and log the error
+      debugPrint('Painter error: $e\n$st');
+    }
   }
 
   void _paintStars(Canvas canvas, Size size) {
@@ -473,14 +610,19 @@ class GamePainter extends CustomPainter {
     canvas.drawPath(ridge, outline);
   }
 
+  // Safe pad drawing
   void _paintPad(Canvas canvas) {
-    final padRect = Rect.fromLTWH(
-      terrain.padX1,
-      terrain.padY - 4,
-      (terrain.padX2 - terrain.padX1),
-      8,
-    );
-    final paint = Paint()..color = status == GameStatus.crashed ? Colors.red : Colors.greenAccent;
+    double x1 = terrain.padX1;
+    double x2 = terrain.padX2;
+    final y = terrain.padY;
+    if (!x1.isFinite || !x2.isFinite || !y.isFinite) return;
+    if (x2 < x1) { final t = x1; x1 = x2; x2 = t; }
+    final w = x2 - x1;
+    if (w <= 0) return;
+
+    final padRect = Rect.fromLTWH(x1, y - 4, w, 8);
+    final paint = Paint()
+      ..color = status == GameStatus.crashed ? Colors.red : Colors.greenAccent;
     canvas.drawRRect(RRect.fromRectAndRadius(padRect, const Radius.circular(4)), paint);
   }
 
@@ -514,19 +656,21 @@ class GamePainter extends CustomPainter {
 
     if (thrusting && lander.fuel > 0) {
       final flameBase = lander.position + rot(const Offset(0, Lander.halfHeight));
-      final flameTip  = lander.position + rot(const Offset(0, Lander.halfHeight + 22));
+      final flameTip = lander.position + rot(const Offset(0, Lander.halfHeight + 22));
       final flamePaint = Paint()
         ..shader = const RadialGradient(colors: [Colors.yellow, Colors.deepOrange]).createShader(
           Rect.fromCircle(center: flameBase, radius: 24),
         );
       final flamePath = Path()
         ..moveTo(flameBase.dx - 6, flameBase.dy)
-        ..quadraticBezierTo(flameTip.dx, flameTip.dy, flameBase.dx + 6, flameBase.dy)
+        ..quadraticBezierTo(flameBase.dx, flameTip.dy, flameBase.dx + 6, flameBase.dy)
         ..close();
       canvas.drawPath(flamePath, flamePaint);
     }
 
-    final shipPaint = Paint()..color = Colors.white.withOpacity(0.9);
+    final shipPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = Colors.white.withOpacity(0.9);
     canvas.drawPath(path, shipPaint);
 
     final cockpit = Paint()..color = Colors.lightBlueAccent.withOpacity(0.9);
@@ -549,11 +693,11 @@ class GamePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant GamePainter old) {
-    return old.lander != lander ||
-        old.terrain != terrain ||
-        old.thrusting != thrusting ||
-        old.status != status ||
-        old.particles != particles;
+  bool shouldRepaint(covariant GamePainter oldDelegate) {
+    return oldDelegate.lander != lander ||
+        oldDelegate.terrain != terrain ||
+        oldDelegate.thrusting != thrusting ||
+        oldDelegate.status != status ||
+        oldDelegate.particles != particles;
   }
 }

@@ -31,12 +31,13 @@ class Tunables {
     double? thrustAccel,
     double? rotSpeed,
     double? maxFuel,
-  }) => Tunables(
-    gravity: gravity ?? this.gravity,
-    thrustAccel: thrustAccel ?? this.thrustAccel,
-    rotSpeed: rotSpeed ?? this.rotSpeed,
-    maxFuel: maxFuel ?? this.maxFuel,
-  );
+  }) =>
+      Tunables(
+        gravity: gravity ?? this.gravity,
+        thrustAccel: thrustAccel ?? this.thrustAccel,
+        rotSpeed: rotSpeed ?? this.rotSpeed,
+        maxFuel: maxFuel ?? this.maxFuel,
+      );
 }
 
 class EngineConfig {
@@ -46,19 +47,19 @@ class EngineConfig {
   final int seed;
   final double stepScale;
 
-  // Curriculum
+  // Curriculum / difficulty knobs
   final double padWidthFactor;
   final double landingSpeedMax;
   final double landingAngleMaxRad;
 
   // Per-step shaping
   final double livingCost;
-  final double effortCost;   // ↓ lower so thrust isn’t discouraged
-  final double wDx;          // |dx-to-pad|
-  final double wDy;          // NEW: |dy to padY|
-  final double wVyDown;      // ↓/↑ tuning falling speed
-  final double wVx;          // |vx|^2
-  final double wAngleDeg;    // |angle(deg)|
+  final double effortCost; // effort per step scales with throttle
+  final double wDx;        // |dx-to-pad|
+  final double wDy;        // |dy to padY|
+  final double wVyDown;    // downward speed^2 weight
+  final double wVx;        // |vx|^2
+  final double wAngleDeg;  // |angle(deg)|
 
   const EngineConfig({
     required this.worldW,
@@ -71,12 +72,12 @@ class EngineConfig {
     this.landingAngleMaxRad = 0.25,
 
     this.livingCost = 0.002,
-    this.effortCost = 0.0003,   // was 0.001
+    this.effortCost = 0.0, //0.0001, // small so thrust isn't discouraged
     this.wDx = 0.0025,
-    this.wDy = 0.0020,          // NEW
-    this.wVyDown = 0.020,       // was 0.005 -> stronger
+    this.wDy = 0.0020,
+    this.wVyDown = 0.025,     // stronger penalty for falling too fast
     this.wVx = 0.0015,
-    this.wAngleDeg = 0.03,
+    this.wAngleDeg = 0.025,   // slightly reduced so it's willing to rotate
   });
 }
 
@@ -103,12 +104,13 @@ class LanderState {
     Vec2? vel,
     double? angle,
     double? fuel,
-  }) => LanderState(
-    pos: pos ?? this.pos,
-    vel: vel ?? this.vel,
-    angle: angle ?? this.angle,
-    fuel: fuel ?? this.fuel,
-  );
+  }) =>
+      LanderState(
+        pos: pos ?? this.pos,
+        vel: vel ?? this.vel,
+        angle: angle ?? this.angle,
+        fuel: fuel ?? this.fuel,
+      );
 
   ({Vec2 left, Vec2 right}) footPoints() {
     final c = math.cos(angle);
@@ -129,8 +131,7 @@ class Terrain {
 
   Terrain(this.ridge, this.padX1, this.padX2, this.padY);
 
-  static Terrain generate(double width, double height,
-      {int seed = 42, double padWidthFactor = 1.0}) {
+  static Terrain generate(double width, double height, {int seed = 42, double padWidthFactor = 1.0}) {
     final rnd = math.Random(seed);
     final List<Vec2> pts = [];
     const int segments = 24;
@@ -148,11 +149,8 @@ class Terrain {
     final padY = height * 0.76;
 
     for (int i = 0; i < pts.length; i++) {
-      if (pts[i].x >= padX1 && pts[i].x <= padX2) {
-        pts[i] = Vec2(pts[i].x, padY);
-      }
+      if (pts[i].x >= padX1 && pts[i].x <= padX2) pts[i] = Vec2(pts[i].x, padY);
     }
-    // ends lower
     pts[0] = Vec2(0, height * 0.92);
     pts[pts.length - 1] = Vec2(width, height * 0.92);
 
@@ -176,9 +174,18 @@ class Terrain {
   double get padCenter => (padX1 + padX2) * 0.5;
 }
 
+/// Backward-compatible control input.
+/// - If you set [throttle] in [0,1], the engine uses it.
+/// - Otherwise it falls back to [thrust] ? 1.0 : 0.0
 class ControlInput {
-  final bool thrust, left, right;
-  const ControlInput({this.thrust = false, this.left = false, this.right = false});
+  final bool thrust, left, right; // legacy flags (UI)
+  final double throttle;          // 0..1 (AI)
+  const ControlInput({
+    this.thrust = false,
+    this.left = false,
+    this.right = false,
+    this.throttle = 0.0,
+  });
 }
 
 class StepInfo {
@@ -187,7 +194,7 @@ class StepInfo {
   final double speed;
   final double angleAbs;
   final bool onPad;
-  final double costDelta;  // >= 0
+  final double costDelta; // >= 0
   const StepInfo({
     required this.status,
     required this.terminal,
@@ -212,13 +219,8 @@ class GameEngine {
   }
 
   void reset({int? seed}) {
-    final s = seed ?? _rnd.nextInt(1 << 31);
-    terrain = Terrain.generate(
-      cfg.worldW,
-      cfg.worldH,
-      seed: s,
-      padWidthFactor: cfg.padWidthFactor,
-    );
+    final seedValue = seed ?? _rnd.nextInt(1 << 31);
+    terrain = Terrain.generate(cfg.worldW, cfg.worldH, seed: seedValue, padWidthFactor: cfg.padWidthFactor);
     status = GameStatus.playing;
     cost = 0.0;
     lander = LanderState(
@@ -237,24 +239,29 @@ class GameEngine {
     final dt = dtSeconds.clamp(0.0, 1 / 20.0);
     final t = cfg.t;
 
-    // Rotation
+    // Rotation from discrete turn buttons
     double angle = lander.angle;
     final rot = t.rotSpeed * 0.5;
     if (input.left && !input.right) angle -= rot * dt;
     if (input.right && !input.left) angle += rot * dt;
 
-    // Accel
+    // Throttle power (AI continuous or legacy boolean)
+    double power = input.throttle;
+    if (power <= 0.0) power = input.thrust ? 1.0 : 0.0;
+    power = power.clamp(0.0, 1.0);
+
+    // Accel with gravity and throttle-based thrust
     Vec2 accel = Vec2(0, t.gravity * 0.05);
     double fuel = lander.fuel;
-    final thrustingNow = input.thrust && fuel > 0;
-    if (thrustingNow) {
+    final bool canThrust = power > 0.0 && fuel > 0.0;
+    if (canThrust) {
       final ax = math.sin(angle);
       final ay = -math.cos(angle);
-      accel = accel + Vec2(ax, ay) * (t.thrustAccel * 0.05);
-      fuel = (fuel - 20 * dt).clamp(0, t.maxFuel);
+      accel = accel + Vec2(ax, ay) * (t.thrustAccel * 0.05 * power);
+      fuel = (fuel - (20 * power * dt)).clamp(0, t.maxFuel);
     }
 
-    // Integrate
+    // Integrate (semi-implicit Euler; keep 60x time scale)
     final vel = lander.vel + accel * (dt * cfg.stepScale);
     Vec2 pos = lander.pos + vel * (dt * cfg.stepScale);
 
@@ -266,65 +273,76 @@ class GameEngine {
     // -------- Shaping cost each step (dense signal) --------
     double stepCost = 0.0;
     stepCost += cfg.livingCost;
-    if (thrustingNow) stepCost += cfg.effortCost;
+    stepCost += cfg.effortCost * power;
 
     final dx = (pos.x - terrain.padCenter).abs();
-    final dy = (pos.y - terrain.padY).abs(); // NEW: vertical distance to pad height
+    final dy = (pos.y - terrain.padY).abs();
     final vx = vel.x;
     final vy = vel.y;
     final angleDeg = (angle.abs() * 180 / math.pi);
 
-    // Penalize distance to target, falling too fast, horizontal speed, tilt
     stepCost += cfg.wDx * dx;
-    stepCost += cfg.wDy * dy;               // NEW
+    stepCost += cfg.wDy * dy;
     if (vy > 0) stepCost += cfg.wVyDown * (vy * vy);
     stepCost += cfg.wVx * (vx * vx);
     stepCost += cfg.wAngleDeg * angleDeg;
 
     // -------- Collision detection --------
     final feet = _footPointsAt(pos, angle);
-    final groundYLeft   = terrain.heightAt(feet.$1.x);
-    final groundYRight  = terrain.heightAt(feet.$2.x);
+    final groundYLeft = terrain.heightAt(feet.$1.x);
+    final groundYRight = terrain.heightAt(feet.$2.x);
     final groundYCenter = terrain.heightAt(pos.x);
-    final collided = (feet.$1.y >= groundYLeft) ||
-        (feet.$2.y >= groundYRight) ||
-        (pos.y >= groundYCenter - 2);
+    final collided =
+        (feet.$1.y >= groundYLeft) || (feet.$2.y >= groundYRight) || (pos.y >= groundYCenter - 2);
 
     final speedNow = vel.length;
     final angleAbs = angle.abs();
 
     if (collided) {
-      final onPad  = terrain.isOnPad(pos.x);
+      final onPad = terrain.isOnPad(pos.x);
       final gentle = speedNow < cfg.landingSpeedMax && angleAbs < cfg.landingAngleMaxRad;
 
       if (onPad && gentle) {
         status = GameStatus.landed;
         pos = Vec2(pos.x, terrain.padY - LanderGeom.halfHeight);
 
-        // Small terminal landing cost (prefer slow, straight, centered, fuel saved)
+        // Small terminal landing cost
         final fuelN = (fuel / cfg.t.maxFuel).clamp(0.0, 1.0);
         final centerOffset = (pos.x - terrain.padCenter).abs();
-        final landingCost =
-            0.01 * speedNow * speedNow
-                + 0.05 * angleDeg
-                + 0.002 * centerOffset
-                + 0.40 * (1.0 - fuelN);
+        final landingCost = 0.01 * speedNow * speedNow +
+            0.05 * angleDeg +
+            0.002 * centerOffset +
+            0.40 * (1.0 - fuelN);
 
         stepCost += landingCost.clamp(0.0, 1e6);
         cost += stepCost;
 
         lander = lander.copyWith(pos: pos, vel: Vec2.zero(), angle: angle, fuel: fuel);
-        return StepInfo(status: status, terminal: true, speed: speedNow, angleAbs: angleAbs, onPad: true, costDelta: stepCost);
+        return StepInfo(
+          status: status,
+          terminal: true,
+          speed: speedNow,
+          angleAbs: angleAbs,
+          onPad: true,
+          costDelta: stepCost,
+        );
       } else {
         status = GameStatus.crashed;
 
-        // Crash cost: big but not astronomical; worse with speed+tilt
+        // Crash cost: worse with speed+tilt
         final crashCost = 120.0 + 0.03 * speedNow * speedNow + 0.6 * angleDeg;
         stepCost += crashCost.clamp(0.0, 1e9);
         cost += stepCost;
 
         lander = lander.copyWith(pos: pos, vel: Vec2.zero(), angle: angle, fuel: fuel);
-        return StepInfo(status: status, terminal: true, speed: speedNow, angleAbs: angleAbs, onPad: onPad, costDelta: stepCost);
+        return StepInfo(
+          status: status,
+          terminal: true,
+          speed: speedNow,
+          angleAbs: angleAbs,
+          onPad: onPad,
+          costDelta: stepCost,
+        );
       }
     }
 
@@ -359,7 +377,7 @@ class GameEngine {
     final s = math.sin(ang);
     final bottomCenter = Vec2(pos.x, pos.y + LanderGeom.halfHeight);
     Vec2 rot(Vec2 v) => Vec2(c * v.x - s * v.y, s * v.x + c * v.y);
-    final leftLocal  = Vec2(-LanderGeom.halfWidth, 0);
+    final leftLocal = Vec2(-LanderGeom.halfWidth, 0);
     final rightLocal = Vec2(LanderGeom.halfWidth, 0);
     return (bottomCenter + rot(leftLocal), bottomCenter + rot(rightLocal));
   }
