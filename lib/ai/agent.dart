@@ -4,8 +4,8 @@ import '../engine/game_engine.dart' as eng;
 
 /// -------- Feature Extraction (state -> input vector) --------
 class FeatureExtractor {
-  final int groundSamples; // e.g., 5 samples around x with stridePx
-  final double stridePx;   // e.g., 40 px
+  final int groundSamples; // e.g., 3 samples around x with stridePx
+  final double stridePx;   // e.g., 48 px
   FeatureExtractor({this.groundSamples = 3, this.stridePx = 48});
 
   List<double> extract(eng.GameEngine e) {
@@ -32,9 +32,9 @@ class FeatureExtractor {
     final slope = (((gyR - gyL) / 40.0) / 0.5).clamp(-2.0, 2.0);
 
     // Local ground samples (relative height around lander)
-    final int n = groundSamples;
+    final n = groundSamples;
     final half = (n - 1) ~/ 2;
-    final List<double> samples = [];
+    final samples = <double>[];
     for (int i = -half; i <= half; i++) {
       final sx = (L.pos.x + i * stridePx).clamp(0.0, cfg.worldW);
       final sy = T.heightAt(sx);
@@ -49,7 +49,7 @@ class FeatureExtractor {
     ];
   }
 
-  int get inputSize => 11 + groundSamples; // updated for sin/cos
+  int get inputSize => 11 + groundSamples; // includes sin/cos
 }
 
 /// --------- Tiny Math helpers ----------
@@ -97,13 +97,13 @@ List<double> reluVec(List<double> v) => v.map(relu).toList();
 List<double> softmax(List<double> z) {
   final m = z.reduce((a,b)=>a>b?a:b);
   double sum = 0.0;
-  final e = List<double>.filled(z.length, 0);
+  final e = List<double>.filled(z.length, 0.0);
   for (int i=0;i<z.length;i++) { e[i] = math.exp(z[i]-m); sum += e[i]; }
   for (int i=0;i<z.length;i++) e[i] /= (sum + 1e-12);
   return e;
 }
 
-/// --------- Policy Network (2 hidden layers, thrust Bernoulli + turn 3-class) ----------
+/// --------- Policy Network (trunk + thrust Bernoulli + turn 3-class) ----------
 class PolicyNetwork {
   final int inputSize;
   final int h1;
@@ -172,33 +172,60 @@ extension PolicyOps on PolicyNetwork {
     // turn logits (3-class)
     final turnLogits = vecAdd(matVec(W_turn, h2v), b_turn);
 
-    // Priors to encourage sensible exploration (optional but helpful)
-    // 1) steer toward pad horizontally based on dx sign
-    final kDx = 0.4;
-    turnLogits[1] += (dx > 0 ? kDx : -kDx) * dx.abs(); // left if pad is left
-    turnLogits[2] += (dx < 0 ? kDx : -kDx) * dx.abs(); // right if pad is right
-    // 2) attitude prior: if tilted right (angle>0), nudge LEFT; vice versa
-    final sign = angle >= 0 ? 1.0 : -1.0;
-    final angN = (angle.abs() / (math.pi / 2)).clamp(0.0, 1.0);
-    const kAng = 0.6;
-    turnLogits[1] += (sign > 0 ? kAng : -kAng) * angN; // left if tilted right
-    turnLogits[2] += (sign < 0 ? kAng : -kAng) * angN; // right if tilted left
+    // Optional priors to encourage sensible exploration
+    // 1) steer toward pad horizontally based on dx sign (small)
+    const kDx = 0.2;
+    const dxDead = 0.05;
+    if (dx.abs() > dxDead) {
+      turnLogits[1] += (dx > 0 ? kDx : -kDx) * dx.abs(); // left if pad is left
+      turnLogits[2] += (dx < 0 ? kDx : -kDx) * dx.abs(); // right if pad is right
+    }
+    // 2) attitude prior: if tilted right (angle>0), nudge LEFT; vice versa (small)
+    const kAng = 0.3;
+    const angDead = 5 * math.pi / 180;
+    if (angle.abs() > angDead) {
+      final sign = angle >= 0 ? 1.0 : -1.0;
+      final angN = (angle.abs() / (math.pi / 2)).clamp(0.0, 1.0);
+      turnLogits[1] += (sign > 0 ? kAng : -kAng) * angN;
+      turnLogits[2] += (sign < 0 ? kAng : -kAng) * angN;
+    }
 
     final turnP = softmax(turnLogits);
     return _Forward(x, z1, h1v, z2, h2v, thrLogits, thrP, turnLogits, turnP);
   }
 
+  /// Temperature sampling: tThr for thrust, tTurn for turn (softmax).
   (bool thrust, bool left, bool right, List<double> probsThr, List<double> probsTurn, _Forward cache)
-  act(List<double> x, math.Random rnd, {double angle = 0.0, double dx = 0.0}) {
+  act(List<double> x, math.Random rnd, {double angle = 0.0, double dx = 0.0, double tThr = 1.0, double tTurn = 1.0}) {
     final f = _forward(x, angle: angle, dx: dx);
-    final thr = rnd.nextDouble() < f.thrP[0];
+
+    // Thrust temperature: scale the logit
+    final Tt = tThr.clamp(0.2, 5.0);
+    final thrLogit = f.thrLogits[0] / Tt;
+    final thrP = 1.0 / (1.0 + math.exp(-thrLogit));
+    final thr = rnd.nextDouble() < thrP;
+
+    // Turn temperature: scale logits before softmax
+    final logits = List<double>.from(f.turnLogits);
+    final Tr = tTurn.clamp(0.2, 5.0);
+    for (int i = 0; i < logits.length; i++) logits[i] /= Tr;
+
+    // softmax
+    final m = logits.reduce((a,b)=>a>b?a:b);
+    double sum = 0.0;
+    final e = List<double>.filled(logits.length, 0.0);
+    for (int i=0;i<logits.length;i++) { e[i] = math.exp(logits[i]-m); sum += e[i]; }
+    for (int i=0;i<e.length;i++) e[i] /= (sum + 1e-12);
+
+    // sample class
     int cls = 0;
     final r = rnd.nextDouble();
     double c = 0.0;
-    for (int i = 0; i < 3; i++) { c += f.turnP[i]; if (r <= c) { cls = i; break; } }
+    for (int i = 0; i < 3; i++) { c += e[i]; if (r <= c) { cls = i; break; } }
     final left = cls == 1;
     final right = cls == 2;
-    return (thr, left, right, f.thrP, f.turnP, f);
+
+    return (thr, left, right, [thrP], e, f);
   }
 
   void updateFromEpisode({
@@ -323,9 +350,16 @@ class Trainer {
     int seed = 7,
   }) : rnd = math.Random(seed);
 
-  EpisodeResult runEpisode({bool train = true, double lr = 3e-4}) {
-    // For overfit/debug we keep terrain & spawn locked via cfg; still randomize seed if you like
-    env.reset(seed: 1337);
+  EpisodeResult runEpisode({
+    bool train = true,
+    double lr = 3e-4,
+    double tThr = 1.0,
+    double tTurn = 1.0,
+    bool addLandingBonus = true,
+    double landingBonus = 30.0,
+  }) {
+//    env.reset(seed: 1337); // terrain & spawn may be locked via cfg
+    env.reset(seed: rnd.nextInt(1 << 30));
 
     final caches = <_Forward>[];
     final actions = <List<int>>[];  // [thr(0/1), turnCls]
@@ -334,11 +368,11 @@ class Trainer {
     int safety = 0;
     while (true) {
       final x = fe.extract(env);
-      // Pass angle and dx for priors consistency
       final angle = env.lander.angle;
       final dx = (env.lander.pos.x - env.terrain.padCenter) / env.cfg.worldW;
 
-      final (th, lf, rt, probsThr, probsTurn, cache) = policy.act(x, rnd, angle: angle, dx: dx);
+      final (th, lf, rt, _, __, cache) =
+      policy.act(x, rnd, angle: angle, dx: dx, tThr: tThr, tTurn: tTurn);
       final turnCls = lf ? 1 : (rt ? 2 : 0);
 
       final info = env.step(dt, eng.ControlInput(thrust: th, left: lf, right: rt));
@@ -351,12 +385,17 @@ class Trainer {
       if (info.terminal || safety > 4000) break;
     }
 
-    // Compute discounted returns (we minimize cost -> use negative returns)
+    // Discounted returns (we minimize cost -> negative costs)
     final G = List<double>.filled(costs.length, 0.0);
     double running = 0.0;
     for (int t = costs.length - 1; t >= 0; t--) {
       running = -costs[t] + gamma * running;
       G[t] = running;
+    }
+
+    // Terminal landing bonus to make success pop out
+    if (addLandingBonus && env.status == eng.GameStatus.landed && G.isNotEmpty) {
+      G[G.length - 1] += landingBonus;
     }
 
     if (train && caches.isNotEmpty) {

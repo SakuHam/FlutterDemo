@@ -37,6 +37,10 @@ class Particle {
 class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin {
   late final Ticker _ticker;
 
+  final math.Random _uiRnd = math.Random();     // UI RNG for runtime randomness
+  int _terrainSeed = DateTime.now().microsecondsSinceEpoch;
+  bool _useFixedSeed = false; // flip to true if you want deterministic level
+
   // Tunables
   final Tunables t = Tunables();
 
@@ -114,16 +118,24 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
   void _reset() {
     final size = _worldSize ?? const Size(360, 640);
+
+    if (!_useFixedSeed) {
+      _terrainSeed = DateTime.now().microsecondsSinceEpoch ^ _uiRnd.nextInt(1 << 30);
+      _terrain = Terrain.generate(size, seed: _terrainSeed);
+    }
+
     setState(() {
       status = GameStatus.playing;
       _particles.clear();
+
+      // --- randomize spawn X (20%..80% screen width) ---
+      final fracX = 0.20 + _uiRnd.nextDouble() * 0.60;
       lander = Lander(
-        position: Offset(size.width * 0.2, 120),
+        position: Offset(size.width * fracX, 120),
         velocity: Offset.zero,
         angle: 0,
         fuel: t.maxFuel,
       );
-      if (aiPlay) { thrust = left = right = false; }
     });
   }
 
@@ -273,6 +285,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     return LayoutBuilder(
       builder: (context, constraints) {
         _worldSize = Size(constraints.maxWidth, constraints.maxHeight);
+        _terrain ??= Terrain.generate(
+          _worldSize!,
+          seed: _useFixedSeed ? 12345 : _terrainSeed,
+        );
 
         if (!_worldSize!.width.isFinite || !_worldSize!.height.isFinite) {
           return const SizedBox.shrink();
@@ -508,8 +524,8 @@ class Terrain {
 
   Terrain({required this.points, required this.padX1, required this.padX2, required this.padY});
 
-  static Terrain generate(Size size) {
-    final rnd = math.Random(42);
+  static Terrain generate(Size size, {int? seed}) {
+    final rnd = math.Random(seed ?? DateTime.now().microsecondsSinceEpoch);
     final width = size.width;
     final height = size.height;
 
@@ -523,7 +539,7 @@ class Terrain {
       pts.add(Offset(x, base + noise));
     }
 
-    // Landing pad
+    // Landing pad (unchanged, but uses rnd)
     final padWidth = width * 0.16;
     final padCenterX = width * (0.35 + rnd.nextDouble() * 0.3);
     final padX1 = (padCenterX - padWidth / 2).clamp(10.0, width - padWidth - 10.0);

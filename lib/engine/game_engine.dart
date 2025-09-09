@@ -78,6 +78,10 @@ class EngineConfig {
   final double ceilingPenaltyPerSec;   // cost/sec when fully at the top
   final double ceilingHitPenalty;      // one-shot when clamping at the top
 
+  final bool randomSpawnX;   // if true, pick X uniformly in [spawnXMin, spawnXMax]
+  final double spawnXMin;    // fraction of worldW (0..1)
+  final double spawnXMax;    // fraction of worldW (0..1)
+
   EngineConfig({
     required this.worldW,
     required this.worldH,
@@ -99,9 +103,9 @@ class EngineConfig {
     this.borderMargin = 30.0,
     this.borderPenaltyPerSec = 2.0,
     this.wrapPenalty = 20.0,
-    this.lockTerrain = true,
+    this.lockTerrain = false,
     this.terrainSeed = 12345,
-    this.lockSpawn = true,
+    this.lockSpawn = false,
     this.spawnX = 0.25,
     this.spawnY = 120.0,
     this.spawnVx = 0.0,
@@ -111,6 +115,9 @@ class EngineConfig {
     this.ceilingMargin = 40.0,
     this.ceilingPenaltyPerSec = 3.0,
     this.ceilingHitPenalty = 10.0,
+    this.randomSpawnX = true,
+    this.spawnXMin = 0.15,
+    this.spawnXMax = 0.85,
   });
 
   EngineConfig copyWith({
@@ -146,6 +153,9 @@ class EngineConfig {
     double? ceilingMargin,
     double? ceilingPenaltyPerSec,
     double? ceilingHitPenalty,
+    bool? randomSpawnX,
+    double? spawnXMin,
+    double? spawnXMax,
   }) {
     return EngineConfig(
       worldW: worldW ?? this.worldW,
@@ -180,6 +190,9 @@ class EngineConfig {
       ceilingMargin: ceilingMargin ?? this.ceilingMargin,
       ceilingPenaltyPerSec: ceilingPenaltyPerSec ?? this.ceilingPenaltyPerSec,
       ceilingHitPenalty: ceilingHitPenalty ?? this.ceilingHitPenalty,
+      randomSpawnX: randomSpawnX ?? this.randomSpawnX,
+      spawnXMin: spawnXMin ?? this.spawnXMin,
+      spawnXMax: spawnXMax ?? this.spawnXMax,
     );
   }
 }
@@ -328,10 +341,12 @@ class GameEngine {
     double? landingSpeedMax,
     double? landingAngleMaxRad,
   }) {
+    // Only reseed if a seed is explicitly provided
     if (seed != null) {
-      _rnd = math.Random(seed); // Random has no setSeed
+      _rnd = math.Random(seed);
     }
-    // Update optional curriculum overrides
+
+    // Apply optional curriculum overrides
     if (padWidthFactor != null || landingSpeedMax != null || landingAngleMaxRad != null) {
       cfg = cfg.copyWith(
         padWidthFactor: padWidthFactor ?? cfg.padWidthFactor,
@@ -348,17 +363,28 @@ class GameEngine {
       terrain = Terrain.generate(cfg.worldW, cfg.worldH, _rnd.nextInt(1 << 30), cfg.padWidthFactor);
     }
 
-    // Spawn
+    // ---- Spawn X (always honor randomSpawnX when enabled) ----
+    double fracX;
+    if (cfg.randomSpawnX) {
+      final a = cfg.spawnXMin.clamp(0.0, 1.0);
+      final b = cfg.spawnXMax.clamp(0.0, 1.0);
+      final lo = math.min(a, b), hi = math.max(a, b);
+      fracX = lo + _rnd.nextDouble() * (hi - lo);
+    } else {
+      fracX = cfg.spawnX; // fixed fraction (0..1)
+    }
+
+    // Build lander state; lockSpawn controls Y/vel/angle/fuel only
     if (cfg.lockSpawn) {
       lander = LanderState(
-        pos: Vector2(cfg.worldW * cfg.spawnX, cfg.spawnY),
+        pos: Vector2(cfg.worldW * fracX, cfg.spawnY),
         vel: Vector2(cfg.spawnVx, cfg.spawnVy),
         angle: cfg.spawnAngle,
         fuel: cfg.t.maxFuel,
       );
     } else {
       lander = LanderState(
-        pos: Vector2(cfg.worldW * 0.2, 120),
+        pos: Vector2(cfg.worldW * fracX, cfg.spawnY),
         vel: Vector2(0, 0),
         angle: 0.0,
         fuel: cfg.t.maxFuel,
