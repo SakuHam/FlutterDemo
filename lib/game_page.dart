@@ -219,10 +219,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                         title: 'Angle',
                         value: '${(_engine.lander.angle * 180 / math.pi).toStringAsFixed(0)}°',
                       ),
-                      _hudBox(
-                        title: 'Score', // >>> NEW
-                        value: _engine.score.toStringAsFixed(0),
-                      ),
                       PopupMenuButton<String>(
                         icon: const Icon(Icons.tune),
                         onSelected: setPreset,
