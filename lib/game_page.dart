@@ -84,6 +84,9 @@ class Particle {
 class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin {
   late final Ticker _ticker;
 
+  static const double kLandingSpeedMax = 5.0;                 // was 40.0
+  static const double kLandingAngleMaxRad = 8 * math.pi / 180; // was ~14.3° (0.25 rad)
+
   // Tunables
   Tunables t = Tunables();
 
@@ -359,7 +362,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       if (collided) {
         final onPad = _terrain!.isOnPad(pos.dx);
         final speed = vel.distance;
-        final gentle = speed < 40 && angle.abs() < 0.25;
+        final gentle = speed <= kLandingSpeedMax && angle.abs() <= kLandingAngleMaxRad;
         if (onPad && gentle) {
           status = GameStatus.landed;
           pos = Offset(pos.dx, _terrain!.padY - Lander.halfHeight);

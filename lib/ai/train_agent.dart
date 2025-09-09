@@ -8,7 +8,6 @@ import 'agent.dart'
     FeatureExtractor,
     PolicyNetwork,
     Trainer,
-    // matrix helpers only if you need them elsewhere (not required here)
     relu,
     reluVec,
     sigmoid,
@@ -26,19 +25,11 @@ Future<void> _writePrettyJson(String path, Map<String, dynamic> js) async {
   stdout.writeln('Saved policy → $path');
 }
 
-/// Convert dynamic JSON -> List<List<double>>
 List<List<double>> _mat(dynamic m) => (m as List)
-    .map<List<double>>(
-      (r) => (r as List).map<double>((x) => (x as num).toDouble()).toList(),
-)
+    .map<List<double>>((r) => (r as List).map<double>((x) => (x as num).toDouble()).toList())
     .toList();
+List<double> _vec(dynamic v) => (v as List).map<double>((x) => (x as num).toDouble()).toList();
 
-/// Convert dynamic JSON -> List<double>
-List<double> _vec(dynamic v) =>
-    (v as List).map<double>((x) => (x as num).toDouble()).toList();
-
-/// Load weights into an existing or (if needed) re-created network.
-/// Returns (policy, feGroundSamples, feStridePx).
 (PolicyNetwork policy, int gs, double stride) _loadPolicyInto(
     PolicyNetwork policy,
     Map<String, dynamic> js,
@@ -47,37 +38,27 @@ List<double> _vec(dynamic v) =>
   final h1J = js['h1'] as int? ?? policy.h1;
   final h2J = js['h2'] as int? ?? policy.h2;
 
-  // Rebuild the net if shapes differ
   if (policy.inputSize != inputSizeJ || policy.h1 != h1J || policy.h2 != h2J) {
     policy = PolicyNetwork(inputSize: inputSizeJ, h1: h1J, h2: h2J, seed: 1234);
   }
 
-  // Mandatory weights (new head layout)
-  policy.W1 = _mat(js['W1']);
-  policy.b1 = _vec(js['b1']);
-  policy.W2 = _mat(js['W2']);
-  policy.b2 = _vec(js['b2']);
+  policy.W1 = _mat(js['W1']); policy.b1 = _vec(js['b1']);
+  policy.W2 = _mat(js['W2']); policy.b2 = _vec(js['b2']);
 
   if (js.containsKey('W_thr') && js.containsKey('W_turn')) {
-    policy.W_thr = _mat(js['W_thr']);
-    policy.b_thr = _vec(js['b_thr']);
-    policy.W_turn = _mat(js['W_turn']);
-    policy.b_turn = _vec(js['b_turn']);
+    policy.W_thr = _mat(js['W_thr']); policy.b_thr = _vec(js['b_thr']);
+    policy.W_turn = _mat(js['W_turn']); policy.b_turn = _vec(js['b_turn']);
   } else {
-    throw ArgumentError(
-      'Policy JSON is missing W_thr/W_turn heads. Make sure you exported the newer format.',
-    );
+    throw ArgumentError('Policy JSON is missing W_thr/W_turn heads.');
   }
 
-  // Feature-extractor settings baked in the JSON (fallbacks if absent)
   final fe = (js['fe'] as Map<String, dynamic>?) ?? const {};
-  final gs = (fe['groundSamples'] as int?) ?? 3;
+  final gs = (fe['groundSamples'] as int?) ?? (inputSizeJ - 10); // fallback if missing
   final stride = (fe['stridePx'] as num?)?.toDouble() ?? 48.0;
 
   return (policy, gs, stride);
 }
 
-/// Save policy + the FE settings you actually trained with.
 Future<void> _savePolicy(
     String path,
     PolicyNetwork p,
@@ -103,22 +84,30 @@ Future<void> _savePolicy(
 }
 
 void main(List<String> args) async {
-  // ---- CLI flags ----
-  // Usage examples:
-  //   dart run lib/ai/train_agent.dart
-  //   dart run lib/ai/train_agent.dart --init=policy_bc_init.json
-  //   dart run lib/ai/train_agent.dart --iters=2000 --save_every=100
+  // CLI
   String? initPath;
   int iters = 20000;
   int saveEvery = 50;
+  int batch = 16;              // K episodes per outer iteration
+  double baseLr = 3e-4;        // per-outer LR, per-ep LR = baseLr / batch
+  double tempThr = 0.9;        // exploration temps
+  double tempTurn = 1.2;
+  double epsilon = 0.05;       // ε-greedy
+  double entropyBeta = 0.003;  // entropy bonus
 
   for (final a in args) {
-    if (a.startsWith('--init=')) initPath = a.substring('--init='.length).trim();
-    if (a.startsWith('--iters=')) iters = int.parse(a.substring('--iters='.length));
-    if (a.startsWith('--save_every=')) saveEvery = int.parse(a.substring('--save_every='.length));
+    if (a.startsWith('--init=')) initPath = a.substring(7).trim();
+    if (a.startsWith('--iters=')) iters = int.parse(a.substring(8));
+    if (a.startsWith('--save_every=')) saveEvery = int.parse(a.substring(13));
+    if (a.startsWith('--batch=')) batch = int.parse(a.substring(8));
+    if (a.startsWith('--lr=')) baseLr = double.parse(a.substring(5));
+    if (a.startsWith('--temp_thr=')) tempThr = double.parse(a.substring(11));
+    if (a.startsWith('--temp_turn=')) tempTurn = double.parse(a.substring(12));
+    if (a.startsWith('--eps=')) epsilon = double.parse(a.substring(6));
+    if (a.startsWith('--entropy=')) entropyBeta = double.parse(a.substring(10));
   }
 
-  // ---- Engine config (keep it Flutter-free) ----
+  // Engine config (Flutter-free)
   final cfg = eng.EngineConfig(
     t: eng.Tunables(
       gravity: 0.18,
@@ -128,43 +117,40 @@ void main(List<String> args) async {
     ),
     worldW: 360,
     worldH: 640,
-    lockTerrain: false,       // random terrain by default (set true to overfit)
-    terrainSeed: 12345,       // used only when lockTerrain=true
-    lockSpawn: true,          // fixed Y/vel/angle, X still random if randomSpawnX=true
+    lockTerrain: false,
+    terrainSeed: 12345,
+    lockSpawn: false,
     randomSpawnX: true,
     spawnXMin: 0.20,
     spawnXMax: 0.80,
-    // landing tolerances same as your latest engine
-    landingSpeedMax: 40.0,
-    landingAngleMaxRad: 0.25,
-    // cost weights (tune as you like)
+    landingSpeedMax: 12.0,                         // stricter landing
+    landingAngleMaxRad: 8 * math.pi / 180.0,
     wDx: 200.0,
     wDy: 180.0,
     wVx: 90.0,
-    wVyDown: 160.0,
+    wVyDown: 200.0,                                // higher with stricter landings
     wAngleDeg: 80.0,
-//    wFuel: 0.05,
-//    wOutOfBounds: 600.0,
-//    wOffPad: 250.0,
-//    wTiltWrongWay: 45.0,
   );
 
   final env = eng.GameEngine(cfg);
 
-  // ---- Feature Extractor (defaults; may be overwritten by init policy) ----
+  // Feature Extractor defaults
   int feGS = 3;
   double feStride = 48.0;
-  final fe = FeatureExtractor(groundSamples: feGS, stridePx: feStride);
 
-  // ---- Policy ----
-  var policy = PolicyNetwork(inputSize: fe.inputSize, h1: 64, h2: 64, seed: 1234);
+  // Policy
+  var policy = PolicyNetwork(
+    inputSize: FeatureExtractor(groundSamples: feGS, stridePx: feStride).inputSize,
+    h1: 64,
+    h2: 64,
+    seed: 1234,
+  );
 
-  // ---- Try to load an init policy ----
+  // Load init (BC or previous)
   Map<String, dynamic>? initJs;
   if (initPath != null && await File(initPath).exists()) {
     initJs = await _readJson(initPath!);
   } else {
-    // Auto fallback: try policy_bc_init.json then policy.json if no --init provided
     if (await File('policy_bc_init.json').exists()) {
       initJs = await _readJson('policy_bc_init.json');
     } else if (await File('policy.json').exists()) {
@@ -173,27 +159,37 @@ void main(List<String> args) async {
   }
 
   if (initJs != null) {
-    // Load into policy (may rebuild shapes)
     final loaded = _loadPolicyInto(policy, initJs);
     policy = loaded.$1;
     feGS = loaded.$2;
     feStride = loaded.$3;
 
-    // Rebuild FE to match the loaded policy’s baked settings
-    final fe2 = FeatureExtractor(groundSamples: feGS, stridePx: feStride);
-    if (fe2.inputSize != policy.inputSize) {
-      // If input size still mismatches, the JSON and your FeatureExtractor code disagree.
+    // If FE size still mismatches, FORCE-align FE to the policy:
+    final expectedGS = policy.inputSize - 10;
+    if (feGS != expectedGS) {
       stderr.writeln(
-          'WARNING: loaded policy.inputSize=${policy.inputSize} but FE.inputSize=${fe2.inputSize}. '
-              'Adjust FeatureExtractor or the policy JSON fe settings so they match.');
+        'WARNING: FE(gs=$feGS) -> aligning to policy.inputSize=${policy.inputSize} (gs=$expectedGS).',
+      );
+      feGS = expectedGS;
     }
-    stdout.writeln(
-        'Loaded init policy. h1=${policy.h1} h2=${policy.h2} | FE(gs=$feGS stride=$feStride)');
+
+    // final consistency check
+    final feCheck = FeatureExtractor(groundSamples: feGS, stridePx: feStride);
+    if (feCheck.inputSize != policy.inputSize) {
+      stderr.writeln(
+        'ERROR: FeatureExtractor.inputSize=${feCheck.inputSize} but policy.inputSize=${policy.inputSize}. '
+            'Adjust code/JSON so they match.',
+      );
+      // hard stop to avoid runtime RangeError
+      exit(1);
+    }
+
+    stdout.writeln('Loaded init policy. h1=${policy.h1} h2=${policy.h2} | FE(gs=$feGS stride=$feStride)');
   } else {
     stdout.writeln('No init policy found; training from scratch.');
   }
 
-  // ---- Trainer ----
+  // Trainer
   final rnd = math.Random(7);
   final trainer = Trainer(
     env: env,
@@ -202,30 +198,58 @@ void main(List<String> args) async {
     dt: 1 / 60.0,
     gamma: 0.99,
     seed: 13,
+    tempThr: tempThr,
+    tempTurn: tempTurn,
+    epsilon: epsilon,
+    entropyBeta: entropyBeta,
   );
 
-  // ---- Training loop ----
+  // Training loop (batched)
   double bestCost = double.infinity;
-  int landedCount = 0;
+  double bestLandRate = 0.0;
+  int landedTotal = 0;
+  final landWindow = <bool>[];
+  const landWindowSize = 200;
 
   for (int it = 1; it <= iters; it++) {
-    // IMPORTANT: reseed env each episode so spawn X randomizes even if terrain is locked
-    env.reset(seed: rnd.nextInt(1 << 30));
+    final epLr = baseLr / batch;
+    double lastCost = 0.0;
+    int lastSteps = 0;
+    bool lastLanded = false;
 
-    final ep = trainer.runEpisode(train: true, lr: 3e-4);
+    for (int k = 0; k < batch; k++) {
+      env.reset(seed: rnd.nextInt(1 << 30));
+      final ep = trainer.runEpisode(train: true, lr: epLr);
 
-    if (ep.landed) landedCount++;
-    final epCost = ep.totalCost;
-    if (epCost < bestCost) {
-      bestCost = epCost;
-      await _savePolicy('policy_best_cost.json', policy, trainer.fe.inputSize, feGS, feStride);
+      lastCost = ep.totalCost;
+      lastSteps = ep.steps;
+      lastLanded = ep.landed;
+
+      if (ep.landed) landedTotal++;
+      landWindow.add(ep.landed);
+      if (landWindow.length > landWindowSize) landWindow.removeAt(0);
+
+      if (ep.totalCost < bestCost) {
+        bestCost = ep.totalCost;
+        await _savePolicy('policy_best_cost.json', policy, trainer.fe.inputSize, feGS, feStride);
+      }
     }
 
     if (it % 5 == 0) {
-      final landRate = (landedCount / it * 100).toStringAsFixed(1);
+      final landRate = landWindow.isEmpty
+          ? 0.0
+          : (landWindow.where((x) => x).length / landWindow.length * 100.0);
+
+      if (landRate > bestLandRate) {
+        bestLandRate = landRate;
+        await _savePolicy('policy_best_land.json', policy, trainer.fe.inputSize, feGS, feStride);
+      }
+
       stdout.writeln(
-          'Iter $it | last-ep steps: ${ep.steps} | cost: ${epCost.toStringAsFixed(3)} '
-              '| landed: ${ep.landed ? 'Y' : 'N'} | best(cost): ${bestCost.toStringAsFixed(3)} | land%: $landRate');
+        'Iter $it | batch=$batch | last-ep steps: $lastSteps | cost: ${lastCost.toStringAsFixed(3)} '
+            '| landed: ${lastLanded ? 'Y' : 'N'} | best(cost): ${bestCost.toStringAsFixed(3)} '
+            '| land%(${landWindowSize})=${landRate.toStringAsFixed(1)} | best(land%)=${bestLandRate.toStringAsFixed(1)}',
+      );
     }
 
     if (it % saveEvery == 0) {
@@ -233,7 +257,6 @@ void main(List<String> args) async {
     }
   }
 
-  // Final save
   await _savePolicy('policy.json', policy, trainer.fe.inputSize, feGS, feStride);
   stdout.writeln('Done. Best cost: ${bestCost.toStringAsFixed(3)}');
 }

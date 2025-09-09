@@ -82,6 +82,11 @@ class EngineConfig {
   final double spawnXMin;    // fraction of worldW (0..1)
   final double spawnXMax;    // fraction of worldW (0..1)
 
+  final double wThrustAssist;   // bonus when thrusting while descending (px/s scaled)
+  final double wTurnAssist;     // bonus when turning to reduce |angle| (rad scaled)
+  final double wPadAlignAssist; // bonus when turning toward pad (dx scaled)
+  final double wIdlePenalty;    // penalty for doing nothing while descending fast
+
   EngineConfig({
     required this.worldW,
     required this.worldH,
@@ -118,6 +123,10 @@ class EngineConfig {
     this.randomSpawnX = true,
     this.spawnXMin = 0.15,
     this.spawnXMax = 0.85,
+    this.wThrustAssist = 0.25,
+    this.wTurnAssist = 0.20,
+    this.wPadAlignAssist = 0.10,
+    this.wIdlePenalty = 0.10,
   });
 
   EngineConfig copyWith({
@@ -547,6 +556,52 @@ class GameEngine {
         cost += 120.0;
       }
     }
+
+// --- Existing penalties (position/velocity/angle/fuel/etc) ---
+// double costDelta = ... your current shaping ...
+
+// ===== Action-aware shaping (bonuses & a small idle penalty) =====
+    const double vyCap = 120.0;                  // scale for descent speed
+    const double angCap = math.pi / 4;           // 45° scale for angle correction
+    final double dxDead = 0.03 * cfg.worldW;     // deadzone for pad alignment
+    const double angDead = 5 * math.pi / 180.0;  // 5° deadzone for angle correction
+
+    // (A) Thrust-assist bonus when descending
+    if (u.thrust && vel.y > 0) {
+      final vyN = (vel.y / vyCap).clamp(0.0, 1.0); // 0..1 for 0..vyCap
+      cost -= cfg.wThrustAssist * vyN;
+    }
+
+    // (B) Turn-assist bonus when turning toward upright (reduce |angle|)
+    if (angle > angDead && u.left) {
+      final aN = ((angle - angDead) / angCap).clamp(0.0, 1.0);
+      cost -= cfg.wTurnAssist * aN;
+    } else if (angle < -angDead && u.right) {
+      final aN = (((-angle) - angDead) / angCap).clamp(0.0, 1.0);
+      cost -= cfg.wTurnAssist * aN;
+    }
+
+    // (C) Pad-align bonus when turning toward the pad horizontally
+    final dx = (pos.x - terrain.padCenter);
+    if (dx.abs() > dxDead) {
+      if (dx > 0 && u.left) {
+        // pad is to the left → turning left helps
+        final dN = ((dx.abs() - dxDead) / (0.5 * cfg.worldW)).clamp(0.0, 1.0);
+        cost -= cfg.wPadAlignAssist * dN;
+      } else if (dx < 0 && u.right) {
+        // pad is to the right → turning right helps
+        final dN = ((dx.abs() - dxDead) / (0.5 * cfg.worldW)).clamp(0.0, 1.0);
+        cost -= cfg.wPadAlignAssist * dN;
+      }
+    }
+
+    // (D) Idle penalty when falling fast & not acting
+    if (!u.thrust && !u.left && !u.right && vel.y > 80) {
+      final vN = ((vel.y - 80) / (vyCap - 80)).clamp(0.0, 1.0);
+      cost += cfg.wIdlePenalty * vN;
+    }
+
+    if (cost < 0) cost = 0.0;
 
     // Commit state
     lander = LanderState(pos: pos, vel: vel, angle: angle, fuel: fuel);
