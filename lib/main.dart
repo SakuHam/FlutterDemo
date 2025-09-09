@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'game.dart';
+import 'game_page.dart';
 import 'app_grid.dart';
 import 'music.dart';
 
