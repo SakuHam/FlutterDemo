@@ -302,7 +302,10 @@ class PPOTrainer {
         final thrP = action.$4;
         final turnP = action.$5;
         final cache = action.$6; // contains value via forward pass
-        final info = env.step(dt, eng.ControlInput(throttle: power, left: turnC == 1, right: turnC == 2));
+        final info = env.step(
+          dt,
+          eng.ControlInput(thrust: power > 0.0, left: turnC == 1, right: turnC == 2),
+        );
 
         // Store transition
         _states.add(s);
