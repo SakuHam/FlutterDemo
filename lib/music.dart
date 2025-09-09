@@ -1,6 +1,9 @@
 // music.dart
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:audio_session/audio_session.dart';
+import 'package:just_audio/just_audio.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -13,20 +16,38 @@ class MusicPage extends StatefulWidget {
 
 class _MusicPageState extends State<MusicPage> {
   late Future<List<File>> _mp3sFuture;
-  bool _deepScan = false; // optional: scan whole /storage/emulated/0 if no results
+  bool _deepScan = false;
+
+  // --- player state ---
+  final AudioPlayer _player = AudioPlayer();
+  List<File> _playlist = const [];
+  int _currentIndex = -1; // index into _playlist
 
   @override
   void initState() {
     super.initState();
+    _setupAudioSession();
     _mp3sFuture = _loadMp3s();
+    // keep UI in sync with player’s currentIndex
+    _player.currentIndexStream.listen((i) {
+      if (i == null) return;
+      setState(() => _currentIndex = i);
+    });
   }
 
-  Future<void> _refresh() async {
-    setState(() => _mp3sFuture = _loadMp3s());
+  Future<void> _setupAudioSession() async {
+    final session = await AudioSession.instance;
+    await session.configure(const AudioSessionConfiguration.music());
   }
 
+  @override
+  void dispose() {
+    _player.dispose();
+    super.dispose();
+  }
+
+  // ---------- permissions & scanning ----------
   Future<PermissionStatus> _ensureAudioPermission() async {
-    // Android 13+: READ_MEDIA_AUDIO; Older: READ_EXTERNAL_STORAGE
     final audio = await Permission.audio.request();
     if (audio.isGranted) return PermissionStatus.granted;
     final storage = await Permission.storage.request();
@@ -38,9 +59,8 @@ class _MusicPageState extends State<MusicPage> {
   }
 
   List<Directory> _preferredAndroidDirs(List<Directory> platformMusicDirs) {
-    // Build a prioritized list of candidate dirs (no duplicates)
     final seen = <String>{};
-    final add = (Directory d) {
+    Directory? Function(Directory) add = (Directory d) {
       final path = d.path;
       if (path.isEmpty) return null;
       if (seen.add(path)) return d;
@@ -49,13 +69,11 @@ class _MusicPageState extends State<MusicPage> {
 
     final dirs = <Directory>[];
 
-    // 1) Platform Music directories
     for (final d in platformMusicDirs) {
       final added = add(d);
       if (added != null) dirs.add(added);
     }
 
-    // 2) Common fallbacks
     final fallbacks = <String>[
       '/storage/emulated/0/Music',
       '/storage/emulated/0/Download',
@@ -70,7 +88,6 @@ class _MusicPageState extends State<MusicPage> {
       }
     }
 
-    // 3) Optional deep scan root (only if explicitly enabled)
     if (_deepScan) {
       final root = Directory('/storage/emulated/0');
       if (root.existsSync()) {
@@ -83,7 +100,6 @@ class _MusicPageState extends State<MusicPage> {
   }
 
   bool _isHiddenOrSandbox(String path) {
-    // Skip app sandboxes & hidden dirs for speed/noise
     if (path.contains('/Android/')) return true;
     final segs = path.split('/');
     return segs.any((s) => s.startsWith('.'));
@@ -99,21 +115,14 @@ class _MusicPageState extends State<MusicPage> {
       throw 'Permission to read audio was denied.';
     }
 
-    // 1) Ask platform for Music directories
     List<Directory> musicDirs = [];
     try {
       final dirs = await getExternalStorageDirectories(type: StorageDirectory.music);
-      if (dirs != null) {
-        musicDirs = dirs.whereType<Directory>().toList();
-      }
-    } catch (_) {
-      // ignore
-    }
+      if (dirs != null) musicDirs = dirs.whereType<Directory>().toList();
+    } catch (_) {}
 
-    // 2) Build candidate list
     final candidates = _preferredAndroidDirs(musicDirs);
 
-    // 3) Scan + dedupe by canonical path
     final seenFiles = <String>{};
     final found = <File>[];
 
@@ -121,7 +130,6 @@ class _MusicPageState extends State<MusicPage> {
       if (_isHiddenOrSandbox(dir.path)) continue;
 
       try {
-        // Shallow-to-deep: recursive=true; followLinks=false to avoid loops
         await for (final entity in dir.list(recursive: true, followLinks: false)) {
           if (entity is! File) continue;
 
@@ -132,22 +140,18 @@ class _MusicPageState extends State<MusicPage> {
             final real = await File(raw).resolveSymbolicLinks();
             if (seenFiles.add(real)) found.add(File(real));
           } catch (_) {
-            // If cannot resolve, dedupe on raw path
             if (seenFiles.add(raw)) found.add(entity);
           }
         }
-      } catch (_) {
-        // ignore per-dir IO/permission errors
-      }
+      } catch (_) {}
     }
 
-    // If nothing found AND deep scan was off, try once with deep scan on
     if (found.isEmpty && !_deepScan) {
       _deepScan = true;
       return _loadMp3s();
     }
 
-    // Sort nicely: by folder then filename
+    // Sort by folder then filename
     found.sort((a, b) {
       final ap = p.dirname(a.path).toLowerCase();
       final bp = p.dirname(b.path).toLowerCase();
@@ -157,6 +161,30 @@ class _MusicPageState extends State<MusicPage> {
     });
 
     return found;
+  }
+
+  Future<void> _refresh() async {
+    setState(() => _mp3sFuture = _loadMp3s());
+  }
+
+  // ---------- playback helpers ----------
+  Future<void> _playList(List<File> files, int startIndex) async {
+    if (files.isEmpty || startIndex < 0 || startIndex >= files.length) return;
+
+    _playlist = files;
+    final sources = files
+        .map((f) => AudioSource.uri(Uri.file(f.path)))
+        .toList(growable: false);
+
+    await _player.setAudioSource(ConcatenatingAudioSource(children: sources),
+        initialIndex: startIndex);
+    await _player.play();
+    setState(() => _currentIndex = startIndex);
+  }
+
+  String _currentTitle() {
+    if (_currentIndex < 0 || _currentIndex >= _playlist.length) return '';
+    return p.basename(_playlist[_currentIndex].path);
   }
 
   @override
@@ -182,59 +210,228 @@ class _MusicPageState extends State<MusicPage> {
           )
         ],
       ),
-      body: FutureBuilder<List<File>>(
-        future: _mp3sFuture,
-        builder: (context, snap) {
-          if (snap.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          if (snap.hasError) {
-            return _ErrorView(
-              message: '${snap.error}',
-              onOpenSettings: () => openAppSettings(),
-              onRetry: _refresh,
-            );
-          }
-          final files = snap.data ?? const [];
-          if (files.isEmpty) {
-            return _EmptyView(onRetry: _refresh, deepScan: _deepScan, onToggleDeep: () {
-              setState(() => _deepScan = true);
-              _refresh();
-            });
-          }
+      body: Column(
+        children: [
+          Expanded(
+            child: FutureBuilder<List<File>>(
+              future: _mp3sFuture,
+              builder: (context, snap) {
+                if (snap.connectionState == ConnectionState.waiting) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                if (snap.hasError) {
+                  return _ErrorView(
+                    message: '${snap.error}',
+                    onOpenSettings: () => openAppSettings(),
+                    onRetry: _refresh,
+                  );
+                }
+                final files = snap.data ?? const [];
+                if (files.isEmpty) {
+                  return _EmptyView(
+                    onRetry: _refresh,
+                    deepScan: _deepScan,
+                    onToggleDeep: () {
+                      setState(() => _deepScan = true);
+                      _refresh();
+                    },
+                  );
+                }
 
-          return RefreshIndicator(
-            onRefresh: _refresh,
-            child: ListView.separated(
-              physics: const AlwaysScrollableScrollPhysics(),
-              itemCount: files.length,
-              separatorBuilder: (_, __) => const Divider(height: 1, thickness: 0.5),
-              itemBuilder: (context, i) {
-                final f = files[i];
-                final name = p.basename(f.path);
-                final folder = p.dirname(f.path);
-                return ListTile(
-                  leading: const Icon(Icons.music_note),
-                  title: Text(name, overflow: TextOverflow.ellipsis),
-                  subtitle: Text(folder, maxLines: 1, overflow: TextOverflow.ellipsis),
-                  onTap: () {
-                    // Hook a player later (just_audio/audioplayers).
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('Selected: $name')),
-                    );
-                  },
+                return RefreshIndicator(
+                  onRefresh: _refresh,
+                  child: ListView.separated(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    itemCount: files.length,
+                    separatorBuilder: (_, __) =>
+                    const Divider(height: 1, thickness: 0.5),
+                    itemBuilder: (context, i) {
+                      final f = files[i];
+                      final name = p.basename(f.path);
+                      final folder = p.dirname(f.path);
+                      final isPlayingThis =
+                          _currentIndex == i && _player.playing;
+
+                      return ListTile(
+                        leading: Icon(
+                          isPlayingThis ? Icons.equalizer : Icons.music_note,
+                        ),
+                        title: Text(name, overflow: TextOverflow.ellipsis),
+                        subtitle: Text(folder,
+                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                        onTap: () => _playList(files, i),
+                      );
+                    },
+                  ),
                 );
               },
             ),
-          );
-        },
+          ),
+          _PlayerBar(
+            player: _player,
+            titleBuilder: _currentTitle,
+            hasQueue: () => _playlist.length > 1,
+          ),
+        ],
       ),
     );
   }
 }
 
+// ---------------- mini player widget ----------------
+
+class _PlayerBar extends StatefulWidget {
+  const _PlayerBar({
+    required this.player,
+    required this.titleBuilder,
+    required this.hasQueue,
+  });
+
+  final AudioPlayer player;
+  final String Function() titleBuilder;
+  final bool Function() hasQueue;
+
+  @override
+  State<_PlayerBar> createState() => _PlayerBarState();
+}
+
+class _PlayerBarState extends State<_PlayerBar> {
+  double? _dragValue;
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<PlayerState>(
+      stream: widget.player.playerStateStream,
+      builder: (context, stateSnap) {
+        final playerState = stateSnap.data;
+        final playing = playerState?.playing ?? false;
+
+        return Material(
+          color: const Color(0xFF121820),
+          elevation: 12,
+          child: SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // --- title & controls row
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          widget.titleBuilder(),
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton(
+                        tooltip: 'Previous',
+                        onPressed: widget.hasQueue()
+                            ? () => widget.player.seekToPrevious()
+                            : null,
+                        icon: const Icon(Icons.skip_previous),
+                      ),
+                      IconButton(
+                        tooltip: playing ? 'Pause' : 'Play',
+                        onPressed: () async {
+                          if (playing) {
+                            await widget.player.pause();
+                          } else {
+                            await widget.player.play();
+                          }
+                        },
+                        iconSize: 32,
+                        icon: Icon(playing ? Icons.pause : Icons.play_arrow),
+                      ),
+                      IconButton(
+                        tooltip: 'Next',
+                        onPressed: widget.hasQueue()
+                            ? () => widget.player.seekToNext()
+                            : null,
+                        icon: const Icon(Icons.skip_next),
+                      ),
+                      IconButton(
+                        tooltip: 'Stop',
+                        onPressed: () => widget.player.stop(),
+                        icon: const Icon(Icons.stop),
+                      ),
+                    ],
+                  ),
+// --- position slider
+                  StreamBuilder<Duration>(
+                    stream: widget.player.positionStream,
+                    builder: (context, posSnap) {
+                      final position = posSnap.data ?? Duration.zero;
+                      final duration = widget.player.duration ?? Duration.zero;
+
+                      // Always use doubles for Slider
+                      final double sliderMax = duration.inMilliseconds.toDouble().isFinite
+                          ? duration.inMilliseconds.toDouble()
+                          : 0.0;
+
+                      double sliderValue = (_dragValue ?? position.inMilliseconds.toDouble());
+                      if (!sliderValue.isFinite) sliderValue = 0.0;
+                      sliderValue = sliderValue.clamp(0.0, sliderMax).toDouble();
+
+                      // Avoid showing a dead slider when no track loaded
+                      if (duration == Duration.zero) {
+                        return const SizedBox.shrink();
+                      }
+
+                      String _fmt(Duration d) {
+                        final h = d.inHours;
+                        final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+                        final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+                        return h > 0 ? '$h:$m:$s' : '$m:$s';
+                      }
+
+                      return Column(
+                        children: [
+                          Slider(
+                            min: 0.0,
+                            max: sliderMax,                  // double
+                            value: sliderValue,              // double
+                            onChangeStart: (_) => setState(() => _dragValue = sliderValue),
+                            onChanged: (v) => setState(() => _dragValue = v),
+                            onChangeEnd: (v) async {
+                              setState(() => _dragValue = null);
+                              await widget.player.seek(Duration(milliseconds: v.round()));
+                            },
+                          ),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(_fmt(position)),
+                              Text(_fmt(duration)),
+                            ],
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ---------------- simple empty/error views ----------------
+
 class _EmptyView extends StatelessWidget {
-  const _EmptyView({required this.onRetry, required this.deepScan, required this.onToggleDeep});
+  const _EmptyView({
+    required this.onRetry,
+    required this.deepScan,
+    required this.onToggleDeep,
+  });
   final Future<void> Function() onRetry;
   final bool deepScan;
   final VoidCallback onToggleDeep;
@@ -258,7 +455,8 @@ class _EmptyView extends StatelessWidget {
             const SizedBox(height: 12),
             Wrap(spacing: 8, children: [
               OutlinedButton(onPressed: onRetry, child: const Text('Scan again')),
-              if (!deepScan) FilledButton(onPressed: onToggleDeep, child: const Text('Enable Deep scan')),
+              if (!deepScan)
+                FilledButton(onPressed: onToggleDeep, child: const Text('Enable Deep scan')),
             ]),
           ],
         ),

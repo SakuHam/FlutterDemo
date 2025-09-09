@@ -37,11 +37,8 @@ dependencies:
   permission_handler: ^11.3.1
   path_provider: ^2.1.2
   path: ^1.9.0
-#  on_audio_query: ^2.9.0   # or latest
-
-#dependency_overrides:
-#  on_audio_query_android:
-#    path: third_party
+  just_audio: ^0.9.39
+  audio_session: ^0.1.21
 
 dev_dependencies:
   flutter_test:
