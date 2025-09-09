@@ -80,11 +80,16 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       setState(() {
         _ai = RuntimePolicy.fromJson(
           js,
-          fe: RuntimeFeatureExtractor(groundSamples: 3, stridePx: 48),
+          fe: const RuntimeFeatureExtractor(groundSamples: 3, stridePx: 48),
         );
       });
     } catch (e) {
-      debugPrint('AI policy load failed (ok if you haven\'t trained yet): $e');
+      debugPrint('AI policy load failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('AI load failed: $e')),
+        );
+      }
     }
   }
 
@@ -146,6 +151,11 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         } catch (e, st) {
           debugPrint('AI act error, disabling AI: $e\n$st');
           aiPlay = false;
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('AI error: $e')),
+            );
+          }
         }
       }
 
@@ -167,6 +177,12 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       // Integrate
       Offset vel = lander.velocity + accel * dt * 60;
       Offset pos = lander.position + vel * dt * 60;
+
+      // Hard ceiling to match engine
+      if (pos.dy < 0) {
+        pos = Offset(pos.dx, 0);
+        if (vel.dy < 0) vel = Offset(vel.dx, 0);
+      }
 
       // Wrap X
       final w = _worldSize?.width ?? 360.0;
