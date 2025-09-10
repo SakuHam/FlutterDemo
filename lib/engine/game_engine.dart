@@ -457,11 +457,11 @@ class GameEngine {
     // Continuous penalty near the top (ramps 0..1 inside margin)
     if (pos.y < cfg.ceilingMargin) {
       final frac = (1.0 - (pos.y / cfg.ceilingMargin)).clamp(0.0, 1.0);
-      cost += frac * cfg.ceilingPenaltyPerSec * dt;
+      cost += frac * cfg.ceilingPenaltyPerSec * dt;  // time integrated
     }
 
     // Continuous edge penalty (pre-wrap position)
-    {
+        {
       final x = pos.x;
       final dLeft = x;
       final dRight = cfg.worldW - x;
@@ -469,7 +469,7 @@ class GameEngine {
 
       if (!cfg.hardWalls && dEdge < cfg.borderMargin) {
         final frac = (1.0 - (dEdge / cfg.borderMargin)).clamp(0.0, 1.0);
-        cost += frac * cfg.borderPenaltyPerSec * dt;
+        cost += frac * cfg.borderPenaltyPerSec * dt; // time integrated
       }
     }
 
@@ -477,21 +477,20 @@ class GameEngine {
       bool hit = false;
       if (pos.x < 0) { pos.x = 0; hit = true; }
       if (pos.x > cfg.worldW) { pos.x = cfg.worldW; hit = true; }
-      if (hit) { cost += cfg.wrapPenalty; /* small nudge */ }
+      if (hit) { cost += cfg.wrapPenalty; /* one-shot nudge */ }
     } else {
       bool crossed = false;
       if (pos.x < 0) { pos = Vector2(cfg.worldW + pos.x, pos.y); crossed = true; }
       else if (pos.x > cfg.worldW) { pos = Vector2(pos.x - cfg.worldW, pos.y); crossed = true; }
-      if (crossed) cost += cfg.wrapPenalty;
+      if (crossed) cost += cfg.wrapPenalty; // one-shot
     }
 
     // Clamp Y to world (don’t let it go above top too much)
     if (pos.y < 0) pos.y = 0;
 
     // =========================
-    // Base shaping (dense)
+    // Base shaping (dense) — TIME INTEGRATED
     // =========================
-    // Distances
     final groundY = terrain.heightAt(pos.x);
     final padCenterX = terrain.padCenter;
 
@@ -503,26 +502,26 @@ class GameEngine {
 
     // Horizontal distance to pad center (normalized)
     final dxN = (pos.x - padCenterX).abs() / cfg.worldW;
-    cost += cfg.wDx * dxN;
+    cost += (cfg.wDx * dxN) * dt;
 
     // Vertical distance to ground (normalized to worldH)
     final dyN = ((groundY - pos.y).abs()) / cfg.worldH;
-    cost += cfg.wDy * dyN;
+    cost += (cfg.wDy * dyN) * dt;
 
     // Velocity shaping (normalize vx, vy roughly by 200 px/s)
     final vxN = (vel.x.abs() / 200.0).clamp(0.0, 2.0);
     final vyDownN = (vel.y > 0 ? (vel.y / 200.0) : 0.0).clamp(0.0, 2.0);
-    cost += cfg.wVx * vxN + cfg.wVyDown * vyDownN;
+    cost += (cfg.wVx * vxN + cfg.wVyDown * vyDownN) * dt;
 
     // Angle shaping (degrees normalized by 180), stronger near ground
     final hN = (dyN).clamp(0.0, 1.0);
     final angleDeg = angle.abs() * 180.0 / math.pi;
     final angleCost = cfg.wAngleDeg * (angleDeg / 180.0) * (1.0 + cfg.angleNearGroundBoost * (1.0 - hN));
-    cost += angleCost;
+    cost += angleCost * dt;
 
-    // Angular rate (smoothness)
+    // Angular rate (smoothness) — rate is per second, integrate over dt
     final dAng = ((angle - _lastAngle).abs()) / (dt + 1e-8);
-    cost += cfg.wAngleRate * (dAng / math.pi); // normalize by π rad/s
+    cost += cfg.wAngleRate * (dAng / math.pi) * dt;
 
     // =========================
     // Collision / Terminal
@@ -547,20 +546,17 @@ class GameEngine {
         // Small landing penalty term (kept >=0) so "perfect" is still ~0
         final landPenalty = 0.2 * (gentleSpeed / (cfg.landingSpeedMax + 1e-6)) +
             0.2 * (gentleAngle / (cfg.landingAngleMaxRad + 1e-6));
-        cost += landPenalty.clamp(0.0, 1.0);
+        cost += landPenalty.clamp(0.0, 1.0); // one-shot
 
         // Snap to pad
         pos = Vector2(pos.x, terrain.padY - 18.0); // halfHeight ~ 18px (UI parity)
       } else {
         // Crash penalty: bigger than any wrap/edge nuisances
-        cost += 120.0;
+        cost += 120.0; // one-shot
       }
     }
 
-// --- Existing penalties (position/velocity/angle/fuel/etc) ---
-// double costDelta = ... your current shaping ...
-
-// ===== Action-aware shaping (bonuses & a small idle penalty) =====
+    // ===== Action-aware shaping (bonuses & a small idle penalty) — TIME INTEGRATED =====
     const double vyCap = 120.0;                  // scale for descent speed
     const double angCap = math.pi / 4;           // 45° scale for angle correction
     final double dxDead = 0.03 * cfg.worldW;     // deadzone for pad alignment
@@ -569,16 +565,16 @@ class GameEngine {
     // (A) Thrust-assist bonus when descending
     if (u.thrust && vel.y > 0) {
       final vyN = (vel.y / vyCap).clamp(0.0, 1.0); // 0..1 for 0..vyCap
-      cost -= cfg.wThrustAssist * vyN;
+      cost -= (cfg.wThrustAssist * vyN) * dt;
     }
 
     // (B) Turn-assist bonus when turning toward upright (reduce |angle|)
     if (angle > angDead && u.left) {
       final aN = ((angle - angDead) / angCap).clamp(0.0, 1.0);
-      cost -= cfg.wTurnAssist * aN;
+      cost -= (cfg.wTurnAssist * aN) * dt;
     } else if (angle < -angDead && u.right) {
       final aN = (((-angle) - angDead) / angCap).clamp(0.0, 1.0);
-      cost -= cfg.wTurnAssist * aN;
+      cost -= (cfg.wTurnAssist * aN) * dt;
     }
 
     // (C) Pad-align bonus when turning toward the pad horizontally
@@ -587,18 +583,18 @@ class GameEngine {
       if (dx > 0 && u.left) {
         // pad is to the left → turning left helps
         final dN = ((dx.abs() - dxDead) / (0.5 * cfg.worldW)).clamp(0.0, 1.0);
-        cost -= cfg.wPadAlignAssist * dN;
+        cost -= (cfg.wPadAlignAssist * dN) * dt;
       } else if (dx < 0 && u.right) {
         // pad is to the right → turning right helps
         final dN = ((dx.abs() - dxDead) / (0.5 * cfg.worldW)).clamp(0.0, 1.0);
-        cost -= cfg.wPadAlignAssist * dN;
+        cost -= (cfg.wPadAlignAssist * dN) * dt;
       }
     }
 
     // (D) Idle penalty when falling fast & not acting
     if (!u.thrust && !u.left && !u.right && vel.y > 80) {
       final vN = ((vel.y - 80) / (vyCap - 80)).clamp(0.0, 1.0);
-      cost += cfg.wIdlePenalty * vN;
+      cost += (cfg.wIdlePenalty * vN) * dt;
     }
 
     if (cost < 0) cost = 0.0;
