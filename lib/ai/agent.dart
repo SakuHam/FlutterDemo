@@ -137,66 +137,87 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
   bool left = false, right = false, thrust = false;
 
-  // -------- Horizontal guidance --------
-  const double vxGoalAbs = 80.0;    // ↑ from 60 → snappier sideways moves
-  const double kAngV     = 0.015;   // ↑ from 0.012 → quicker tilt toward vxDes
-  const double kDxHover  = 0.40;    // hover centering gain
-  const double maxTilt   = 20 * math.pi / 180; // ↑ allow a bit more lean
+  // -------- Geometry helpers --------
+  final groundY = env.terrain.heightAt(L.pos.x);
+  final height  = (groundY - L.pos.y).clamp(0.0, 1e9); // px above ground
+  final ceilingDist = (L.pos.y - env.cfg.ceilingMargin).clamp(0.0, 1e9); // px below ceiling
 
-  double vxDes = 0.0;
-  switch (intent) {
-    case Intent.goLeft:       vxDes = -vxGoalAbs; break;
-    case Intent.goRight:      vxDes = vxGoalAbs; break;
-    case Intent.hoverCenter:  vxDes = -kDxHover * dx; break; // gentle drift to pad
-    case Intent.descendSlow:
-    case Intent.brakeUp:      vxDes = 0.0; break;
+  // -------- Horizontal guidance (vx target + leveling) --------
+  const double vxGoalAbs = 80.0;
+  const double kAngV     = 0.015;
+  const double kDxHover  = 0.40;
+
+  // Base max tilt; soften near ceiling
+  double maxTilt = 20 * math.pi / 180;
+  if (ceilingDist < 140) {
+    final a = (ceilingDist / 140.0).clamp(0.0, 1.0);         // 0..1
+    final softMax = 12 * math.pi / 180;                      // min tilt near ceiling
+    maxTilt = softMax + a * (maxTilt - softMax);
   }
 
-  // target angle from horizontal velocity error
-  final vxErr = (vxDes - vx);
-  double targetAngle = (kAngV * vxErr).clamp(-maxTilt, maxTilt);
+  // Desired vx from intent
+  double vxDes = switch (intent) {
+    Intent.goLeft       => -vxGoalAbs,
+    Intent.goRight      => vxGoalAbs,
+    Intent.hoverCenter  => -kDxHover * dx,
+    _                   => 0.0,
+  };
 
-  // map desired angle to left/right jets with a deadzone
+  // Leveling factor: when |vxErr| small, bias targetAngle→0 (keep level)
+  final vxErr = (vxDes - vx);
+  final normErr = (vxErr.abs() / vxGoalAbs).clamp(0.0, 1.0);   // 0..1
+  final levelGain = normErr * normErr;                         // s-curve (square)
+
+  // Target angle, capped by (possibly reduced) maxTilt
+  double targetAngle = (kAngV * vxErr * levelGain).clamp(-maxTilt, maxTilt);
+
+  // Map desired angle -> turn jets with deadzone
   const angDead = 3 * math.pi / 180;
   if (angle > targetAngle + angDead) left = true;
   if (angle < targetAngle - angDead) right = true;
 
-  // -------- Vertical guidance (early braking) --------
-  // Height-relative descent cap: tighter near ground, looser high up.
-  final groundY = env.terrain.heightAt(L.pos.x);
-  final height  = (groundY - L.pos.y).clamp(0.0, 1e9);
-
-  // sqrt profile works well for moon-lander style units
-  // Example: at 400px → ~30 px/s, at 100px → ~17 px/s, near ground → ~10 px/s
+  // -------- Vertical guidance (early braking; height-based cap) --------
   double vyCapDown = 10.0 + 1.0 * math.sqrt(height.clamp(0.0, 9999.0));
   vyCapDown = vyCapDown.clamp(10.0, 45.0);
 
-  // base targets
-  double targetVy = vyCapDown;         // default: descend within the cap
+  double targetVy = vyCapDown;
   if (intent == Intent.descendSlow) targetVy = math.min(targetVy, 18.0);
-  if (intent == Intent.brakeUp)     targetVy = -15.0;  // climb a bit
+  if (intent == Intent.brakeUp)     targetVy = -15.0;
 
-  // additional near-ground tightening
   if (height < 120) targetVy = math.min(targetVy, 18.0);
   if (height <  60) targetVy = math.min(targetVy, 10.0);
 
-  // -------- Thrust logic --------
-  // 1) Vertical safety: brake if falling faster than target
+  // Base thrust: brake vertical overspeed
   final eVy = vy - targetVy;
   thrust = eVy > 0;
 
-  // 2) Horizontal assist: if we are tilted toward the desired angle and
-  //    still far from desired vx, burn to inject horizontal momentum.
-  const double vxErrTh = 20.0;             // need meaningful horizontal error
+  // -------- Horizontal assist burn (reined in) --------
+  // Only assist when:
+  //  - intent is lateral
+  //  - tilt points the right way
+  //  - sideways error is meaningful
+  //  - NOT near the ceiling
+  //  - NOT already ascending quickly
+  const double vxErrTh = 20.0;
   final bool tiltAligned =
-      (targetAngle >  6 * math.pi / 180 && angle >  3 * math.pi / 180) || // tilted right
-          (targetAngle < -6 * math.pi / 180 && angle < -3 * math.pi / 180);   // tilted left
-  if ((intent == Intent.goLeft || intent == Intent.goRight) &&
-      tiltAligned && vxErr.abs() > vxErrTh) {
+      (targetAngle >  6 * math.pi / 180 && angle >  3 * math.pi / 180) ||
+          (targetAngle < -6 * math.pi / 180 && angle < -3 * math.pi / 180);
+
+  final bool lateralIntent = intent == Intent.goLeft || intent == Intent.goRight;
+  if (lateralIntent &&
+      tiltAligned &&
+      vxErr.abs() > vxErrTh &&
+      ceilingDist > 100 &&     // stay away from ceiling when vectoring
+      vy > -6) {                // don't add thrust while strongly ascending
     thrust = true;
   }
 
-  // avoid ceiling hover
+  // Hard anti-ceiling: if too close AND going up, cut thrust
+  if (ceilingDist < 40 && vy < 2) {
+    thrust = false;
+  }
+
+  // Keep original ceiling guard
   if (L.pos.y < env.cfg.ceilingMargin) {
     thrust = false;
   }
