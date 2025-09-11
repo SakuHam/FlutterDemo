@@ -93,6 +93,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   static const double kLandingSpeedMax = 5.0;                  // was 40.0
   static const double kLandingAngleMaxRad = 8 * math.pi / 180; // was ~14.3° (0.25 rad)
 
+  Duration _lastElapsed = Duration.zero;
+
   // Tunables
   Tunables t = Tunables();
 
@@ -324,11 +326,13 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     }
   }
 
-  void _onTick(Duration _) {
-    final now = DateTime.now();
-    double dt = now.difference(_last).inMicroseconds / 1e6;
-    dt = dt.clamp(0, 1 / 20); // max 50 ms step
-    _last = now;
+  void _onTick(Duration elapsed) {
+    double dt = (elapsed - _lastElapsed).inMicroseconds / 1e6;
+    _lastElapsed = elapsed;
+
+    // clamp for safety
+    if (dt <= 0) dt = 1 / 60.0;     // fallback to nominal frame
+    dt = dt.clamp(0, 1 / 20.0);     // max 50 ms step
 
     if (!mounted || status != GameStatus.playing || _terrain == null) return;
 

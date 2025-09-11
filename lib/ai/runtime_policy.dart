@@ -3,23 +3,21 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/services.dart' show rootBundle;
 
-// Game data types from your UI side
+// UI types
 import 'package:flutter/material.dart' show Offset;
-import 'package:flutter_application_1/engine/game_engine.dart';
 import '../game_page.dart' show Lander, Terrain;
 
-// Two-stage bits and bus (reuse training controller + intent names)
-import 'agent.dart' show Intent, kIntentNames, controllerForIntent, intentToIndex, indexToIntent;
+// Intent bus (runtime)
 import 'intent_bus.dart';
 
-/// === Runtime features (MIRRORS TRAINING: 10 + groundSamples) ===
-/// Training FeatureExtractor used:
-/// [px,py,vx,vy,ang,fuel, padCenter,dxCenter, dGround,slope, ...groundSamples]
+/// ================= Runtime features (must mirror training) =================
 class RuntimeFeatureExtractor {
   final int groundSamples;
   final double stridePx;
   const RuntimeFeatureExtractor({this.groundSamples = 3, this.stridePx = 48});
 
+  /// Training layout (IMPORTANT):
+  /// [px, py, vx, vy, ang, fuel, padCenter, dxCenter, dGround, slope, samples...]
   List<double> extract({
     required Lander lander,
     required Terrain terrain,
@@ -30,47 +28,40 @@ class RuntimeFeatureExtractor {
     final py = lander.position.dy / worldH;
     final vx = (lander.velocity.dx / 200.0).clamp(-2.0, 2.0);
     final vy = (lander.velocity.dy / 200.0).clamp(-2.0, 2.0);
-    final ang = (lander.angle / math.pi).clamp(-1.5, 1.5); // MATCH training
-    // If you expose actual maxFuel, replace 100/140 accordingly; training used cfg.t.maxFuel.
-    final fuel = (lander.fuel / 100.0).clamp(0.0, 1.0);
+    final ang = (lander.angle / math.pi).clamp(-1.5, 1.5); // angle value, not sin/cos
+    final fuel = (lander.fuel / 100.0).clamp(0.0, 1.0);    // UI Tunables.maxFuel = 100
 
     final padCenter = ((terrain.padX1 + terrain.padX2) * 0.5) / worldW;
-    final dxCenter = ((lander.position.dx - (terrain.padX1 + terrain.padX2) * 0.5) / worldW)
+    final dxCenter =
+    ((lander.position.dx - (terrain.padX1 + terrain.padX2) * 0.5) / worldW)
         .clamp(-1.0, 1.0);
 
-    double groundY(double x) => terrain.heightAt(x);
-    final gY = groundY(lander.position.dx);
+    final gY = terrain.heightAt(lander.position.dx);
     final dGround = ((gY - lander.position.dy) / worldH).clamp(-1.0, 1.0);
 
-    final gyL = groundY((lander.position.dx - 20).clamp(0.0, worldW));
-    final gyR = groundY((lander.position.dx + 20).clamp(0.0, worldW));
+    final gyL = terrain.heightAt((lander.position.dx - 20).clamp(0.0, worldW));
+    final gyR = terrain.heightAt((lander.position.dx + 20).clamp(0.0, worldW));
     final slope = (((gyR - gyL) / 40.0) / 0.5).clamp(-2.0, 2.0);
 
-    // symmetric local samples (works for even/odd n)
+    // local ground samples: exactly `groundSamples` with even/odd symmetry
     final n = groundSamples;
-    final samples = <double>[];
     final center = (n - 1) / 2.0;
+    final samples = <double>[];
     for (int k = 0; k < n; k++) {
       final relIndex = k - center;
       final sx = (lander.position.dx + relIndex * stridePx).clamp(0.0, worldW);
-      final sy = groundY(sx);
-      final rel = ((sy - lander.position.dy) / worldH).clamp(-1.0, 1.0);
-      samples.add(rel);
+      final sy = terrain.heightAt(sx);
+      samples.add(((sy - lander.position.dy) / worldH).clamp(-1.0, 1.0));
     }
 
-    return [
-      px, py, vx, vy, ang, fuel,
-      padCenter, dxCenter,
-      dGround, slope,
-      ...samples,
-    ];
+    return [px, py, vx, vy, ang, fuel, padCenter, dxCenter, dGround, slope, ...samples];
   }
 
   int get inputSize => 10 + groundSamples;
 }
 
-/// === Tiny math ===
-List<double> matVec(List<List<double>> W, List<double> x) {
+/// =============== Tiny math (pure Dart, no Flutter/engine deps) ===============
+List<double> _matVec(List<List<double>> W, List<double> x) {
   final m = W.length, n = W[0].length;
   final out = List<double>.filled(m, 0.0);
   for (int i = 0; i < m; i++) {
@@ -80,52 +71,124 @@ List<double> matVec(List<List<double>> W, List<double> x) {
   }
   return out;
 }
-List<double> vecAdd(List<double> a, List<double> b) {
+List<double> _vecAdd(List<double> a, List<double> b) {
   final out = List<double>.filled(a.length, 0.0);
   for (int i = 0; i < a.length; i++) out[i] = a[i] + b[i];
   return out;
 }
-double relu(double x) => x > 0 ? x : 0.0;
-List<double> reluVec(List<double> v) => v.map(relu).toList();
-double sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
-List<double> softmax(List<double> z) {
+double _relu(double x) => x > 0 ? x : 0.0;
+List<double> _reluVec(List<double> v) => v.map(_relu).toList();
+double _sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
+List<double> _softmax(List<double> z) {
   final m = z.reduce((a,b)=>a>b?a:b);
-  double sum = 0.0;
+  var s = 0.0;
   final e = List<double>.filled(z.length, 0.0);
-  for (int i=0;i<z.length;i++) { e[i] = math.exp(z[i]-m); sum += e[i]; }
-  for (int i=0;i<z.length;i++) e[i] /= (sum + 1e-12);
+  for (int i=0;i<z.length;i++) { e[i] = math.exp(z[i]-m); s += e[i]; }
+  for (int i=0;i<z.length;i++) e[i] /= (s + 1e-12);
   return e;
 }
-int argmax(List<double> a) {
+int _argmax(List<double> a) {
   var bi = 0; var bv = a[0];
-  for (int i=1;i<a.length;i++) { if (a[i] > bv) { bv = a[i]; bi = i; } }
+  for (int i=1;i<a.length;i++) if (a[i] > bv) { bv=a[i]; bi=i; }
   return bi;
 }
 
-/// === Two-stage runtime policy (trunk -> intent(K) head; controller does actions) ===
+/// ======================= Intents (mirror training enum) =======================
+enum Intent { hoverCenter, goLeft, goRight, descendSlow, brakeUp }
+const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','brakeUp'];
+
+/// ===== UI-side low-level controller (no GameEngine dependency!) =====
+/// Converts an intent into (thrust,left,right) using only Lander/Terrain/world.
+({bool thrust, bool left, bool right}) _controllerForIntentUI(
+    Intent intent, {
+      required Lander lander,
+      required Terrain terrain,
+      required double worldW,
+      required double worldH,
+    }) {
+  final padCx = (terrain.padX1 + terrain.padX2) * 0.5;
+  final dx = lander.position.dx - padCx;
+  final vx = lander.velocity.dx;
+  final vy = lander.velocity.dy;
+  final angle = lander.angle;
+
+  bool left = false, right = false, thrust = false;
+
+  // angle PD toward desired angle (lean into correcting dx and vx)
+  double targetAngle = 0.0;
+  const kAngDx = 0.006;
+  const kAngVx = 0.012;
+  const maxTilt = 15 * math.pi / 180;
+
+  switch (intent) {
+    case Intent.goLeft:
+      targetAngle = (-kAngDx * dx - kAngVx * vx).clamp(-maxTilt, maxTilt);
+      break;
+    case Intent.goRight:
+      targetAngle = (kAngDx * dx + kAngVx * vx).clamp(-maxTilt, maxTilt);
+      break;
+    case Intent.hoverCenter:
+      targetAngle = (-0.5 * kAngDx * dx - 0.5 * kAngVx * vx).clamp(-maxTilt, maxTilt);
+      break;
+    case Intent.descendSlow:
+    case Intent.brakeUp:
+      targetAngle = 0.0;
+      break;
+  }
+
+  const angDead = 3 * math.pi / 180;
+  if (angle > targetAngle + angDead) left = true;
+  if (angle < targetAngle - angDead) right = true;
+
+  // vertical PD for thrust target
+  double targetVy = 60.0;                // px/s downward normally
+  if (intent == Intent.descendSlow) targetVy = 30.0;
+  if (intent == Intent.brakeUp)     targetVy = -20.0;
+
+  // stricter near ground
+  final groundY = terrain.heightAt(lander.position.dx);
+  final height = groundY - lander.position.dy;
+  if (height < 120) targetVy = math.min(targetVy, 20.0);
+  if (height <  60) targetVy = math.min(targetVy, 10.0);
+
+  final eVy = vy - targetVy;
+  thrust = eVy > 0;                      // burn if falling faster than target
+
+  // avoid ceiling hover (UI has hard ceiling at y=0)
+  if (lander.position.dy < 0 + 4) {
+    thrust = false;
+  }
+
+  return (thrust: thrust, left: left, right: right);
+}
+
+/// =================== Two-stage runtime policy (planner) ===================
 class RuntimeTwoStagePolicy {
   final int inputSize, h1, h2;
 
   // Trunk
-  late final List<List<double>> W1, W2;
-  late final List<double> b1, b2;
+  final List<List<double>> W1, W2;
+  final List<double> b1, b2;
 
-  // Intent head (K x h2)
-  late final List<List<double>> W_intent;
-  late final List<double> b_intent;
-  late final int numIntents;
+  // Legacy action heads (unused for control when two-stage is on, but we load them anyway)
+  final List<List<double>> W_thr, W_turn;
+  final List<double> b_thr, b_turn;
 
-  // (Optional) single-stage heads if you still want to expose them for debugging
-  late final List<List<double>>? W_thr;
-  late final List<double>? b_thr;
-  late final List<List<double>>? W_turn;
-  late final List<double>? b_turn;
+  // Two-stage heads
+  final List<List<double>> W_intent; // (K, h2)
+  final List<double> b_intent;       // (K)
 
-  // FE + planner state
+  // Critic
+  final List<List<double>> W_val;    // (1, h2)
+  final List<double> b_val;          // (1)
+
+  // FE & planner config
   final RuntimeFeatureExtractor fe;
-  final int planHold;           // frames to hold selected intent
-  int _framesLeft = 0;          // countdown
-  int _currentIntentIdx = -1;   // last chosen intent
+  final int planHold;                // frames to hold an intent
+
+  // Planner state
+  int _framesLeft = 0;
+  int _currentIntentIdx = -1;
 
   RuntimeTwoStagePolicy._({
     required this.inputSize,
@@ -135,15 +198,16 @@ class RuntimeTwoStagePolicy {
     required this.b1,
     required this.W2,
     required this.b2,
+    required this.W_thr,
+    required this.b_thr,
+    required this.W_turn,
+    required this.b_turn,
     required this.W_intent,
     required this.b_intent,
-    required this.numIntents,
+    required this.W_val,
+    required this.b_val,
     required this.fe,
     required this.planHold,
-    this.W_thr,
-    this.b_thr,
-    this.W_turn,
-    this.b_turn,
   });
 
   static RuntimeTwoStagePolicy fromJson(
@@ -164,28 +228,20 @@ class RuntimeTwoStagePolicy {
 
     final W1 = _as2d(j['W1']); final b1 = _as1d(j['b1']);
     final W2 = _as2d(j['W2']); final b2 = _as1d(j['b2']);
+    final W_thr = _as2d(j['W_thr']); final b_thr = _as1d(j['b_thr']);
+    final W_turn = _as2d(j['W_turn']); final b_turn = _as1d(j['b_turn']);
 
-    // Two-stage: require intent head
-    if (!j.containsKey('W_intent') || !j.containsKey('b_intent')) {
-      throw StateError('Policy JSON lacks W_intent/b_intent (two-stage).');
-    }
+    // Two-stage bits (must exist for planner runtime)
     final W_intent = _as2d(j['W_intent']);
     final b_intent = _as1d(j['b_intent']);
-    final numIntents = W_intent.length;
+    final W_val = _as2d(j['W_val']);
+    final b_val = _as1d(j['b_val']);
 
-    // Optional single-stage heads (may or may not exist)
-    List<List<double>>? W_thr, W_turn;
-    List<double>? b_thr, b_turn;
-    if (j.containsKey('W_thr') && j.containsKey('b_thr') &&
-        j.containsKey('W_turn') && j.containsKey('b_turn')) {
-      W_thr  = _as2d(j['W_thr']);  b_thr  = _as1d(j['b_thr']);
-      W_turn = _as2d(j['W_turn']); b_turn = _as1d(j['b_turn']);
-    }
-
-    final fe0 = fe ?? RuntimeFeatureExtractor(
-      groundSamples: (j['fe']?['groundSamples'] ?? 3) as int,
-      stridePx: ((j['fe']?['stridePx'] ?? 48) as num).toDouble(),
-    );
+    final fe0 = fe ??
+        RuntimeFeatureExtractor(
+          groundSamples: (j['fe']?['groundSamples'] ?? 3) as int,
+          stridePx: ((j['fe']?['stridePx'] ?? 48) as num).toDouble(),
+        );
 
     // shape checks
     void _expect(bool c, String m) { if (!c) throw StateError(m); }
@@ -193,59 +249,35 @@ class RuntimeTwoStagePolicy {
     _expect(b1.length == h1, 'b1 len');
     _expect(W2.length == h2 && W2[0].length == h1, 'W2 shape');
     _expect(b2.length == h2, 'b2 len');
-    _expect(W_intent[0].length == h2, 'W_intent cols must equal h2');
-    _expect(b_intent.length == numIntents, 'b_intent len');
-    _expect(fe0.inputSize == inputSize, 'feature size mismatch (runtime vs training)');
+    _expect(W_thr.length == 1 && W_thr[0].length == h2, 'W_thr shape');
+    _expect(b_thr.length == 1, 'b_thr len');
+    _expect(W_turn.length == 3 && W_turn[0].length == h2, 'W_turn shape');
+    _expect(b_turn.length == 3, 'b_turn len');
+    _expect(W_intent.length >= 2 && W_intent[0].length == h2, 'W_intent shape');
+    _expect(b_intent.length == W_intent.length, 'b_intent len');
+    _expect(W_val.length == 1 && W_val[0].length == h2, 'W_val shape');
+    _expect(b_val.length == 1, 'b_val len');
+    _expect(fe0.inputSize == inputSize, 'feature size mismatch');
 
     return RuntimeTwoStagePolicy._(
       inputSize: inputSize, h1: h1, h2: h2,
       W1: W1, b1: b1, W2: W2, b2: b2,
-      W_intent: W_intent, b_intent: b_intent, numIntents: numIntents,
-      fe: fe0, planHold: planHold,
       W_thr: W_thr, b_thr: b_thr, W_turn: W_turn, b_turn: b_turn,
+      W_intent: W_intent, b_intent: b_intent,
+      W_val: W_val, b_val: b_val,
+      fe: fe0, planHold: planHold,
     );
   }
 
-  static Future<RuntimeTwoStagePolicy> loadFromAsset(
-      String assetPath, {
-        RuntimeFeatureExtractor? fe,
-        int planHold = 12,
-      }) async {
+  static Future<RuntimeTwoStagePolicy> loadFromAsset(String assetPath, {int planHold = 12}) async {
     final js = await rootBundle.loadString(assetPath);
-    return RuntimeTwoStagePolicy.fromJson(js, fe: fe, planHold: planHold);
+    return RuntimeTwoStagePolicy.fromJson(js, planHold: planHold);
   }
 
-  /// Reset the planner (e.g., on episode reset or user toggling AI)
-  void resetPlanner() {
-    _framesLeft = 0;
-    _currentIntentIdx = -1;
-  }
+  /// Reset internal planner so next call will re-plan immediately.
+  void resetPlanner() { _framesLeft = 0; _currentIntentIdx = -1; }
 
-  /// Forward trunk + intent head → pick an intent (greedy)
-  int _selectIntentGreedy(List<double> x) {
-    // trunk
-    final z1 = vecAdd(matVec(W1, x), b1);
-    final h1v = reluVec(z1);
-    final z2 = vecAdd(matVec(W2, h1v), b2);
-    final h2v = reluVec(z2);
-
-    // intent head
-    final logits = matVec(W_intent, h2v);
-    for (int i = 0; i < logits.length; i++) logits[i] += b_intent[i];
-    final p = softmax(logits);
-    final idx = argmax(p);
-    // publish probs for UI visibility
-    IntentBus.instance.publishIntent(IntentEvent(
-      intent: kIntentNames[idx],
-      probs: p,
-      step: 0,
-      meta: {'source': 'runtime', 'mode': 'greedy'},
-    ));
-    return idx;
-  }
-
-  /// Act: maintain an intent for `planHold` frames, emit control via controller
-  /// Returns (thrust,left,right) for this frame and publishes intents/controls.
+  /// Main runtime step: choose/hold intent, emit control, publish bus events.
   (bool thrust, bool left, bool right) actWithIntent({
     required Lander lander,
     required Terrain terrain,
@@ -253,70 +285,56 @@ class RuntimeTwoStagePolicy {
     required double worldH,
     int step = 0,
   }) {
-    // (Re)plan if needed
+    // Re-plan if needed
     if (_framesLeft <= 0) {
       final x = fe.extract(lander: lander, terrain: terrain, worldW: worldW, worldH: worldH);
-      _currentIntentIdx = _selectIntentGreedy(x);
+
+      // trunk
+      final z1 = _vecAdd(_matVec(W1, x), b1);
+      final h1v = _reluVec(z1);
+      final z2 = _vecAdd(_matVec(W2, h1v), b2);
+      final h2v = _reluVec(z2);
+
+      // intent head (greedy at runtime)
+      final logits = _vecAdd(_matVec(W_intent, h2v), b_intent);
+      final probs = _softmax(logits);
+      final idx = _argmax(probs);
+
+      _currentIntentIdx = idx;
       _framesLeft = planHold;
+
+      // Publish intent (UI)
+      IntentBus.instance.publishIntent(
+        IntentEvent(
+          intent: kIntentNames[idx],
+          probs: probs,
+          step: step,
+          meta: {'plan_hold': planHold},
+        ),
+      );
     }
 
-    final intent = indexToIntent(_currentIntentIdx);
+    final intent = Intent.values[_currentIntentIdx < 0 ? 0 : _currentIntentIdx];
+    final ctrl = _controllerForIntentUI(
+      intent,
+      lander: lander,
+      terrain: terrain,
+      worldW: worldW,
+      worldH: worldH,
+    );
 
-    // Heartbeat publish so late subscribers see current intent
-    IntentBus.instance.publishIntent(IntentEvent(
-      intent: kIntentNames[_currentIntentIdx],
-      probs: const [], // already published on (re)plan
-      step: step,
-      meta: {'hold': true, 'framesLeft': _framesLeft},
-    ));
-
-    // Low-level control from the same controller used in training
-    final u = controllerForIntent(intent, _RuntimeEnvView(lander, terrain, worldW, worldH) as GameEngine);
-
-    // Publish control too (optional, great for HUD)
-    IntentBus.instance.publishControl(ControlEvent(
-      thrust: u.thrust, left: u.left, right: u.right, step: step,
-      meta: {'intent': kIntentNames[_currentIntentIdx]},
-    ));
+    // Publish control (UI)
+    IntentBus.instance.publishControl(
+      ControlEvent(
+        thrust: ctrl.thrust,
+        left: ctrl.left,
+        right: ctrl.right,
+        step: step,
+        meta: {'intent': kIntentNames[_currentIntentIdx < 0 ? 0 : _currentIntentIdx]},
+      ),
+    );
 
     _framesLeft -= 1;
-    return (u.thrust, u.left, u.right);
+    return (ctrl.thrust, ctrl.left, ctrl.right);
   }
-}
-
-/// Minimal adapter so controllerForIntent() (expects training env) can read state.
-/// We only provide what's needed: lander pos/vel/angle/fuel, terrain pad + heightAt.
-class _RuntimeEnvView {
-  final _RLander lander;
-  final _RTerrain terrain;
-  final _RCfg cfg;
-  _RuntimeEnvView(Lander L, Terrain T, double worldW, double worldH)
-      : lander = _RLander(L),
-        terrain = _RTerrain(T),
-        cfg = _RCfg(worldW: worldW, worldH: worldH);
-}
-class _RLander {
-  final _V2 pos;
-  final _V2 vel;
-  final double angle;
-  final double fuel;
-  _RLander(Lander L)
-      : pos = _V2(L.position.dx, L.position.dy),
-        vel = _V2(L.velocity.dx, L.velocity.dy),
-        angle = L.angle,
-        fuel = L.fuel.toDouble();
-}
-class _V2 { final double x,y; const _V2(this.x,this.y); }
-class _RTerrain {
-  final double padCenter;
-  final Terrain _t;
-  _RTerrain(this._t)
-      : padCenter = ((_t.padX1 + _t.padX2) * 0.5);
-  double heightAt(double x) => _t.heightAt(x);
-}
-class _RCfg {
-  final double worldW, worldH;
-  // Provide a ceiling margin similar to engine cfg (use small default)
-  final double ceilingMargin;
-  _RCfg({required this.worldW, required this.worldH, this.ceilingMargin = 8.0});
 }
