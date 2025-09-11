@@ -99,6 +99,7 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
 
 /// ===== UI-side low-level controller (no GameEngine dependency!) =====
 /// Converts an intent into (thrust,left,right) using only Lander/Terrain/world.
+// in lib/ai/runtime_policy.dart
 ({bool thrust, bool left, bool right}) _controllerForIntentUI(
     Intent intent, {
       required Lander lander,
@@ -114,11 +115,11 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
 
   bool left = false, right = false, thrust = false;
 
-  // --- Horizontal (absolute) ---
-  const double vxGoalAbs = 60.0;
-  const double kAngV     = 0.012;
+  // -------- Horizontal guidance (match trainer) --------
+  const double vxGoalAbs = 80.0;
+  const double kAngV     = 0.015;
   const double kDxHover  = 0.40;
-  const double maxTilt   = 15 * math.pi / 180;
+  const double maxTilt   = 20 * math.pi / 180;
 
   double vxDes = 0.0;
   switch (intent) {
@@ -126,30 +127,44 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
     case Intent.goRight:      vxDes = vxGoalAbs; break;
     case Intent.hoverCenter:  vxDes = -kDxHover * dx; break;
     case Intent.descendSlow:
-    case Intent.brakeUp:
-      vxDes = 0.0;
-      break;
+    case Intent.brakeUp:      vxDes = 0.0; break;
   }
 
-  double targetAngle = (kAngV * (vxDes - vx)).clamp(-maxTilt, maxTilt);
+  final vxErr = (vxDes - vx);
+  double targetAngle = (kAngV * vxErr).clamp(-maxTilt, maxTilt);
 
   const angDead = 3 * math.pi / 180;
   if (angle > targetAngle + angDead) left = true;
   if (angle < targetAngle - angDead) right = true;
 
-  // --- Vertical (same as trainer) ---
-  double targetVy = 60.0;
-  if (intent == Intent.descendSlow) targetVy = 30.0;
-  if (intent == Intent.brakeUp)     targetVy = -20.0;
-
+  // -------- Vertical guidance (early braking; match trainer) --------
   final groundY = terrain.heightAt(lander.position.dx);
-  final height = groundY - lander.position.dy;
-  if (height < 120) targetVy = math.min(targetVy, 20.0);
+  final height  = (groundY - lander.position.dy).clamp(0.0, 1e9);
+
+  double vyCapDown = 10.0 + 1.0 * math.sqrt(height.clamp(0.0, 9999.0));
+  vyCapDown = vyCapDown.clamp(10.0, 45.0);
+
+  double targetVy = vyCapDown;
+  if (intent == Intent.descendSlow) targetVy = math.min(targetVy, 18.0);
+  if (intent == Intent.brakeUp)     targetVy = -15.0;
+
+  if (height < 120) targetVy = math.min(targetVy, 18.0);
   if (height <  60) targetVy = math.min(targetVy, 10.0);
 
   final eVy = vy - targetVy;
   thrust = eVy > 0;
 
+  // Horizontal assist (same as trainer)
+  const double vxErrTh = 20.0;
+  final bool tiltAligned =
+      (targetAngle >  6 * math.pi / 180 && angle >  3 * math.pi / 180) ||
+          (targetAngle < -6 * math.pi / 180 && angle < -3 * math.pi / 180);
+  if ((intent == Intent.goLeft || intent == Intent.goRight) &&
+      tiltAligned && vxErr.abs() > vxErrTh) {
+    thrust = true;
+  }
+
+  // UI ceiling guard
   if (lander.position.dy < 4) thrust = false;
 
   return (thrust: thrust, left: left, right: right);
