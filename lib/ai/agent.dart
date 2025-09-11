@@ -1,6 +1,10 @@
 // lib/ai/agent.dart
 import 'dart:math' as math;
+
+// Game engine (physics integrator)
 import '../engine/game_engine.dart' as eng;
+// Shared types/configs (ControlInput, GameStatus, etc.)
+import '../engine/types.dart' as et;
 
 /// -------- Feature Extraction (state -> input vector) --------
 class FeatureExtractor {
@@ -343,8 +347,8 @@ extension PolicyOps on PolicyNetwork {
       }
 
       // ---------- Value loss (Huber) ----------
-      final err = f.v - returns_[t];            // d/dv  0.5*(v - R)^2  is (v - R); here we use Huber
-      final dLdv = valueBeta * _huberGrad(err, huberDelta); // weight the value gradient
+      final err = f.v - returns_[t];
+      final dLdv = valueBeta * _huberGrad(err, huberDelta);
 
       // ---------- Head grads ----------
       // throttle head
@@ -387,7 +391,7 @@ extension PolicyOps on PolicyNetwork {
     }
     addL2(dW1, W1); addL2(dW2, W2);
     addL2(dW_thr, W_thr); addL2(dW_turn, W_turn);
-    addL2(dW_val, W_val); // usually okay to decay value head weights too
+    addL2(dW_val, W_val);
 
     // ---- Global-norm gradient clipping ----
     double sqSum = 0.0;
@@ -395,7 +399,7 @@ extension PolicyOps on PolicyNetwork {
     void accumB(List<double> g) { for (final v in g) sqSum += v*v; }
     accum(dW1); accum(dW2); accum(dW_thr); accum(dW_turn); accum(dW_val);
     accumB(db1); accumB(db2); accumB(db_thr); accumB(db_turn); accumB(db_val);
-    final clip = 5.0; // tweak 1..5 if needed
+    final clip = 5.0;
     final norm = math.sqrt(sqSum + 1e-12);
     final scale = norm > clip ? (clip / norm) : 1.0;
     if (scale != 1.0) {
@@ -444,7 +448,7 @@ class Trainer {
   double tempThr;
   double tempTurn;
   double epsilon;
-  final double entropyBeta; // final: don’t mutate, use separate eval trainer if needed
+  final double entropyBeta;
 
   Trainer({
     required this.env,
@@ -495,7 +499,7 @@ class Trainer {
         th = res.$1; lf = res.$2; rt = res.$3; cache = res.$5;
       }
 
-      final info = env.step(dt, eng.ControlInput(thrust: th, left: lf, right: rt));
+      final info = env.step(dt, et.ControlInput(thrust: th, left: lf, right: rt));
 
       // Interpret engine signal
       final s = info.scoreDelta; // could be reward OR cost depending on engine
@@ -529,7 +533,7 @@ class Trainer {
       );
     }
 
-    final landed = env.status == eng.GameStatus.landed;
+    final landed = env.status == et.GameStatus.landed;
     final totalCost = costs.fold(0.0, (a, b) => a + b);
     return EpisodeResult(totalCost, costs.length, landed);
   }

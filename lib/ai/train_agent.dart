@@ -13,7 +13,10 @@ import 'agent.dart'
     sigmoid,
     softmax;
 
+// Use eng for GameEngine (physics stepper)
 import '../engine/game_engine.dart' as eng;
+// Use et for types/configs (Tunables, EngineConfig, etc.)
+import '../engine/types.dart' as et;
 
 /// ---------- Tiny IO helpers ----------
 Future<Map<String, dynamic>> _readJson(String path) async =>
@@ -45,8 +48,7 @@ List<double> _vec(dynamic v) =>
   final h2J = js['h2'] as int? ?? policy.h2;
 
   if (policy.inputSize != inputSizeJ || policy.h1 != h1J || policy.h2 != h2J) {
-    policy =
-        PolicyNetwork(inputSize: inputSizeJ, h1: h1J, h2: h2J, seed: 1234);
+    policy = PolicyNetwork(inputSize: inputSizeJ, h1: h1J, h2: h2J, seed: 1234);
   }
 
   policy
@@ -135,8 +137,8 @@ void main(List<String> args) async {
   }
 
   // --------------- Engine config (Flutter-free) ---------------
-  final cfg = eng.EngineConfig(
-    t: eng.Tunables(
+  final cfg = et.EngineConfig(
+    t: et.Tunables(
       gravity: 0.18,
       thrustAccel: 0.42,
       rotSpeed: 1.6,
@@ -243,7 +245,8 @@ void main(List<String> args) async {
     entropyBeta: 0.0,
   );
 
-  {
+  // quick determinism probe
+      {
     final s = fixedSeed;
     env.reset(seed: s);
     final ep1 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
@@ -251,9 +254,9 @@ void main(List<String> args) async {
     final ep2 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
     final same = (ep1.steps == ep2.steps) && ((ep1.totalCost - ep2.totalCost).abs() < 1e-9);
     stdout.writeln(
-        'Determinism probe: steps ${ep1.steps} vs ${ep2.steps} | '
-            'cost ${ep1.totalCost.toStringAsFixed(6)} vs ${ep2.totalCost.toStringAsFixed(6)} '
-            '=> ${same ? "OK" : "NONDETERMINISTIC!"}'
+      'Determinism probe: steps ${ep1.steps} vs ${ep2.steps} | '
+          'cost ${ep1.totalCost.toStringAsFixed(6)} vs ${ep2.totalCost.toStringAsFixed(6)} '
+          '=> ${same ? "OK" : "NONDETERMINISTIC!"}',
     );
   }
 
@@ -333,7 +336,8 @@ void main(List<String> args) async {
       // Deterministic eval for logging and model selection
       final ev = await evalDeterministic(nSeeds: evalSeeds);
       stdout.writeln(
-          'Eval → avgCost=${ev.avgCost.toStringAsFixed(3)} | steps=${ev.avgSteps} | land%=${ev.landPct.toStringAsFixed(1)}');
+        'Eval → avgCost=${ev.avgCost.toStringAsFixed(3)} | steps=${ev.avgSteps} | land%=${ev.landPct.toStringAsFixed(1)}',
+      );
 
       // Model selection: prefer lower cost, break ties by land%
       bool isBest = false;
