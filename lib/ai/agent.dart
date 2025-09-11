@@ -1,5 +1,4 @@
 // lib/ai/agent.dart
-import 'dart:io' as io;
 import 'dart:math' as math;
 
 import '../engine/game_engine.dart' as eng;
@@ -932,8 +931,15 @@ class Trainer {
               'plan_hold': planHold,
             },
           ));
+        } else {
+          // heartbeat so late subscribers still see something
+          IntentBus.instance.publishIntent(IntentEvent(
+            intent: kIntentNames[currentIntentIdx],
+            probs: const [], // same as prior, or omit
+            step: t,
+            meta: {'hold': true, 'framesLeft': framesLeft},
+          ));
         }
-
         final intent = indexToIntent(currentIntentIdx);
         final u = controllerForIntent(intent, env);
 

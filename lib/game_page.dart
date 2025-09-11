@@ -11,6 +11,7 @@ import 'package:flutter/services.dart' show rootBundle;
 
 // IMPORTANT: use the same package: import everywhere (UI + agent + trainer)
 import 'package:flutter_application_1/ai/intent_bus.dart';
+import 'package:flutter_application_1/ai/runtime_policy.dart';
 
 /// ======= Demo DTOs (same as in pretrain) =======
 
@@ -111,9 +112,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   bool left = false;
   bool right = false;
 
-  // AI
+  // AI (two-stage runtime policy)
   bool aiPlay = false;
-  SimplePolicy? _policy; // auto-loaded from policy.json
+  RuntimeTwoStagePolicy? _policy;
   String _policyInfo = 'No policy loaded';
 
   // IntentBus subscriptions and UI toast helpers
@@ -137,24 +138,24 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   int _terrainSeed = DateTime.now().microsecondsSinceEpoch;
   bool _useFixedSeed = false; // set true to freeze terrain for debugging
 
-  // Timing
+  // Timing/frame
   late DateTime _last;
+  int _frame = 0;
 
   @override
   void initState() {
     super.initState();
-    debugPrint('[BUS/UI] instance = ${IntentBus.instance.debugId}');
+//    debugPrint('[BUS/UI] instance = ${IntentBus.instance.debugId}');
     _ticker = createTicker(_onTick)..start();
     _last = DateTime.now();
 
     // Subscribe to the global singleton bus
-    _intentSub = IntentBus.instance.intents.listen((e) {
-      // Show toast regardless; if you want only under AI control, gate by `if (!aiPlay) return;`
+    _intentSub = IntentBus.instance.intentsWithReplay().listen((e) {
       _lastIntent = e.intent;
       _showIntentToast('Intent: ${e.intent}');
       debugPrint('[BUS/UI] intent=${e.intent} probs=${e.probs}');
     });
-    _controlSub = IntentBus.instance.controls.listen((c) {
+    _controlSub = IntentBus.instance.controlsWithReplay().listen((c) {
       debugPrint('[BUS/UI] control: T=${c.thrust} L=${c.left} R=${c.right} meta=${c.meta}');
     });
 
@@ -210,6 +211,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
             _showIntentToast('…waiting for AI intent');
           }
         });
+      } else {
+        // On AI off, reset planner so it re-plans next time
+        _policy?.resetPlanner();
       }
     });
     _showIntentToast(aiPlay ? 'AI: ON' : 'AI: OFF');
@@ -247,7 +251,11 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
       // Clear manual controls
       thrust = left = right = false;
+      _frame = 0;
     });
+
+    // Also reset planner so the next frame will (re)plan immediately
+    _policy?.resetPlanner();
 
     debugPrint('[GamePage.reset] W=${size.width.toStringAsFixed(1)} '
         'H=${size.height.toStringAsFixed(1)} seed=$_terrainSeed '
@@ -259,7 +267,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _demoEpisodes.add(DemoEpisode(List.of(_currentSteps), landed: false));
       _currentSteps.clear();
     }
-    final inputSize = 11 + _feGroundSamples; // MUST match trainer/runtime
+    // IMPORTANT: match training (10 + groundSamples), angle not sin/cos
+    final inputSize = 10 + _feGroundSamples;
     final ds = DemoSet(inputSize: inputSize, episodes: _demoEpisodes);
 
     try {
@@ -279,30 +288,32 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   Future<void> _loadPolicy() async {
     try {
       String jsonText;
+      RuntimeTwoStagePolicy pol;
 
       // 1) Try Documents/policy.json (trainer output)
-      try {
-        final dir = await getApplicationDocumentsDirectory();
-        final file = File('${dir.path}/policy.json');
-        if (await file.exists()) {
-          jsonText = await file.readAsString();
-        } else {
-          throw const FileSystemException('policy.json not in Documents');
-        }
-      } catch (_) {
+      final dir = await getApplicationDocumentsDirectory();
+      final file = File('${dir.path}/policy.json');
+      if (await file.exists()) {
+        jsonText = await file.readAsString();
+        pol = RuntimeTwoStagePolicy.fromJson(
+          jsonText,
+          // Let FE be inferred from JSON's 'fe' block; planHold mirrors trainer default
+          planHold: 12,
+        );
+      } else {
         // 2) Fallback: bundled asset
-        jsonText = await rootBundle.loadString('assets/ai/policy.json');
+        pol = await RuntimeTwoStagePolicy.loadFromAsset(
+          'assets/ai/policy.json',
+          planHold: 12,
+        );
       }
-
-      final js = json.decode(jsonText) as Map<String, dynamic>;
-      final pol = SimplePolicy.fromJson(js);
 
       setState(() {
         _policy = pol;
         _policyInfo =
-        'Loaded policy: h1=${pol.h1}, h2=${pol.h2}, fe(gs=${pol.feGroundSamples}, stride=${pol.feStridePx})';
-        _feGroundSamples = pol.feGroundSamples;
-        _feStridePx = pol.feStridePx;
+        'Loaded policy: h1=${pol.h1}, h2=${pol.h2}, fe(gs=${pol.fe.groundSamples}, stride=${pol.fe.stridePx}), planHold=12';
+        _feGroundSamples = pol.fe.groundSamples;
+        _feStridePx = pol.fe.stridePx;
       });
 
       if (!mounted) return;
@@ -324,26 +335,16 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     setState(() {
       // --- If AI is active, compute controls here (override manual) ---
       if (aiPlay && _policy != null && _worldSize != null) {
-        final feats = _extractFeatures(
-          position: lander.position,
-          velocity: lander.velocity,
-          angle: lander.angle,
-          fuel: lander.fuel,
+        final (thr, lf, rt) = _policy!.actWithIntent(
+          lander: lander,
           terrain: _terrain!,
           worldW: _worldSize!.width,
           worldH: _worldSize!.height,
-          groundSamples: _feGroundSamples,
-          stridePx: _feStridePx,
+          step: _frame,
         );
-        final act = _policy!.actGreedy(
-          feats,
-          angle: lander.angle,
-          dxToPad: (lander.position.dx - _terrain!.padCenter) / (_worldSize!.width),
-          thrThresh: 0.35, // works well for greedy
-        );
-        thrust = act.thrust;
-        left = act.left;
-        right = act.right;
+        thrust = thr;
+        left = lf;
+        right = rt;
       }
 
       // --- Controls & rotation (apply scale 0.5) ---
@@ -456,11 +457,12 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
       // --- Commit state ---
       lander = lander.copyWith(position: pos, velocity: vel, angle: angle, fuel: fuel);
+      _frame++;
     });
   }
 
   /// Matches training/runtime feature layout:
-  /// [px, py, vx, vy, sinA, cosA, fuel, padCenter, dxCenter, dGround, slope, samples...]
+  /// [px, py, vx, vy, ang, fuel, padCenter, dxCenter, dGround, slope, samples...]
   List<double> _extractFeatures({
     required Offset position,
     required Offset velocity,
@@ -476,8 +478,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final py = position.dy / worldH;
     final vx = (velocity.dx / 200.0).clamp(-2.0, 2.0);
     final vy = (velocity.dy / 200.0).clamp(-2.0, 2.0);
-    final sinA = math.sin(angle);
-    final cosA = math.cos(angle);
+    final ang = (angle / math.pi).clamp(-1.5, 1.5); // IMPORTANT: use angle (not sin/cos)
     final fuelN = (fuel / t.maxFuel).clamp(0.0, 1.0);
 
     final padCenter = ((_terrain!.padX1 + _terrain!.padX2) * 0.5) / worldW;
@@ -491,17 +492,18 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final slope = (((gyR - gyL) / 40.0) / 0.5).clamp(-2.0, 2.0);
 
     final n = groundSamples;
-    final half = (n - 1) ~/ 2;
     final samples = <double>[];
-    for (int i = -half; i <= half; i++) {
-      final sx = (position.dx + i * stridePx).clamp(0.0, worldW);
+    final center = (n - 1) / 2.0;
+    for (int k = 0; k < n; k++) {
+      final relIndex = k - center;
+      final sx = (position.dx + relIndex * stridePx).clamp(0.0, worldW);
       final sy = terrain.heightAt(sx);
       final rel = ((sy - position.dy) / worldH).clamp(-1.0, 1.0);
       samples.add(rel);
     }
 
     return [
-      px, py, vx, vy, sinA, cosA, fuelN,
+      px, py, vx, vy, ang, fuelN,
       padCenter, dxCenter, dGround, slope,
       ...samples,
     ];
@@ -1025,125 +1027,5 @@ class GamePainter extends CustomPainter {
         old.thrusting != thrusting ||
         old.status != status ||
         old.particles != particles;
-  }
-}
-
-/// ===== Simple runtime policy (loads policy.json and acts greedily) =====
-
-class SimplePolicy {
-  final int inputSize;
-  final int h1;
-  final int h2;
-  final List<List<double>> W1, W2, W_thr, W_turn;
-  final List<double> b1, b2, b_thr, b_turn;
-  final int feGroundSamples;
-  final double feStridePx;
-
-  SimplePolicy({
-    required this.inputSize,
-    required this.h1,
-    required this.h2,
-    required this.W1,
-    required this.b1,
-    required this.W2,
-    required this.b2,
-    required this.W_thr,
-    required this.b_thr,
-    required this.W_turn,
-    required this.b_turn,
-    required this.feGroundSamples,
-    required this.feStridePx,
-  });
-
-  static SimplePolicy fromJson(Map<String, dynamic> j) {
-    List<List<double>> _mat(dynamic m) =>
-        (m as List).map<List<double>>((r) => (r as List).map((x) => (x as num).toDouble()).toList()).toList();
-    List<double> _vec(dynamic v) => (v as List).map((x) => (x as num).toDouble()).toList();
-
-    final fe = (j['fe'] as Map<String, dynamic>?);
-    final gs = fe?['groundSamples'] as int? ?? 3;
-    final sp = (fe?['stridePx'] as num?)?.toDouble() ?? 48.0;
-
-    return SimplePolicy(
-      inputSize: j['inputSize'] as int,
-      h1: j['h1'] as int,
-      h2: j['h2'] as int,
-      W1: _mat(j['W1']),
-      b1: _vec(j['b1']),
-      W2: _mat(j['W2']),
-      b2: _vec(j['b2']),
-      W_thr: _mat(j['W_thr']),
-      b_thr: _vec(j['b_thr']),
-      W_turn: _mat(j['W_turn']),
-      b_turn: _vec(j['b_turn']),
-      feGroundSamples: gs,
-      feStridePx: sp,
-    );
-  }
-
-  // small helpers
-  static List<double> _matVec(List<List<double>> W, List<double> x) {
-    final out = List<double>.filled(W.length, 0.0);
-    for (int i = 0; i < W.length; i++) {
-      double s = 0.0;
-      final Wi = W[i];
-      for (int j = 0; j < Wi.length; j++) s += Wi[j] * x[j];
-      out[i] = s;
-    }
-    return out;
-  }
-
-  static List<double> _reluVec(List<double> v) =>
-      v.map((e) => e > 0 ? e : 0.0).toList();
-
-  static double _sigmoid(double z) => 1.0 / (1.0 + math.exp(-z));
-
-  static int _argmax(List<double> a) {
-    var bi = 0; var bv = a[0];
-    for (var i=1;i<a.length;i++) { if (a[i] > bv) { bv=a[i]; bi=i; } }
-    return bi;
-  }
-
-  ({bool thrust, bool left, bool right}) actGreedy(
-      List<double> x, {
-        required double angle,
-        required double dxToPad, // -1..+1 approx
-        double thrThresh = 0.35,
-      }) {
-    // forward
-    final z1 = _matVec(W1, x);
-    for (int i=0;i<z1.length;i++) z1[i] += b1[i];
-    final h1v = _reluVec(z1);
-    final z2 = _matVec(W2, h1v);
-    for (int i=0;i<z2.length;i++) z2[i] += b2[i];
-    final h2v = _reluVec(z2);
-
-    // thrust (Bernoulli)
-    final thrLogit = _matVec(W_thr, h2v)[0] + b_thr[0];
-    final thrP = _sigmoid(thrLogit);
-    final thr = thrP > thrThresh;
-
-    // turn (3-class)
-    final turnLogits = _matVec(W_turn, h2v);
-    for (int i=0;i<3;i++) turnLogits[i] += b_turn[i];
-
-    // tiny priors (dx to pad & angle) – nudge toward reasonable direction
-    const kDx = 0.2; const dxDead = 0.05;
-    if (dxToPad.abs() > dxDead) {
-      turnLogits[1] += (dxToPad > 0 ? kDx : -kDx) * dxToPad.abs(); // left if pad is left
-      turnLogits[2] += (dxToPad < 0 ? kDx : -kDx) * dxToPad.abs(); // right if pad is right
-    }
-    const kAng = 0.3; const angDead = 5 * math.pi / 180;
-    if (angle.abs() > angDead) {
-      final sign = angle >= 0 ? 1.0 : -1.0;
-      final angN = (angle.abs() / (math.pi / 2)).clamp(0.0, 1.0);
-      turnLogits[1] += (sign > 0 ? kAng : -kAng) * angN; // counter-rotate
-      turnLogits[2] += (sign < 0 ? kAng : -kAng) * angN;
-    }
-
-    final cls = _argmax(turnLogits);
-    final left = cls == 1;
-    final right = cls == 2;
-    return (thrust: thr, left: left, right: right);
   }
 }

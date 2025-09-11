@@ -51,23 +51,51 @@ List<double> _vec(dynamic v) =>
     policy = PolicyNetwork(inputSize: inputSizeJ, h1: h1J, h2: h2J, seed: 1234);
   }
 
+  // trunk
   policy
     ..W1 = _mat(js['W1'])
     ..b1 = _vec(js['b1'])
     ..W2 = _mat(js['W2'])
     ..b2 = _vec(js['b2']);
 
-  if (js.containsKey('W_thr') && js.containsKey('W_turn')) {
+  // ---- Heads: load what exists (support legacy & two-stage) ----
+  final hasThrTurn = js.containsKey('W_thr') &&
+      js.containsKey('b_thr') &&
+      js.containsKey('W_turn') &&
+      js.containsKey('b_turn');
+
+  if (hasThrTurn) {
     policy
       ..W_thr = _mat(js['W_thr'])
       ..b_thr = _vec(js['b_thr'])
       ..W_turn = _mat(js['W_turn'])
       ..b_turn = _vec(js['b_turn']);
-  } else {
-    throw ArgumentError('Policy JSON is missing W_thr/W_turn heads.');
+  }
+
+  final hasIntent = js.containsKey('W_intent') && js.containsKey('b_intent');
+  if (hasIntent) {
+    policy
+      ..W_intent = _mat(js['W_intent'])
+      ..b_intent = _vec(js['b_intent']);
+  }
+
+  final hasValue = js.containsKey('W_val') && js.containsKey('b_val');
+  if (hasValue) {
+    policy
+      ..W_val = _mat(js['W_val'])
+      ..b_val = _vec(js['b_val']);
+  }
+
+  // If neither legacy nor intent heads exist, bail with a clear message.
+  if (!hasThrTurn && !hasIntent) {
+    throw ArgumentError(
+      'Policy JSON has no action heads: expected either '
+          'single-stage (W_thr/W_turn) or two-stage (W_intent).',
+    );
   }
 
   final fe = (js['fe'] as Map<String, dynamic>?) ?? const {};
+  // Training FE = 10 + groundSamples (px,py,vx,vy,ang,fuel,padCenter,dxCenter,dGround,slope)
   final gs = (fe['groundSamples'] as int?) ?? (inputSizeJ - 10);
   final stride = (fe['stridePx'] as num?)?.toDouble() ?? 48.0;
 
@@ -81,7 +109,7 @@ Future<void> _savePolicy(
     int gs,
     double stride,
     ) async {
-  final js = {
+  final js = <String, dynamic>{
     'inputSize': inputSize,
     'h1': p.h1,
     'h2': p.h2,
@@ -89,10 +117,15 @@ Future<void> _savePolicy(
     'b1': p.b1,
     'W2': p.W2,
     'b2': p.b2,
+    // Save both legacy and two-stage heads if present (they always exist in PolicyNetwork)
     'W_thr': p.W_thr,
     'b_thr': p.b_thr,
     'W_turn': p.W_turn,
     'b_turn': p.b_turn,
+    'W_intent': p.W_intent,
+    'b_intent': p.b_intent,
+    'W_val': p.W_val,
+    'b_val': p.b_val,
     'fe': {'groundSamples': gs, 'stridePx': stride},
   };
   await _writePrettyJson(path, js);
@@ -104,9 +137,9 @@ void main(List<String> args) async {
   int iters = 20000;
   int saveEvery = 50;
   int batch = 16; // episodes per outer iteration
-  double baseLr = 3e-4; // per-episode LR (no /batch by default)
+  double baseLr = 3e-4; // per-episode LR (before /batch below)
 
-  double tempThr = 0.9; // exploration (train-time)
+  double tempThr = 0.9; // exploration (train-time, single-stage only)
   double tempTurn = 1.2;
   double epsilon = 0.05;
   double entropyBeta = 0.003;
@@ -175,7 +208,8 @@ void main(List<String> args) async {
     seed: 1234,
   );
 
-  policy.b_thr[0] = -0.2; // Make boost biased off
+  // Bias throttle slightly off at the start (legacy head)
+  policy.b_thr[0] = -0.2;
 
   // --------------- Load init (BC or previous) ---------------
   Map<String, dynamic>? initJs;
@@ -215,28 +249,28 @@ void main(List<String> args) async {
   final rnd = math.Random(7);
 
   // Train-time exploration (optionally disabled)
-  final double trainEps      = noExplore ? 0.0 : epsilon;
-  final double trainTempThr  = noExplore ? 0.2 : tempThr;   // keep throttle tight
-  final double trainTempTurn = noExplore ? 0.7 : tempTurn;  // keep some turn exploration
-  final double trainEntropy  = noExplore ? 0.01 : entropyBeta;
+  final double trainEps = noExplore ? 0.0 : epsilon;
+  final double trainTempThr = noExplore ? 0.2 : tempThr; // (legacy head)
+  final double trainTempTurn = noExplore ? 0.7 : tempTurn;
+  final double trainEntropy = noExplore ? 0.01 : entropyBeta;
 
   final trainer = Trainer(
-      env: env,
-      fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
-      policy: policy,
-      dt: 1/60.0,
-      gamma: 0.99,
-      seed: 13,
-      // single-stage exploration (unused when twoStage=true)
-      tempThr:  trainTempThr,
-      tempTurn: trainTempTurn,
-      epsilon:  trainEps,
-      entropyBeta: trainEntropy,
-      // turn this on:
-      twoStage: true,
-      planHold: 12,           // re-plan intent every 12 frames (~0.2s @ 60Hz)
-      tempIntent: 0.8,        // softer sampling for planner
-      intentEntropyBeta: 0.01 // small entropy on intents
+    env: env,
+    fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
+    policy: policy,
+    dt: 1 / 60.0,
+    gamma: 0.99,
+    seed: 13,
+    // single-stage exploration (unused when twoStage=true)
+    tempThr: trainTempThr,
+    tempTurn: trainTempTurn,
+    epsilon: trainEps,
+    entropyBeta: trainEntropy,
+    // two-stage on:
+    twoStage: true,
+    planHold: 12, // re-plan intent every 12 frames (~0.2s @ 60Hz)
+    tempIntent: 0.8, // softer sampling for planner
+    intentEntropyBeta: 0.01, // small entropy on intents
   );
 
   // Deterministic evaluation trainer (no exploration)
@@ -244,16 +278,16 @@ void main(List<String> args) async {
     env: env,
     fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
     policy: policy,
-    dt: 1/60.0,
+    dt: 1 / 60.0,
     gamma: 0.99,
     seed: 13,
     tempThr: 1e-6,
     tempTurn: 1e-6,
     epsilon: 0.0,
     entropyBeta: 0.0,
-    twoStage: true,          // <-- keep the same architecture
+    twoStage: true, // keep the same architecture
     planHold: 12,
-    tempIntent: 1e-6,        // greedy planner
+    tempIntent: 1e-6, // greedy planner
     intentEntropyBeta: 0.0,
   );
 
@@ -263,12 +297,12 @@ void main(List<String> args) async {
     final ep1 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
     env.reset(seed: s);
     final ep2 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
-    final same = (ep1.steps == ep2.steps) && ((ep1.totalCost - ep2.totalCost).abs() < 1e-9);
+    final same =
+        (ep1.steps == ep2.steps) && ((ep1.totalCost - ep2.totalCost).abs() < 1e-9);
     stdout.writeln(
         'Determinism probe: steps ${ep1.steps} vs ${ep2.steps} | '
             'cost ${ep1.totalCost.toStringAsFixed(6)} vs ${ep2.totalCost.toStringAsFixed(6)} '
-            '=> ${same ? "OK" : "NONDETERMINISTIC!"}'
-    );
+            '=> ${same ? "OK" : "NONDETERMINISTIC!"}');
   }
 
   int nextEpisodeSeed() {
@@ -277,8 +311,14 @@ void main(List<String> args) async {
   }
 
   // --------------- Deterministic evaluation helper ---------------
-  Future<({double avgCost, int avgSteps, double landPct, double turnPct, double thrustPct})>
-  evalDeterministic({int nSeeds = 5}) async {
+  Future<
+      ({
+      double avgCost,
+      int avgSteps,
+      double landPct,
+      double turnPct,
+      double thrustPct
+      })> evalDeterministic({int nSeeds = 5}) async {
     final seeds = List.generate(
       nSeeds,
           (i) => overfit ? fixedSeed : (1000 + i), // fixed small set
@@ -305,7 +345,13 @@ void main(List<String> args) async {
     final landPct = 100.0 * lands / nSeeds;
     final turnPct = sumSteps == 0 ? 0.0 : 100.0 * (sumTurnSteps / sumSteps);
     final thrustPct = sumSteps == 0 ? 0.0 : 100.0 * (sumThrustSteps / sumSteps);
-    return (avgCost: avgCost, avgSteps: avgSteps, landPct: landPct, turnPct: turnPct, thrustPct: thrustPct);
+    return (
+    avgCost: avgCost,
+    avgSteps: avgSteps,
+    landPct: landPct,
+    turnPct: turnPct,
+    thrustPct: thrustPct
+    );
   }
 
   // --------------- Training loop (batched) ---------------
@@ -317,7 +363,7 @@ void main(List<String> args) async {
   const landWindowSize = 200;
 
   for (int it = 1; it <= iters; it++) {
-    // Per-episode LR
+    // Per-episode LR: split across episodes in batch
     final epLr = baseLr / batch;
 
     double lastCost = 0.0;
@@ -390,8 +436,7 @@ void main(List<String> args) async {
         final ev = await evalDeterministic(nSeeds: evalSeeds);
         stdout.writeln(
           '[On Save] Eval → avgCost=${ev.avgCost.toStringAsFixed(3)} | steps=${ev.avgSteps} '
-              '| land%=${ev.landPct.toStringAsFixed(1)} | turn%=${ev.turnPct.toStringAsFixed(1)} '
-              '| thrust%=${ev.thrustPct.toStringAsFixed(1)}',
+              '| land%=${ev.landPct.toStringAsFixed(1)} | turn%=${ev.thrustPct.toStringAsFixed(1)}',
         );
       }
     }
