@@ -137,35 +137,32 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
   bool left = false, right = false, thrust = false;
 
-  // angle PD toward desired angle (lean into correcting dx and vx)
-  double targetAngle = 0.0;
-  const kAngDx = 0.006;     // how much horizontal error affects target angle
-  const kAngVx = 0.012;     // how much vx affects target angle
-  const maxTilt = 15 * math.pi / 180;
+  // --- Horizontal: target angle from desired horizontal velocity ---
+  const double vxGoalAbs = 60.0;   // px/s target sideways speed
+  const double kAngV     = 0.012;  // maps (vx_des - vx) -> angle command
+  const double kDxHover  = 0.40;   // mild centering only for hover
+  const double maxTilt   = 15 * math.pi / 180;
 
+  double vxDes = 0.0;
   switch (intent) {
-    case Intent.goLeft:
-      targetAngle = (-kAngDx * dx - kAngVx * vx).clamp(-maxTilt, maxTilt);
-      break;
-    case Intent.goRight:
-      targetAngle = (kAngDx * dx + kAngVx * vx).clamp(-maxTilt, maxTilt);
-      break;
-    case Intent.hoverCenter:
-      targetAngle = (-0.5 * kAngDx * dx - 0.5 * kAngVx * vx).clamp(-maxTilt, maxTilt);
-      break;
+    case Intent.goLeft:       vxDes = -vxGoalAbs; break;
+    case Intent.goRight:      vxDes = vxGoalAbs; break;
+    case Intent.hoverCenter:  vxDes = -kDxHover * dx; break;   // drift toward pad
     case Intent.descendSlow:
-      targetAngle = 0.0;
-      break;
     case Intent.brakeUp:
-      targetAngle = 0.0;
+      vxDes = 0.0;
       break;
   }
 
+  // Angle command: positive angle -> right thrust
+  double targetAngle = (kAngV * (vxDes - vx)).clamp(-maxTilt, maxTilt);
+
+  // Apply attitude deadzone and map to left/right thrusters
   const angDead = 3 * math.pi / 180;
   if (angle > targetAngle + angDead) left = true;
   if (angle < targetAngle - angDead) right = true;
 
-  // vertical PD for thrust target
+  // --- Vertical: keep descent within targets (same as before) ---
   double targetVy = 60.0; // px/s downward normally
   if (intent == Intent.descendSlow) targetVy = 30.0;
   if (intent == Intent.brakeUp)     targetVy = -20.0;
@@ -180,9 +177,7 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   thrust = eVy > 0; // burn if falling faster than target
 
   // avoid ceiling hover
-  if (L.pos.y < env.cfg.ceilingMargin) {
-    thrust = false;
-  }
+  if (L.pos.y < env.cfg.ceilingMargin) thrust = false;
 
   return et.ControlInput(thrust: thrust, left: left, right: right);
 }

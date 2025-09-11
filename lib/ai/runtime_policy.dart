@@ -114,50 +114,43 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
 
   bool left = false, right = false, thrust = false;
 
-  // angle PD toward desired angle (lean into correcting dx and vx)
-  double targetAngle = 0.0;
-  const kAngDx = 0.006;
-  const kAngVx = 0.012;
-  const maxTilt = 15 * math.pi / 180;
+  // --- Horizontal (absolute) ---
+  const double vxGoalAbs = 60.0;
+  const double kAngV     = 0.012;
+  const double kDxHover  = 0.40;
+  const double maxTilt   = 15 * math.pi / 180;
 
+  double vxDes = 0.0;
   switch (intent) {
-    case Intent.goLeft:
-      targetAngle = (-kAngDx * dx - kAngVx * vx).clamp(-maxTilt, maxTilt);
-      break;
-    case Intent.goRight:
-      targetAngle = (kAngDx * dx + kAngVx * vx).clamp(-maxTilt, maxTilt);
-      break;
-    case Intent.hoverCenter:
-      targetAngle = (-0.5 * kAngDx * dx - 0.5 * kAngVx * vx).clamp(-maxTilt, maxTilt);
-      break;
+    case Intent.goLeft:       vxDes = -vxGoalAbs; break;
+    case Intent.goRight:      vxDes = vxGoalAbs; break;
+    case Intent.hoverCenter:  vxDes = -kDxHover * dx; break;
     case Intent.descendSlow:
     case Intent.brakeUp:
-      targetAngle = 0.0;
+      vxDes = 0.0;
       break;
   }
+
+  double targetAngle = (kAngV * (vxDes - vx)).clamp(-maxTilt, maxTilt);
 
   const angDead = 3 * math.pi / 180;
   if (angle > targetAngle + angDead) left = true;
   if (angle < targetAngle - angDead) right = true;
 
-  // vertical PD for thrust target
-  double targetVy = 60.0;                // px/s downward normally
+  // --- Vertical (same as trainer) ---
+  double targetVy = 60.0;
   if (intent == Intent.descendSlow) targetVy = 30.0;
   if (intent == Intent.brakeUp)     targetVy = -20.0;
 
-  // stricter near ground
   final groundY = terrain.heightAt(lander.position.dx);
   final height = groundY - lander.position.dy;
   if (height < 120) targetVy = math.min(targetVy, 20.0);
   if (height <  60) targetVy = math.min(targetVy, 10.0);
 
   final eVy = vy - targetVy;
-  thrust = eVy > 0;                      // burn if falling faster than target
+  thrust = eVy > 0;
 
-  // avoid ceiling hover (UI has hard ceiling at y=0)
-  if (lander.position.dy < 0 + 4) {
-    thrust = false;
-  }
+  if (lander.position.dy < 4) thrust = false;
 
   return (thrust: thrust, left: left, right: right);
 }
