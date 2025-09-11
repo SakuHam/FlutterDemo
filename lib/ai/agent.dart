@@ -783,7 +783,7 @@ class Trainer {
     this.tempTurn = 1.0,
     this.epsilon = 0.0,
     this.entropyBeta = 0.0,
-    // two-stage defaults (off by default to preserve behavior)
+    // two-stage defaults (on by default here)
     this.twoStage = true,
     this.planHold = 12,
     this.tempIntent = 1.0,
@@ -861,7 +861,7 @@ class Trainer {
           entropyBeta: entropyBeta,
           valueBeta: valueBeta,
           huberDelta: huberDelta,
-          intentMode: true,
+          intentMode: false, // FIX: train the single-stage heads here
         );
       }
 
@@ -879,7 +879,6 @@ class Trainer {
       );
     } else {
       // ----------------------- Two-stage path (planner/controller) --------------
-      // ---------------- two-stage path ----------------
       final decisionCaches = <_Forward>[];
       final intentChoices  = <int>[];
       final decisionTimes  = <int>[];
@@ -887,6 +886,10 @@ class Trainer {
 
       final intentCounts = List<int>.filled(PolicyNetwork.kIntents, 0);
       int intentSwitches = 0;
+
+      // NEW: actuation counters for diagnostics
+      int turnSteps = 0, leftSteps = 0, rightSteps = 0, thrustSteps = 0;
+      double thrProbSum = 0.0; // stays 0.0 in two-stage (no p_thr here)
 
       int t = 0;
       int framesLeft = 0;
@@ -940,6 +943,12 @@ class Trainer {
           meta: {'intent': kIntentNames[currentIntentIdx]},
         ));
 
+        // NEW: count actuation for diagnostics
+        if (u.left || u.right) turnSteps++;
+        if (u.left) leftSteps++;
+        if (u.right) rightSteps++;
+        if (u.thrust) thrustSteps++;
+
         final info = env.step(dt, et.ControlInput(thrust: u.thrust, left: u.left, right: u.right));
         final s = info.scoreDelta;
         costs.add(scoreIsReward ? -s : s);
@@ -983,6 +992,12 @@ class Trainer {
 
       return EpisodeResult(
         totalCost, costs.length, landed,
+        // expose actuation diagnostics so your logs show non-zero %
+        turnSteps: turnSteps,
+        leftSteps: leftSteps,
+        rightSteps: rightSteps,
+        thrustSteps: thrustSteps,
+        avgThrProb: thrProbSum,
         intentCounts: intentCounts,
         intentSwitches: intentSwitches,
       );

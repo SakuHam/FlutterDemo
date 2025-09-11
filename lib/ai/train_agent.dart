@@ -228,10 +228,10 @@ void main(List<String> args) async {
       gamma: 0.99,
       seed: 13,
       // single-stage exploration (unused when twoStage=true)
-      tempThr: tempThr,
-      tempTurn: tempTurn,
-      epsilon: epsilon,
-      entropyBeta: entropyBeta,
+      tempThr:  trainTempThr,
+      tempTurn: trainTempTurn,
+      epsilon:  trainEps,
+      entropyBeta: trainEntropy,
       // turn this on:
       twoStage: true,
       planHold: 12,           // re-plan intent every 12 frames (~0.2s @ 60Hz)
@@ -243,14 +243,18 @@ void main(List<String> args) async {
   final evalTrainer = Trainer(
     env: env,
     fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
-    policy: policy, // share the SAME policy instance
-    dt: 1 / 60.0,
+    policy: policy,
+    dt: 1/60.0,
     gamma: 0.99,
     seed: 13,
     tempThr: 1e-6,
     tempTurn: 1e-6,
     epsilon: 0.0,
     entropyBeta: 0.0,
+    twoStage: true,          // <-- keep the same architecture
+    planHold: 12,
+    tempIntent: 1e-6,        // greedy planner
+    intentEntropyBeta: 0.0,
   );
 
   {
@@ -313,8 +317,8 @@ void main(List<String> args) async {
   const landWindowSize = 200;
 
   for (int it = 1; it <= iters; it++) {
-    // Per-episode LR (no /batch; adjust if Trainer accumulates differently)
-    final epLr = baseLr;
+    // Per-episode LR
+    final epLr = baseLr / batch;
 
     double lastCost = 0.0;
     int lastSteps = 0;
