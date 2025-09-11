@@ -2,11 +2,10 @@
 import 'dart:async';
 
 class IntentEvent {
-  final String intent;            // e.g. "goLeft"
-  final List<double> probs;       // softmax over intents (optional)
-  final int step;                 // env step when chosen (optional)
-  final Map<String, Object?> meta; // anything else (episodeId, seed, etc.)
-
+  final String intent;
+  final List<double> probs;
+  final int step;
+  final Map<String, Object?> meta;
   IntentEvent({
     required this.intent,
     this.probs = const [],
@@ -19,7 +18,6 @@ class ControlEvent {
   final bool thrust, left, right;
   final int step;
   final Map<String, Object?> meta;
-
   ControlEvent({
     required this.thrust,
     required this.left,
@@ -30,8 +28,11 @@ class ControlEvent {
 }
 
 class IntentBus {
+  // ---- REAL SINGLETON ----
+  static final IntentBus _singleton = IntentBus._internal();
   IntentBus._internal();
-  static final IntentBus instance = IntentBus._internal();
+  factory IntentBus() => _singleton;
+  static IntentBus get instance => _singleton;
 
   final _intentCtrl = StreamController<IntentEvent>.broadcast();
   final _controlCtrl = StreamController<ControlEvent>.broadcast();
@@ -42,11 +43,11 @@ class IntentBus {
   void publishIntent(IntentEvent e) => _intentCtrl.add(e);
   void publishControl(ControlEvent e) => _controlCtrl.add(e);
 
+  // Debug helper to verify same instance across imports
+  String get debugId => 'IntentBus#${identityHashCode(this)}';
+
   void dispose() {
     _intentCtrl.close();
     _controlCtrl.close();
   }
 }
-
-// (Optional) a short alias
-IntentBus get intentBus => IntentBus.instance;

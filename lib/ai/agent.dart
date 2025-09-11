@@ -697,7 +697,7 @@ extension PolicyOps on PolicyNetwork {
     double valueBeta = 0.5,
     double huberDelta = 1.0,
     // mode
-    bool intentMode = false,
+    bool intentMode = true,
   }) {
     if (intentMode) {
       _updateIntentStage(
@@ -861,7 +861,7 @@ class Trainer {
           entropyBeta: entropyBeta,
           valueBeta: valueBeta,
           huberDelta: huberDelta,
-          intentMode: false,
+          intentMode: true,
         );
       }
 

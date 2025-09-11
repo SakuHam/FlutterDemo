@@ -9,8 +9,8 @@ import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:path_provider/path_provider.dart';
 import 'package:flutter/services.dart' show rootBundle;
 
-// 🚦 intent bus (singleton)
-import '../ai/intent_bus.dart'; // <-- adjust path if needed
+// IMPORTANT: use the same package: import everywhere (UI + agent + trainer)
+import 'package:flutter_application_1/ai/intent_bus.dart';
 
 /// ======= Demo DTOs (same as in pretrain) =======
 
@@ -89,7 +89,7 @@ class Particle {
 class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin {
   late final Ticker _ticker;
 
-  static const double kLandingSpeedMax = 5.0;                 // was 40.0
+  static const double kLandingSpeedMax = 5.0;                  // was 40.0
   static const double kLandingAngleMaxRad = 8 * math.pi / 180; // was ~14.3° (0.25 rad)
 
   // Tunables
@@ -113,8 +113,14 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
   // AI
   bool aiPlay = false;
-  SimplePolicy? _policy; // loaded from policy.json
+  SimplePolicy? _policy; // auto-loaded from policy.json
   String _policyInfo = 'No policy loaded';
+
+  // IntentBus subscriptions and UI toast helpers
+  StreamSubscription<IntentEvent>? _intentSub;
+  StreamSubscription<ControlEvent>? _controlSub;
+  String? _lastIntent;
+  Timer? _idleToastTimer;
 
   // Demo recording
   bool recordDemos = false;
@@ -134,65 +140,79 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   // Timing
   late DateTime _last;
 
-  // ------------ Intent Bus (toast) ------------
-  StreamSubscription<IntentEvent>? _intentSub;
-  String? _toastText;
-  bool _toastVisible = false;
-  Timer? _toastTimer;
-
-  // UI-synthesized intent cadence
-  int _uiPlanHold = 12;     // frames to hold a UI intent
-  int _uiFramesLeft = 0;
-  String? _uiCurrentIntent; // last computed UI intent
-
   @override
   void initState() {
     super.initState();
+    debugPrint('[BUS/UI] instance = ${IntentBus.instance.debugId}');
     _ticker = createTicker(_onTick)..start();
     _last = DateTime.now();
 
     // Subscribe to the global singleton bus
-    debugPrint('[BUS/UI] initState');
     _intentSub = IntentBus.instance.intents.listen((e) {
-      // show toast on ANY event (even if AI is off) so UI is never silent
-      _showIntentToast(e.intent);
+      // Show toast regardless; if you want only under AI control, gate by `if (!aiPlay) return;`
+      _lastIntent = e.intent;
+      _showIntentToast('Intent: ${e.intent}');
       debugPrint('[BUS/UI] intent=${e.intent} probs=${e.probs}');
     });
+    _controlSub = IntentBus.instance.controls.listen((c) {
+      debugPrint('[BUS/UI] control: T=${c.thrust} L=${c.left} R=${c.right} meta=${c.meta}');
+    });
 
-    WidgetsBinding.instance.addPostFrameCallback((_) => _reset());
+    // Idle hint if no intents arrive shortly after enabling AI
+    _idleToastTimer = Timer(const Duration(milliseconds: 1600), () {
+      if (!mounted) return;
+      if (aiPlay && _lastIntent == null) {
+        _showIntentToast('…waiting for AI intent');
+      }
+    });
+
+    // Auto-load policy on startup
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _loadPolicy();         // load default policy.json
+      _reset();                    // start a fresh episode after loading
+    });
   }
 
   @override
   void dispose() {
     _ticker.dispose();
     _intentSub?.cancel();
-    _toastTimer?.cancel();
+    _controlSub?.cancel();
+    _idleToastTimer?.cancel();
     super.dispose();
   }
 
   void _showIntentToast(String text) {
-    setState(() {
-      _toastText = text;
-      _toastVisible = true;
-    });
-    _toastTimer?.cancel();
-    _toastTimer = Timer(const Duration(milliseconds: 900), () {
-      if (!mounted) return;
-      setState(() => _toastVisible = false);
-    });
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(text),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.only(left: 12, right: 12, bottom: 18),
+        duration: const Duration(milliseconds: 900),
+      ),
+    );
   }
 
-  void setPreset(String name) {
+  void _toggleAI() {
     setState(() {
-      if (name == 'Easy') {
-        t = t.copyWith(gravity: 0.12, thrustAccel: 0.65, rotSpeed: 2.2, maxFuel: 140);
-      } else if (name == 'Classic') {
-        t = t.copyWith(gravity: 0.18, thrustAccel: 0.42, rotSpeed: 1.6, maxFuel: 100);
-      } else if (name == 'Hard') {
-        t = t.copyWith(gravity: 0.22, thrustAccel: 0.38, rotSpeed: 1.3, maxFuel: 80);
+      aiPlay = !aiPlay;
+      if (aiPlay) {
+        // When AI starts, stop recording and clear manual inputs
+        recordDemos = false;
+        thrust = left = right = false;
+        _lastIntent = null;
+        _idleToastTimer?.cancel();
+        _idleToastTimer = Timer(const Duration(milliseconds: 1600), () {
+          if (!mounted) return;
+          if (aiPlay && _lastIntent == null) {
+            _showIntentToast('…waiting for AI intent');
+          }
+        });
       }
-      _reset();
     });
+    _showIntentToast(aiPlay ? 'AI: ON' : 'AI: OFF');
   }
 
   void _reset() {
@@ -227,11 +247,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
       // Clear manual controls
       thrust = left = right = false;
-      // Leave aiPlay as-is (user toggle)
-
-      // reset UI intent cadence
-      _uiFramesLeft = 0;
-      _uiCurrentIntent = null;
     });
 
     debugPrint('[GamePage.reset] W=${size.width.toStringAsFixed(1)} '
@@ -265,7 +280,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     try {
       String jsonText;
 
-      // 1) Try Documents/policy.json (so you can drop in new weights from the trainer)
+      // 1) Try Documents/policy.json (trainer output)
       try {
         final dir = await getApplicationDocumentsDirectory();
         final file = File('${dir.path}/policy.json');
@@ -294,26 +309,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(_policyInfo)));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Load failed: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Load policy failed: $e')));
     }
-  }
-
-  // ---------- UI-synthesized intent (so toast shows even when idle) ----------
-  String _chooseUiIntent({
-    required double dxToPad,   // normalized ~[-1,+1]
-    required double vy,        // px/s
-    required double height,    // px above ground
-    required double angle,     // rad
-  }) {
-    // Soft, readable rules; tweak to your taste
-    if (vy < -25) return 'brakeUp';            // moving up fast -> stop it
-    if (vy > 90)  return 'descendSlow';        // falling too fast -> slow down
-
-    const dxDead = 0.05; // 5% screen width
-    if (dxToPad > dxDead)  return 'goLeft';
-    if (dxToPad < -dxDead) return 'goRight';
-
-    return 'hover'; // default when idle-ish
   }
 
   void _onTick(Duration _) {
@@ -325,37 +322,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     if (!mounted || status != GameStatus.playing || _terrain == null) return;
 
     setState(() {
-      // ---------- Always compute & publish a UI intent every few frames ----------
-      final wW = _worldSize?.width ?? 360.0;
-      final dxN = (lander.position.dx - _terrain!.padCenter) / (wW == 0 ? 1.0 : wW);
-      final groundY = _terrain!.heightAt(lander.position.dx);
-      final height = (groundY - lander.position.dy);
-      if (_uiFramesLeft <= 0) {
-        final intent = _chooseUiIntent(
-          dxToPad: dxN,
-          vy: lander.velocity.dy,
-          height: height,
-          angle: lander.angle,
-        );
-        if (intent != _uiCurrentIntent) {
-          _uiCurrentIntent = intent;
-          // publish so toast shows even when AI is off
-          IntentBus.instance.publishIntent(IntentEvent(
-            intent: intent,
-            meta: {'source': 'ui'},
-          ));
-        } else {
-          // still publish periodically so there's always activity
-          IntentBus.instance.publishIntent(IntentEvent(
-            intent: intent,
-            meta: {'source': 'ui/keepalive'},
-          ));
-        }
-        _uiFramesLeft = _uiPlanHold;
-      } else {
-        _uiFramesLeft -= 1;
-      }
-
       // --- If AI is active, compute controls here (override manual) ---
       if (aiPlay && _policy != null && _worldSize != null) {
         final feats = _extractFeatures(
@@ -372,7 +338,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         final act = _policy!.actGreedy(
           feats,
           angle: lander.angle,
-          dxToPad: dxN,
+          dxToPad: (lander.position.dx - _terrain!.padCenter) / (_worldSize!.width),
           thrThresh: 0.35, // works well for greedy
         );
         thrust = act.thrust;
@@ -541,30 +507,27 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     ];
   }
 
-  Widget _menuButton() {
-    return ElevatedButton.icon(
-      style: ElevatedButton.styleFrom(
-        backgroundColor: Colors.black.withOpacity(0.55),
-        foregroundColor: Colors.white,
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      ),
-      onPressed: () async {
-        final leave = await showDialog<bool>(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            title: const Text('Return to Menu?'),
-            content: const Text('Current run will be lost.'),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-              FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Leave')),
-            ],
+  Widget _aiToggleIcon() {
+    final active = aiPlay;
+    return Tooltip(
+      message: active ? 'AI Play: ON' : 'AI Play: OFF',
+      child: InkResponse(
+        onTap: _toggleAI,
+        radius: 24,
+        child: Container(
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            color: active ? Colors.green.withOpacity(0.20) : Colors.white10,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: active ? Colors.greenAccent : Colors.white30),
           ),
-        );
-        if (leave == true) Navigator.pop(context);
-      },
-      icon: const Icon(Icons.home),
-      label: const Text('Menu'),
+          child: Icon(
+            Icons.smart_toy_outlined,
+            color: active ? Colors.greenAccent : Colors.white70,
+            size: 22,
+          ),
+        ),
+      ),
     );
   }
 
@@ -602,10 +565,13 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
+                      // Top row: back/menu on the left, nothing on right (space)
                       Padding(
                         padding: const EdgeInsets.all(12.0),
                         child: _menuButton(),
                       ),
+
+                      // Stats + AI toggle row (difficulty removed)
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
@@ -619,51 +585,22 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             title: 'Angle',
                             value: '${(lander.angle * 180 / math.pi).toStringAsFixed(0)}°',
                           ),
-                          PopupMenuButton<String>(
-                            icon: const Icon(Icons.tune),
-                            onSelected: setPreset,
-                            itemBuilder: (context) => const [
-                              PopupMenuItem(value: 'Easy', child: Text('Easy')),
-                              PopupMenuItem(value: 'Classic', child: Text('Classic')),
-                              PopupMenuItem(value: 'Hard', child: Text('Hard')),
-                            ],
-                          ),
+                          _aiToggleIcon(),
                         ],
                       ),
 
                       const SizedBox(height: 8),
 
-                      // AI & Recording controls
+                      // Recording controls (kept)
                       Wrap(
                         spacing: 8,
                         runSpacing: 8,
                         crossAxisAlignment: WrapCrossAlignment.center,
                         children: [
-                          ElevatedButton.icon(
-                            onPressed: _loadPolicy,
-                            icon: const Icon(Icons.download),
-                            label: const Text('Load policy'),
-                          ),
                           FilterChip(
-                            label: Text('AI Play${_policy == null ? ' (load first)' : ''}'),
+                            label: const Text('AI Play'),
                             selected: aiPlay,
-                            onSelected: (v) {
-                              if (_policy == null) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(content: Text('Load policy.json first')),
-                                );
-                                return;
-                              }
-                              setState(() {
-                                aiPlay = v;
-                                if (aiPlay) {
-                                  // When AI starts, stop recording (we only want human demos)
-                                  recordDemos = false;
-                                  // clear manual inputs to avoid sticky states
-                                  thrust = left = right = false;
-                                }
-                              });
-                            },
+                            onSelected: (_) => _toggleAI(),
                           ),
                           const SizedBox(width: 8),
                           FilterChip(
@@ -747,41 +684,37 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                     ),
                   ),
                 ),
-
-              // -------- Bottom toast for intent --------
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: 18,
-                child: IgnorePointer(
-                  child: AnimatedOpacity(
-                    duration: const Duration(milliseconds: 200),
-                    opacity: _toastVisible ? 1.0 : 0.0,
-                    child: Center(
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.65),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(color: Colors.white24),
-                        ),
-                        child: Text(
-                          _toastText ?? '',
-                          style: const TextStyle(
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: 0.4,
-                            color: Colors.white,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
             ],
           );
         },
       ),
+    );
+  }
+
+  Widget _menuButton() {
+    return ElevatedButton.icon(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: Colors.black.withOpacity(0.55),
+        foregroundColor: Colors.white,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+      onPressed: () async {
+        final leave = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Return to Menu?'),
+            content: const Text('Current run will be lost.'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Leave')),
+            ],
+          ),
+        );
+        if (leave == true) Navigator.pop(context);
+      },
+      icon: const Icon(Icons.home),
+      label: const Text('Menu'),
     );
   }
 
@@ -1194,7 +1127,7 @@ class SimplePolicy {
     final turnLogits = _matVec(W_turn, h2v);
     for (int i=0;i<3;i++) turnLogits[i] += b_turn[i];
 
-    // same gentle priors we used during training sampling (tiny nudges)
+    // tiny priors (dx to pad & angle) – nudge toward reasonable direction
     const kDx = 0.2; const dxDead = 0.05;
     if (dxToPad.abs() > dxDead) {
       turnLogits[1] += (dxToPad > 0 ? kDx : -kDx) * dxToPad.abs(); // left if pad is left
