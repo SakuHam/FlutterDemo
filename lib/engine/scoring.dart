@@ -20,18 +20,17 @@ class ScoringOutcome {
   });
 }
 
-/// Centralized scoring logic (time-integrated shaping + events).
-/// Everything about penalties/bonuses/landing/crash lives here.
+/// Minimal scoring: horizontal distance to pad center + ceiling/border + landing.
 class Scoring {
   static ScoringOutcome apply({
     required EngineConfig cfg,
     required Terrain terrain,
     required Vector2 pos,
     required Vector2 vel,
-    required double angle,
-    required double prevAngle,
+    required double angle,      // kept only for landing check (angle tolerance)
+    required double prevAngle,  // unused (kept for signature parity)
     required double dt,
-    required ControlInput u,
+    required ControlInput u,    // unused in this minimal scoring
   }) {
     double cost = 0.0;
 
@@ -48,7 +47,8 @@ class Scoring {
       cost += frac * cfg.ceilingPenaltyPerSec * dt;  // time integrated
     }
 
-    // Continuous edge penalty (pre-wrap position)
+    // ----- Border proximity penalty (if wrapping enabled) -----
+    // (Leave it off when hardWalls==true, only wrap/hit still applies.)
         {
       final x = pos.x;
       final dLeft = x;
@@ -61,7 +61,7 @@ class Scoring {
       }
     }
 
-    // Wrap or hard walls
+    // Wrap or hard walls (one-shot)
     if (cfg.hardWalls) {
       bool hit = false;
       double x = pos.x;
@@ -78,119 +78,49 @@ class Scoring {
       pos = Vector2(x, pos.y);
     }
 
-    // Clamp Y to world (don’t let it go above top too much)
+    // Clamp Y to world top (already handled above)
     if (pos.y < 0) pos = Vector2(pos.x, 0);
 
     // =========================
-    // Base shaping (dense) — TIME INTEGRATED
+    // The ONLY dense shaping we keep: horizontal distance to pad center
     // =========================
-    final groundY = terrain.heightAt(pos.x);
     final padCenterX = terrain.padCenter;
-
-    // Living time
-    cost += cfg.livingCost * dt;
-
-    // NOTE: effort cost must be handled by caller via "power" if desired.
-    // Here we assume caller already added cfg.effortCost * power * dt to cost,
-    // or prefers to keep effort inside physics. We won't add it here.
-
-    // Horizontal distance to pad center (normalized)
-    final dxN = (pos.x - padCenterX).abs() / cfg.worldW;
+    final dxN = (pos.x - padCenterX).abs() / cfg.worldW; // 0..~0.5
     cost += (cfg.wDx * dxN) * dt;
 
-    // Vertical distance to ground (normalized to worldH)
-    final dyN = ((groundY - pos.y).abs()) / cfg.worldH;
-    cost += (cfg.wDy * dyN) * dt;
-
-    // Velocity shaping (normalize vx, vy roughly by 200 px/s)
-    final vxN = (vel.x.abs() / 200.0).clamp(0.0, 2.0);
-    final vyDownN = (vel.y > 0 ? (vel.y / 200.0) : 0.0).clamp(0.0, 2.0);
-    cost += (cfg.wVx * vxN + cfg.wVyDown * vyDownN) * dt;
-
-    // Angle shaping (degrees normalized by 180), stronger near ground
-    final hN = (dyN).clamp(0.0, 1.0);
-    final angleDeg = angle.abs() * 180.0 / math.pi;
-    final angleCost = cfg.wAngleDeg * (angleDeg / 180.0) * (1.0 + cfg.angleNearGroundBoost * (1.0 - hN));
-    cost += angleCost * dt;
-
-    // Angular rate (smoothness) — rate is per second, integrate over dt
-    final dAng = ((angle - prevAngle).abs()) / (dt + 1e-8);
-    cost += cfg.wAngleRate * (dAng / math.pi) * dt;
-
     // =========================
-    // Collision / Terminal
+    // Collision / Terminal (landing vs crash)
     // =========================
     bool terminal = false;
     bool landed = false;
     final bool onPadNow = terrain.isOnPad(pos.x);
 
-    final gentleSpeed = vel.length;
-    final gentleAngle = angle.abs();
-
+    final groundY = terrain.heightAt(pos.x);
     final collided = (pos.y >= groundY - 2.0);
 
     if (collided) {
       terminal = true;
-      // Landing check with current curriculum tolerances
-      final okSpeed = gentleSpeed <= cfg.landingSpeedMax;
-      final okAngle = gentleAngle <= cfg.landingAngleMaxRad;
+
+      // Use existing tolerances for a valid landing.
+      final okSpeed = vel.length <= cfg.landingSpeedMax;
+      final okAngle = angle.abs() <= cfg.landingAngleMaxRad;
 
       if (onPadNow && okSpeed && okAngle) {
         landed = true;
-        // Small landing penalty term (kept >=0) so "perfect" is still ~0
-        final landPenalty = 0.2 * (gentleSpeed / (cfg.landingSpeedMax + 1e-6)) +
-            0.2 * (gentleAngle / (cfg.landingAngleMaxRad + 1e-6));
-        cost += landPenalty.clamp(0.0, 1.0); // one-shot
+        // Very small landing penalty (kept >=0) so "perfect" stays near 0.
+        final landPenalty = 0.2 * (vel.length / (cfg.landingSpeedMax + 1e-6)) +
+            0.2 * (angle.abs() / (cfg.landingAngleMaxRad + 1e-6));
+        cost += landPenalty.clamp(0.0, 1.0);
 
-        // Snap to pad
-        pos = Vector2(pos.x, terrain.padY - 18.0); // halfHeight ~ 18px (UI parity)
+        // Snap to pad for stable terminal state
+        pos = Vector2(pos.x, terrain.padY - 18.0); // halfHeight ~ 18px
       } else {
-        // Crash penalty: bigger than any wrap/edge nuisances
-        cost += 120.0; // one-shot
+        // Crash penalty (one-shot): bigger than border/wrap nuisances.
+        cost += 120.0;
       }
     }
 
-    // ===== Action-aware shaping (bonuses & a small idle penalty) — TIME INTEGRATED =====
-    const double vyCap = 120.0;                  // scale for descent speed
-    const double angCap = math.pi / 4;           // 45° scale for angle correction
-    final double dxDead = 0.03 * cfg.worldW;     // deadzone for pad alignment
-    const double angDead = 5 * math.pi / 180.0;  // 5° deadzone for angle correction
-
-    // (A) Thrust-assist bonus when descending
-    if (u.thrust && vel.y > 0) {
-      final vyN = (vel.y / vyCap).clamp(0.0, 1.0); // 0..1 for 0..vyCap
-      cost -= (cfg.wThrustAssist * vyN) * dt;
-    }
-
-    // (B) Turn-assist bonus when turning toward upright (reduce |angle|)
-    if (angle > angDead && u.left) {
-      final aN = ((angle - angDead) / angCap).clamp(0.0, 1.0);
-      cost -= (cfg.wTurnAssist * aN) * dt;
-    } else if (angle < -angDead && u.right) {
-      final aN = (((-angle) - angDead) / angCap).clamp(0.0, 1.0);
-      cost -= (cfg.wTurnAssist * aN) * dt;
-    }
-
-    // (C) Pad-align bonus when turning toward the pad horizontally
-    final dx = (pos.x - terrain.padCenter);
-    if (dx.abs() > dxDead) {
-      if (dx > 0 && u.left) {
-        // pad is to the left → turning left helps
-        final dN = ((dx.abs() - dxDead) / (0.5 * cfg.worldW)).clamp(0.0, 1.0);
-        cost -= (cfg.wPadAlignAssist * dN) * dt;
-      } else if (dx < 0 && u.right) {
-        // pad is to the right → turning right helps
-        final dN = ((dx.abs() - dxDead) / (0.5 * cfg.worldW)).clamp(0.0, 1.0);
-        cost -= (cfg.wPadAlignAssist * dN) * dt;
-      }
-    }
-
-    // (D) Idle penalty when falling fast & not acting
-    if (!u.thrust && !u.left && !u.right && vel.y > 80) {
-      final vN = ((vel.y - 80) / (vyCap - 80)).clamp(0.0, 1.0);
-      cost += (cfg.wIdlePenalty * vN) * dt;
-    }
-
+    // No negative cost.
     if (cost < 0) cost = 0.0;
 
     return ScoringOutcome(

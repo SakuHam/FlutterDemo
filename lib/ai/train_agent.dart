@@ -175,6 +175,8 @@ void main(List<String> args) async {
     seed: 1234,
   );
 
+  policy.b_thr[0] = -0.2; // Make boost biased off
+
   // --------------- Load init (BC or previous) ---------------
   Map<String, dynamic>? initJs;
   if (initPath != null && await File(initPath!).exists()) {
@@ -213,22 +215,28 @@ void main(List<String> args) async {
   final rnd = math.Random(7);
 
   // Train-time exploration (optionally disabled)
-  final double trainEps = noExplore || overfit ? 0.0 : epsilon;
-  final double trainTempThr = noExplore || overfit ? 1e-6 : tempThr;
-  final double trainTempTurn = noExplore || overfit ? 1e-6 : tempTurn;
-  final double trainEntropy = noExplore || overfit ? 0.0 : entropyBeta;
+  final double trainEps      = noExplore ? 0.0 : epsilon;
+  final double trainTempThr  = noExplore ? 0.2 : tempThr;   // keep throttle tight
+  final double trainTempTurn = noExplore ? 0.7 : tempTurn;  // keep some turn exploration
+  final double trainEntropy  = noExplore ? 0.01 : entropyBeta;
 
   final trainer = Trainer(
-    env: env,
-    fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
-    policy: policy,
-    dt: 1 / 60.0,
-    gamma: 0.99,
-    seed: 13,
-    tempThr: trainTempThr,
-    tempTurn: trainTempTurn,
-    epsilon: trainEps,
-    entropyBeta: trainEntropy,
+      env: env,
+      fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
+      policy: policy,
+      dt: 1/60.0,
+      gamma: 0.99,
+      seed: 13,
+      // single-stage exploration (unused when twoStage=true)
+      tempThr: tempThr,
+      tempTurn: tempTurn,
+      epsilon: epsilon,
+      entropyBeta: entropyBeta,
+      // turn this on:
+      twoStage: true,
+      planHold: 12,           // re-plan intent every 12 frames (~0.2s @ 60Hz)
+      tempIntent: 0.8,        // softer sampling for planner
+      intentEntropyBeta: 0.01 // small entropy on intents
   );
 
   // Deterministic evaluation trainer (no exploration)
@@ -245,8 +253,7 @@ void main(List<String> args) async {
     entropyBeta: 0.0,
   );
 
-  // quick determinism probe
-      {
+  {
     final s = fixedSeed;
     env.reset(seed: s);
     final ep1 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
@@ -254,9 +261,9 @@ void main(List<String> args) async {
     final ep2 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
     final same = (ep1.steps == ep2.steps) && ((ep1.totalCost - ep2.totalCost).abs() < 1e-9);
     stdout.writeln(
-      'Determinism probe: steps ${ep1.steps} vs ${ep2.steps} | '
-          'cost ${ep1.totalCost.toStringAsFixed(6)} vs ${ep2.totalCost.toStringAsFixed(6)} '
-          '=> ${same ? "OK" : "NONDETERMINISTIC!"}',
+        'Determinism probe: steps ${ep1.steps} vs ${ep2.steps} | '
+            'cost ${ep1.totalCost.toStringAsFixed(6)} vs ${ep2.totalCost.toStringAsFixed(6)} '
+            '=> ${same ? "OK" : "NONDETERMINISTIC!"}'
     );
   }
 
@@ -266,8 +273,8 @@ void main(List<String> args) async {
   }
 
   // --------------- Deterministic evaluation helper ---------------
-  Future<({double avgCost, int avgSteps, double landPct})> evalDeterministic(
-      {int nSeeds = 5}) async {
+  Future<({double avgCost, int avgSteps, double landPct, double turnPct, double thrustPct})>
+  evalDeterministic({int nSeeds = 5}) async {
     final seeds = List.generate(
       nSeeds,
           (i) => overfit ? fixedSeed : (1000 + i), // fixed small set
@@ -276,19 +283,25 @@ void main(List<String> args) async {
     double sumCost = 0.0;
     int sumSteps = 0;
     int lands = 0;
+    int sumTurnSteps = 0;
+    int sumThrustSteps = 0;
 
     for (final s in seeds) {
       env.reset(seed: s);
       final ep = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
       sumCost += ep.totalCost;
       sumSteps += ep.steps;
+      sumTurnSteps += ep.turnSteps;
+      sumThrustSteps += ep.thrustSteps;
       if (ep.landed) lands++;
     }
 
     final avgCost = sumCost / nSeeds;
     final avgSteps = (sumSteps / nSeeds).round();
     final landPct = 100.0 * lands / nSeeds;
-    return (avgCost: avgCost, avgSteps: avgSteps, landPct: landPct);
+    final turnPct = sumSteps == 0 ? 0.0 : 100.0 * (sumTurnSteps / sumSteps);
+    final thrustPct = sumSteps == 0 ? 0.0 : 100.0 * (sumThrustSteps / sumSteps);
+    return (avgCost: avgCost, avgSteps: avgSteps, landPct: landPct, turnPct: turnPct, thrustPct: thrustPct);
   }
 
   // --------------- Training loop (batched) ---------------
@@ -306,18 +319,22 @@ void main(List<String> args) async {
     double lastCost = 0.0;
     int lastSteps = 0;
     bool lastLanded = false;
+    int lastTurnSteps = 0;
+    int lastThrustSteps = 0;
 
     for (int k = 0; k < batch; k++) {
       env.reset(seed: nextEpisodeSeed());
       final ep = trainer.runEpisode(
         train: true,
         lr: epLr,
-        greedy: noExplore || overfit, // true when you pass --no_explore=true
+        greedy: false, // IMPORTANT: always sample during training
       );
 
       lastCost = ep.totalCost;
       lastSteps = ep.steps;
       lastLanded = ep.landed;
+      lastTurnSteps = ep.turnSteps;
+      lastThrustSteps = ep.thrustSteps;
 
       if (ep.landed) landedTotal++;
       landWindow.add(ep.landed);
@@ -328,15 +345,22 @@ void main(List<String> args) async {
       final landRate = landWindow.isEmpty
           ? 0.0
           : (landWindow.where((x) => x).length / landWindow.length * 100.0);
+
+      final turnPct = lastSteps == 0 ? 0.0 : 100.0 * (lastTurnSteps / lastSteps);
+      final thrustPct = lastSteps == 0 ? 0.0 : 100.0 * (lastThrustSteps / lastSteps);
+
       stdout.writeln(
         'Iter $it | batch=$batch | last-ep steps: $lastSteps | cost: ${lastCost.toStringAsFixed(3)} '
-            '| landed: ${lastLanded ? 'Y' : 'N'} | land%($landWindowSize)=${landRate.toStringAsFixed(1)}',
+            '| landed: ${lastLanded ? 'Y' : 'N'} | turn%: ${turnPct.toStringAsFixed(1)} '
+            '| thrust%: ${thrustPct.toStringAsFixed(1)} | land%($landWindowSize)=${landRate.toStringAsFixed(1)}',
       );
 
       // Deterministic eval for logging and model selection
       final ev = await evalDeterministic(nSeeds: evalSeeds);
       stdout.writeln(
-        'Eval → avgCost=${ev.avgCost.toStringAsFixed(3)} | steps=${ev.avgSteps} | land%=${ev.landPct.toStringAsFixed(1)}',
+        'Eval → avgCost=${ev.avgCost.toStringAsFixed(3)} | steps=${ev.avgSteps} '
+            '| land%=${ev.landPct.toStringAsFixed(1)} | turn%=${ev.turnPct.toStringAsFixed(1)} '
+            '| thrust%=${ev.thrustPct.toStringAsFixed(1)}',
       );
 
       // Model selection: prefer lower cost, break ties by land%
@@ -361,7 +385,10 @@ void main(List<String> args) async {
       if (logEvalEverySave) {
         final ev = await evalDeterministic(nSeeds: evalSeeds);
         stdout.writeln(
-            '[On Save] Eval → avgCost=${ev.avgCost.toStringAsFixed(3)} | steps=${ev.avgSteps} | land%=${ev.landPct.toStringAsFixed(1)}');
+          '[On Save] Eval → avgCost=${ev.avgCost.toStringAsFixed(3)} | steps=${ev.avgSteps} '
+              '| land%=${ev.landPct.toStringAsFixed(1)} | turn%=${ev.turnPct.toStringAsFixed(1)} '
+              '| thrust%=${ev.thrustPct.toStringAsFixed(1)}',
+        );
       }
     }
   }
@@ -370,6 +397,9 @@ void main(List<String> args) async {
   await _savePolicy('policy.json', policy, trainer.fe.inputSize, feGS, feStride);
   final ev = await evalDeterministic(nSeeds: evalSeeds);
   stdout.writeln(
-      'Done. BestEvalCost=${bestEvalCost.toStringAsFixed(3)} bestEvalLand%=${bestEvalLandPct.toStringAsFixed(1)} '
-          '| FinalEval avgCost=${ev.avgCost.toStringAsFixed(3)} steps=${ev.avgSteps} land%=${ev.landPct.toStringAsFixed(1)}');
+    'Done. BestEvalCost=${bestEvalCost.toStringAsFixed(3)} bestEvalLand%=${bestEvalLandPct.toStringAsFixed(1)} '
+        '| FinalEval avgCost=${ev.avgCost.toStringAsFixed(3)} steps=${ev.avgSteps} '
+        'land%=${ev.landPct.toStringAsFixed(1)} turn%=${ev.turnPct.toStringAsFixed(1)} '
+        'thrust%=${ev.thrustPct.toStringAsFixed(1)}',
+  );
 }

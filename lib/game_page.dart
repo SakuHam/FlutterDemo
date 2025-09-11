@@ -1,3 +1,5 @@
+// lib/ui/game_page.dart
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -6,6 +8,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:path_provider/path_provider.dart';
 import 'package:flutter/services.dart' show rootBundle;
+
+// 🚦 intent bus (singleton)
+import '../ai/intent_bus.dart'; // <-- adjust path if needed
 
 /// ======= Demo DTOs (same as in pretrain) =======
 
@@ -129,18 +134,52 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   // Timing
   late DateTime _last;
 
+  // ------------ Intent Bus (toast) ------------
+  StreamSubscription<IntentEvent>? _intentSub;
+  String? _toastText;
+  bool _toastVisible = false;
+  Timer? _toastTimer;
+
+  // UI-synthesized intent cadence
+  int _uiPlanHold = 12;     // frames to hold a UI intent
+  int _uiFramesLeft = 0;
+  String? _uiCurrentIntent; // last computed UI intent
+
   @override
   void initState() {
     super.initState();
     _ticker = createTicker(_onTick)..start();
     _last = DateTime.now();
+
+    // Subscribe to the global singleton bus
+    debugPrint('[BUS/UI] initState');
+    _intentSub = IntentBus.instance.intents.listen((e) {
+      // show toast on ANY event (even if AI is off) so UI is never silent
+      _showIntentToast(e.intent);
+      debugPrint('[BUS/UI] intent=${e.intent} probs=${e.probs}');
+    });
+
     WidgetsBinding.instance.addPostFrameCallback((_) => _reset());
   }
 
   @override
   void dispose() {
     _ticker.dispose();
+    _intentSub?.cancel();
+    _toastTimer?.cancel();
     super.dispose();
+  }
+
+  void _showIntentToast(String text) {
+    setState(() {
+      _toastText = text;
+      _toastVisible = true;
+    });
+    _toastTimer?.cancel();
+    _toastTimer = Timer(const Duration(milliseconds: 900), () {
+      if (!mounted) return;
+      setState(() => _toastVisible = false);
+    });
   }
 
   void setPreset(String name) {
@@ -189,6 +228,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       // Clear manual controls
       thrust = left = right = false;
       // Leave aiPlay as-is (user toggle)
+
+      // reset UI intent cadence
+      _uiFramesLeft = 0;
+      _uiCurrentIntent = null;
     });
 
     debugPrint('[GamePage.reset] W=${size.width.toStringAsFixed(1)} '
@@ -255,6 +298,24 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     }
   }
 
+  // ---------- UI-synthesized intent (so toast shows even when idle) ----------
+  String _chooseUiIntent({
+    required double dxToPad,   // normalized ~[-1,+1]
+    required double vy,        // px/s
+    required double height,    // px above ground
+    required double angle,     // rad
+  }) {
+    // Soft, readable rules; tweak to your taste
+    if (vy < -25) return 'brakeUp';            // moving up fast -> stop it
+    if (vy > 90)  return 'descendSlow';        // falling too fast -> slow down
+
+    const dxDead = 0.05; // 5% screen width
+    if (dxToPad > dxDead)  return 'goLeft';
+    if (dxToPad < -dxDead) return 'goRight';
+
+    return 'hover'; // default when idle-ish
+  }
+
   void _onTick(Duration _) {
     final now = DateTime.now();
     double dt = now.difference(_last).inMicroseconds / 1e6;
@@ -264,6 +325,37 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     if (!mounted || status != GameStatus.playing || _terrain == null) return;
 
     setState(() {
+      // ---------- Always compute & publish a UI intent every few frames ----------
+      final wW = _worldSize?.width ?? 360.0;
+      final dxN = (lander.position.dx - _terrain!.padCenter) / (wW == 0 ? 1.0 : wW);
+      final groundY = _terrain!.heightAt(lander.position.dx);
+      final height = (groundY - lander.position.dy);
+      if (_uiFramesLeft <= 0) {
+        final intent = _chooseUiIntent(
+          dxToPad: dxN,
+          vy: lander.velocity.dy,
+          height: height,
+          angle: lander.angle,
+        );
+        if (intent != _uiCurrentIntent) {
+          _uiCurrentIntent = intent;
+          // publish so toast shows even when AI is off
+          IntentBus.instance.publishIntent(IntentEvent(
+            intent: intent,
+            meta: {'source': 'ui'},
+          ));
+        } else {
+          // still publish periodically so there's always activity
+          IntentBus.instance.publishIntent(IntentEvent(
+            intent: intent,
+            meta: {'source': 'ui/keepalive'},
+          ));
+        }
+        _uiFramesLeft = _uiPlanHold;
+      } else {
+        _uiFramesLeft -= 1;
+      }
+
       // --- If AI is active, compute controls here (override manual) ---
       if (aiPlay && _policy != null && _worldSize != null) {
         final feats = _extractFeatures(
@@ -280,7 +372,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         final act = _policy!.actGreedy(
           feats,
           angle: lander.angle,
-          dxToPad: (lander.position.dx - _terrain!.padCenter) / (_worldSize!.width),
+          dxToPad: dxN,
           thrThresh: 0.35, // works well for greedy
         );
         thrust = act.thrust;
@@ -655,6 +747,37 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                     ),
                   ),
                 ),
+
+              // -------- Bottom toast for intent --------
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 18,
+                child: IgnorePointer(
+                  child: AnimatedOpacity(
+                    duration: const Duration(milliseconds: 200),
+                    opacity: _toastVisible ? 1.0 : 0.0,
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.65),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: Colors.white24),
+                        ),
+                        child: Text(
+                          _toastText ?? '',
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.4,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
             ],
           );
         },

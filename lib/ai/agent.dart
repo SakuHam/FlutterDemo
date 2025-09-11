@@ -1,12 +1,13 @@
 // lib/ai/agent.dart
+import 'dart:io' as io;
 import 'dart:math' as math;
 
-// Game engine (physics integrator)
 import '../engine/game_engine.dart' as eng;
-// Shared types/configs (ControlInput, GameStatus, etc.)
 import '../engine/types.dart' as et;
+import 'intent_bus.dart'; // ControlInput (adjust/remove if yours is in game_engine.dart)
 
-/// -------- Feature Extraction (state -> input vector) --------
+/* ----------------------------- Feature Extraction ----------------------------- */
+
 class FeatureExtractor {
   final int groundSamples; // total number of local ground samples (even or odd)
   final double stridePx;
@@ -57,7 +58,8 @@ class FeatureExtractor {
   int get inputSize => 10 + groundSamples;
 }
 
-/// --------- Tiny Linear Algebra ----------
+/* ----------------------------- Tiny Linear Algebra ---------------------------- */
+
 List<double> vecAdd(List<double> a, List<double> b) {
   final n = a.length; final out = List<double>.filled(n, 0);
   for (int i = 0; i < n; i++) out[i] = a[i] + b[i];
@@ -98,7 +100,8 @@ void addInPlaceMat(List<List<double>> A, List<List<double>> B) {
   }
 }
 
-/// --------- Nonlinearities ----------
+/* -------------------------------- Nonlinearities ------------------------------ */
+
 double relu(double x) => x > 0 ? x : 0.0;
 double dRelu(double x) => x > 0 ? 1.0 : 0.0;
 double sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
@@ -112,7 +115,81 @@ List<double> softmax(List<double> z) {
   return exps.map((e)=> e / s).toList();
 }
 
-/// --------- Policy Network (2 hidden, 2 action heads + value head) ----------
+/* ----------------------- Intents & tiny low-level controller ------------------ */
+
+enum Intent { hoverCenter, goLeft, goRight, descendSlow, brakeUp }
+
+const List<String> kIntentNames = [
+  'hover', 'goLeft', 'goRight', 'descendSlow', 'brakeUp'
+];
+
+int intentToIndex(Intent it) => it.index;
+Intent indexToIntent(int i) => Intent.values[i];
+
+/// Simple deterministic controller that converts a chosen intent into
+/// (thrust,left,right) per physics step. Tune the gains here.
+et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
+  final L = env.lander;
+  final padCx = env.terrain.padCenter;
+  final dx = L.pos.x - padCx;
+  final vx = L.vel.x;
+  final vy = L.vel.y;
+  final angle = L.angle;
+
+  bool left = false, right = false, thrust = false;
+
+  // angle PD toward desired angle (lean into correcting dx and vx)
+  double targetAngle = 0.0;
+  const kAngDx = 0.006;     // how much horizontal error affects target angle
+  const kAngVx = 0.012;     // how much vx affects target angle
+  const maxTilt = 15 * math.pi / 180;
+
+  switch (intent) {
+    case Intent.goLeft:
+      targetAngle = (-kAngDx * dx - kAngVx * vx).clamp(-maxTilt, maxTilt);
+      break;
+    case Intent.goRight:
+      targetAngle = (kAngDx * dx + kAngVx * vx).clamp(-maxTilt, maxTilt);
+      break;
+    case Intent.hoverCenter:
+      targetAngle = (-0.5 * kAngDx * dx - 0.5 * kAngVx * vx).clamp(-maxTilt, maxTilt);
+      break;
+    case Intent.descendSlow:
+      targetAngle = 0.0;
+      break;
+    case Intent.brakeUp:
+      targetAngle = 0.0;
+      break;
+  }
+
+  const angDead = 3 * math.pi / 180;
+  if (angle > targetAngle + angDead) left = true;
+  if (angle < targetAngle - angDead) right = true;
+
+  // vertical PD for thrust target
+  double targetVy = 60.0; // px/s downward normally
+  if (intent == Intent.descendSlow) targetVy = 30.0;
+  if (intent == Intent.brakeUp)     targetVy = -20.0;
+
+  // stricter near ground
+  final groundY = env.terrain.heightAt(L.pos.x);
+  final height = groundY - L.pos.y;
+  if (height < 120) targetVy = math.min(targetVy, 20.0);
+  if (height <  60) targetVy = math.min(targetVy, 10.0);
+
+  final eVy = vy - targetVy;
+  thrust = eVy > 0; // burn if falling faster than target
+
+  // avoid ceiling hover
+  if (L.pos.y < env.cfg.ceilingMargin) {
+    thrust = false;
+  }
+
+  return et.ControlInput(thrust: thrust, left: left, right: right);
+}
+
+/* -------------------- Policy Network (trunk + multiple heads) ----------------- */
+
 class PolicyNetwork {
   final int inputSize;
   final int h1;
@@ -122,15 +199,20 @@ class PolicyNetwork {
   late List<List<double>> W1, W2;
   late List<double> b1, b2;
 
-  // Action Heads
-  late List<List<double>> W_thr;  // (1, h2)
-  late List<double> b_thr;        // (1)
-  late List<List<double>> W_turn; // (3, h2)
-  late List<double> b_turn;       // (3)
+  // Action Heads (single-stage)
+  late List<List<double>> W_thr;   // (1, h2)
+  late List<double> b_thr;         // (1)
+  late List<List<double>> W_turn;  // (3, h2)  [none,left,right]
+  late List<double> b_turn;        // (3)
+
+  // Intent Head (two-stage)
+  static const int kIntents = 5;   // keep in sync with Intent enum
+  late List<List<double>> W_intent; // (K, h2)
+  late List<double> b_intent;       // (K)
 
   // Value Head (critic)
-  late List<List<double>> W_val;  // (1, h2)
-  late List<double> b_val;        // (1)
+  late List<List<double>> W_val;   // (1, h2)
+  late List<double> b_val;         // (1)
 
   final math.Random rnd;
 
@@ -145,13 +227,16 @@ class PolicyNetwork {
     b1 = List<double>.filled(h1, 0);
     b2 = List<double>.filled(h2, 0);
 
-    W_thr = _init(1, h2);
-    b_thr = List<double>.filled(1, 0);
-    W_turn = _init(3, h2);
-    b_turn = List<double>.filled(3, 0);
+    // single-stage heads
+    W_thr = _init(1, h2);   b_thr = List<double>.filled(1, 0);
+    W_turn = _init(3, h2);  b_turn = List<double>.filled(3, 0);
 
-    W_val = _init(1, h2);
-    b_val = List<double>.filled(1, 0);
+    // two-stage planner head
+    W_intent = _init(kIntents, h2);
+    b_intent = List<double>.filled(kIntents, 0);
+
+    // critic
+    W_val = _init(1, h2);   b_val = List<double>.filled(1, 0);
   }
 
   List<List<double>> _init(int rows, int cols) {
@@ -163,17 +248,32 @@ class PolicyNetwork {
   }
 }
 
-/// Forward cache
+/* ----------------------------- Forward cache struct --------------------------- */
+
 class _Forward {
   final List<double> x;
   final List<double> z1, h1;
   final List<double> z2, h2;
+
+  // single-stage heads
   final double thrLogit, thrP;
   final List<double> turnLogits, turnP;
-  final double v; // value prediction
-  _Forward(this.x, this.z1, this.h1, this.z2, this.h2,
-      this.thrLogit, this.thrP, this.turnLogits, this.turnP, this.v);
+
+  // two-stage planner
+  final List<double> intentLogits, intentP;
+
+  // critic
+  final double v;
+
+  _Forward(
+      this.x, this.z1, this.h1, this.z2, this.h2,
+      this.thrLogit, this.thrP, this.turnLogits, this.turnP,
+      this.intentLogits, this.intentP,
+      this.v,
+      );
 }
+
+/* ----------------------------- Policy operations ----------------------------- */
 
 extension PolicyOps on PolicyNetwork {
   _Forward _forward(List<double> x) {
@@ -182,7 +282,7 @@ extension PolicyOps on PolicyNetwork {
     final z2 = vecAdd(matVec(W2, h1v), b2);
     final h2v = reluVec(z2);
 
-    // Action heads
+    // single-stage heads
     final thrLogit = matVec(W_thr, h2v)[0] + b_thr[0];
     final thrP = sigmoid(thrLogit);
 
@@ -190,10 +290,20 @@ extension PolicyOps on PolicyNetwork {
     for (int i = 0; i < 3; i++) turnLogits[i] += b_turn[i];
     final turnP = softmax(turnLogits);
 
-    // Value head
+    // two-stage planner head
+    final intentLogits = matVec(W_intent, h2v);
+    for (int i = 0; i < PolicyNetwork.kIntents; i++) intentLogits[i] += b_intent[i];
+    final intentP = softmax(intentLogits);
+
+    // critic
     final v = matVec(W_val, h2v)[0] + b_val[0];
 
-    return _Forward(x, z1, h1v, z2, h2v, thrLogit, thrP, turnLogits, turnP, v);
+    return _Forward(
+      x, z1, h1v, z2, h2v,
+      thrLogit, thrP, turnLogits, turnP,
+      intentLogits, intentP,
+      v,
+    );
   }
 
   int _argmax(List<double> v) {
@@ -205,14 +315,16 @@ extension PolicyOps on PolicyNetwork {
     return bi;
   }
 
+  /* --------------------------- Single-stage (legacy) -------------------------- */
+
   /// Deterministic (greedy) action: no sampling, no temps/epsilon.
   /// Returns (thrust, left, right, probs[ p_thr, p_turn0, p_turn1, p_turn2 ], cache)
   (bool thrust, bool left, bool right, List<double> probs, _Forward cache)
   actGreedy(List<double> x) {
     final f = _forward(x);
 
-    // throttle: threshold at 0 (equiv to p>=0.5)
-    final thrust = f.thrLogit >= 0.0;
+    // throttle: STRICT tie-break → no thrust on tie
+    final thrust = f.thrP > 0.5;
 
     // turn: argmax over raw logits: classes [none, left, right]
     final cls = _argmax(f.turnLogits);
@@ -233,12 +345,12 @@ extension PolicyOps on PolicyNetwork {
     final f = _forward(x);
 
     // temperature scaling
-    final pThr = sigmoid(f.thrLogit / tempThr);
+    final pThr = sigmoid(f.thrLogit / math.max(1e-6, tempThr));
 
     final scaled = [
-      f.turnLogits[0] / tempTurn,
-      f.turnLogits[1] / tempTurn,
-      f.turnLogits[2] / tempTurn,
+      f.turnLogits[0] / math.max(1e-6, tempTurn),
+      f.turnLogits[1] / math.max(1e-6, tempTurn),
+      f.turnLogits[2] / math.max(1e-6, tempTurn),
     ];
     final pTurn = softmax(scaled); // [none,left,right]
 
@@ -270,75 +382,96 @@ extension PolicyOps on PolicyNetwork {
     return (thrust, left, right, [pThr, ...pTurn], f);
   }
 
-  // ---------------- Value head loss (Huber) ----------------
-  double _huberGrad(double error, double delta) {
-    // returns d/d(error) huber(error)
-    final ae = error.abs();
-    if (ae <= delta) return error;              // derivative of 0.5*e^2
-    return delta * (error.isNegative ? -1.0 : 1.0); // derivative of delta*(|e|-0.5*delta)
+  /* ---------------------------- Two-stage (planner) --------------------------- */
+
+  /// Greedy intent selection (deterministic). Returns (intentIndex, probs[K], cache)
+  (int intentIndex, List<double> probs, _Forward cache) actIntentGreedy(List<double> x) {
+    final f = _forward(x);
+    final idx = _argmax(f.intentLogits);
+    return (idx, List<double>.from(f.intentP), f);
   }
 
-  /// One REINFORCE step over an episode, with entropy bonus and a value head baseline.
-  void updateFromEpisode({
+  /// Sample an intent with temperature + epsilon.
+  (int intentIndex, List<double> probs, _Forward cache) actIntent(
+      List<double> x,
+      math.Random rnd, {
+        double tempIntent = 1.0,
+        double epsilon = 0.0,
+      }) {
+    final f = _forward(x);
+    final scaled = List<double>.generate(PolicyNetwork.kIntents, (i) => f.intentLogits[i] / math.max(1e-6, tempIntent));
+    final p = softmax(scaled);
+    int idx;
+    final r = rnd.nextDouble();
+    double c = 0.0;
+    for (idx = 0; idx < PolicyNetwork.kIntents; idx++) { c += p[idx]; if (r <= c) break; }
+    if (idx >= PolicyNetwork.kIntents) idx = PolicyNetwork.kIntents - 1;
+
+    if (epsilon > 0.0 && rnd.nextDouble() < epsilon) {
+      idx = rnd.nextInt(PolicyNetwork.kIntents);
+    }
+    return (idx, p, f);
+  }
+
+  /* ------------------------ Updates: single & two-stage ----------------------- */
+
+  // Single-stage update (thr/turn + value + optional entropy)
+  void _updateSingleStage({
     required List<_Forward> caches,
-    required List<List<int>> actions,   // [th, left, right]
-    required List<double> returns_,     // discounted sum of rewards
+    required List<List<int>> actions, // [th, left, right]
+    required List<double> returns_,
     double lr = 3e-4,
     double l2 = 1e-6,
     double entropyBeta = 0.0,
-    double valueBeta = 0.5,             // weight for value loss
-    double huberDelta = 1.0,            // Huber delta for value loss
+    double valueBeta = 0.5,
+    double huberDelta = 1.0,
   }) {
     final T = caches.length;
     if (T == 0) return;
 
-    // ------- Compute advantages: A = R - V(s) -------
+    // Advantages: A = R - V
     final values = List<double>.generate(T, (t) => caches[t].v);
     final adv = List<double>.generate(T, (t) => returns_[t] - values[t]);
-
-    // Normalize advantages for stability
-    final mean = adv.reduce((a, b) => a + b) / T;
-    double var0 = 0.0; for (final v in adv) { var0 += (v - mean) * (v - mean); }
+    final mean = adv.reduce((a,b)=>a+b) / T;
+    double var0 = 0.0; for (final v in adv) var0 += (v-mean)*(v-mean);
     var0 /= T;
     final std = math.sqrt(var0 + 1e-8);
-    for (int i = 0; i < adv.length; i++) adv[i] = (adv[i] - mean) / std;
+    for (int i=0;i<T;i++) adv[i] = (adv[i] - mean) / std;
 
-    // Grad accumulators
+    // Accumulators
     final dW1 = zeros(W1.length, W1[0].length);
     final dW2 = zeros(W2.length, W2[0].length);
     final db1 = List<double>.filled(b1.length, 0);
     final db2 = List<double>.filled(b2.length, 0);
 
-    final dW_thr = zeros(W_thr.length, W_thr[0].length); // (1,h2)
-    final db_thr = List<double>.filled(b_thr.length, 0); // (1)
-    final dW_turn = zeros(W_turn.length, W_turn[0].length); // (3,h2)
-    final db_turn = List<double>.filled(b_turn.length, 0);   // (3)
+    final dW_thr = zeros(W_thr.length, W_thr[0].length);
+    final db_thr = List<double>.filled(b_thr.length, 0);
+    final dW_turn = zeros(W_turn.length, W_turn[0].length);
+    final db_turn = List<double>.filled(b_turn.length, 0);
 
-    final dW_val = zeros(W_val.length, W_val[0].length); // (1,h2)
-    final db_val = List<double>.filled(b_val.length, 0); // (1)
+    final dW_val = zeros(W_val.length, W_val[0].length);
+    final db_val = List<double>.filled(b_val.length, 0);
 
     for (int t = 0; t < T; t++) {
       final f = caches[t];
-      final a = actions[t];      // [th, left, right]
+      final a = actions[t];
       final A = adv[t];
 
-      // ---------- Policy grad: logits grads = (p - a) * A ----------
+      // logits grads = (p - a) * A
       final a_thr = a[0].toDouble();
-      final a_turn = <double>[1 - a[1] - a[2] + 0.0, a[1] + 0.0, a[2] + 0.0]; // [none,left,right]
+      final a_turn = <double>[1 - a[1] - a[2] + 0.0, a[1] + 0.0, a[2] + 0.0];
 
       double dz_thr = (f.thrP - a_thr) * A;
       final dz_turn = List<double>.generate(3, (k) => (f.turnP[k] - a_turn[k]) * A);
 
-      // ---------- Entropy bonus ----------
+      // entropy bonus
       if (entropyBeta > 0.0) {
-        // Bernoulli entropy grad
         final p = f.thrP.clamp(1e-6, 1 - 1e-6);
         final dH_dz_thr = math.log((1 - p) / p) * p * (1 - p);
         dz_thr += -entropyBeta * dH_dz_thr;
 
-        // Categorical entropy grad
         final p3 = f.turnP.map((x) => x.clamp(1e-8, 1.0)).toList();
-        final g = List<double>.generate(3, (i) => -(math.log(p3[i]) + 1.0)); // -∂H/∂p
+        final g = List<double>.generate(3, (i) => -(math.log(p3[i]) + 1.0));
         double s = 0.0; for (int i = 0; i < 3; i++) s += p3[i] * g[i];
         for (int i = 0; i < 3; i++) {
           final dH_dz_i = p3[i] * g[i] - p3[i] * s; // (diag(p)-pp^T)g
@@ -346,44 +479,36 @@ extension PolicyOps on PolicyNetwork {
         }
       }
 
-      // ---------- Value loss (Huber) ----------
+      // value head (Huber on v - R)
       final err = f.v - returns_[t];
       final dLdv = valueBeta * _huberGrad(err, huberDelta);
 
-      // ---------- Head grads ----------
-      // throttle head
+      // heads
       addInPlaceMat(dW_thr, outer([dz_thr], f.h2)); db_thr[0] += dz_thr;
-      // turn head
       addInPlaceMat(dW_turn, outer(dz_turn, f.h2)); addInPlaceVec(db_turn, dz_turn);
-      // value head
       addInPlaceMat(dW_val, outer([dLdv], f.h2)); db_val[0] += dLdv;
 
-      // ---------- Backprop to h2 (sum contributions from all heads) ----------
+      // backprop to trunk
       final dh2 = List<double>.filled(f.h2.length, 0);
-      // from throttle head
       for (int j = 0; j < W_thr[0].length; j++) dh2[j] += W_thr[0][j] * dz_thr;
-      // from turn head
       for (int i = 0; i < 3; i++) {
         final row = W_turn[i];
         for (int j = 0; j < row.length; j++) dh2[j] += row[j] * dz_turn[i];
       }
-      // from value head
       for (int j = 0; j < W_val[0].length; j++) dh2[j] += W_val[0][j] * dLdv;
 
       final dz2 = List<double>.generate(f.z2.length, (i) => dh2[i] * dRelu(f.z2[i]));
       addInPlaceMat(dW2, outer(dz2, f.h1)); addInPlaceVec(db2, dz2);
 
-      // Backprop to h1
       final dh1 = List<double>.filled(f.h1.length, 0);
       for (int i = 0; i < W2.length; i++) {
         for (int j = 0; j < W2[0].length; j++) dh1[j] += W2[i][j] * dz2[i];
       }
-
       final dz1 = List<double>.generate(f.z1.length, (i) => dh1[i] * dRelu(f.z1[i]));
       addInPlaceMat(dW1, outer(dz1, f.x)); addInPlaceVec(db1, dz1);
     }
 
-    // ---- L2 weight decay ----
+    // L2
     void addL2(List<List<double>> dW, List<List<double>> W) {
       for (int i = 0; i < dW.length; i++) {
         for (int j = 0; j < dW[0].length; j++) dW[i][j] += l2 * W[i][j];
@@ -393,31 +518,29 @@ extension PolicyOps on PolicyNetwork {
     addL2(dW_thr, W_thr); addL2(dW_turn, W_turn);
     addL2(dW_val, W_val);
 
-    // ---- Global-norm gradient clipping ----
-    double sqSum = 0.0;
-    void accum(List<List<double>> G) { for (final r in G) { for (final v in r) sqSum += v*v; } }
-    void accumB(List<double> g) { for (final v in g) sqSum += v*v; }
-    accum(dW1); accum(dW2); accum(dW_thr); accum(dW_turn); accum(dW_val);
+    // global norm clip
+    double sq = 0.0;
+    void accumM(List<List<double>> G){ for(final r in G){ for(final v in r) sq += v*v; } }
+    void accumB(List<double> g){ for(final v in g) sq += v*v; }
+    accumM(dW1); accumM(dW2); accumM(dW_thr); accumM(dW_turn); accumM(dW_val);
     accumB(db1); accumB(db2); accumB(db_thr); accumB(db_turn); accumB(db_val);
     final clip = 5.0;
-    final norm = math.sqrt(sqSum + 1e-12);
-    final scale = norm > clip ? (clip / norm) : 1.0;
-    if (scale != 1.0) {
-      void scaleM(List<List<double>> G) { for (final r in G) { for (int j=0;j<r.length;j++) r[j]*=scale; } }
-      void scaleB(List<double> g) { for (int j=0;j<g.length;j++) g[j]*=scale; }
+    final nrm = math.sqrt(sq + 1e-12);
+    final sc = nrm > clip ? (clip / nrm) : 1.0;
+    if (sc != 1.0) {
+      void scaleM(List<List<double>> G){ for(final r in G){ for(int j=0;j<r.length;j++) r[j]*=sc; } }
+      void scaleB(List<double> g){ for(int j=0;j<g.length;j++) g[j]*=sc; }
       scaleM(dW1); scaleM(dW2); scaleM(dW_thr); scaleM(dW_turn); scaleM(dW_val);
       scaleB(db1); scaleB(db2); scaleB(db_thr); scaleB(db_turn); scaleB(db_val);
     }
 
-    // ---- SGD update ----
+    // SGD
     void sgdW(List<List<double>> W, List<List<double>> dW) {
       for (int i = 0; i < W.length; i++) {
         for (int j = 0; j < W[0].length; j++) W[i][j] -= lr * dW[i][j];
       }
     }
-    void sgdB(List<double> b, List<double> db) {
-      for (int i = 0; i < b.length; i++) b[i] -= lr * db[i];
-    }
+    void sgdB(List<double> b, List<double> db) { for (int i = 0; i < b.length; i++) b[i] -= lr * db[i]; }
 
     sgdW(W_thr, dW_thr); sgdB(b_thr, db_thr);
     sgdW(W_turn, dW_turn); sgdB(b_turn, db_turn);
@@ -425,14 +548,207 @@ extension PolicyOps on PolicyNetwork {
     sgdW(W2, dW2); sgdB(b2, db2);
     sgdW(W1, dW1); sgdB(b1, db1);
   }
+
+  // Two-stage update (intent categorical + value + optional entropy)
+  void _updateIntentStage({
+    required List<_Forward> decisionCaches, // caches at decision times
+    required List<int> intentChoices,       // indices 0..K-1
+    required List<double> decisionReturns,  // rewards-to-go at decision times
+    double lr = 3e-4,
+    double l2 = 1e-6,
+    double entropyBeta = 0.0,
+    double valueBeta = 0.5,
+    double huberDelta = 1.0,
+  }) {
+    final T = decisionCaches.length;
+    if (T == 0) return;
+
+    // Advantages: A = R_decision - V(s_decision)
+    final values = List<double>.generate(T, (t) => decisionCaches[t].v);
+    final adv = List<double>.generate(T, (t) => decisionReturns[t] - values[t]);
+    final mean = adv.reduce((a,b)=>a+b) / T;
+    double var0 = 0.0; for (final v in adv) var0 += (v-mean)*(v-mean);
+    var0 /= T;
+    final std = math.sqrt(var0 + 1e-8);
+    for (int i=0;i<T;i++) adv[i] = (adv[i] - mean) / std;
+
+    // Accumulators
+    final dW1 = zeros(W1.length, W1[0].length);
+    final dW2 = zeros(W2.length, W2[0].length);
+    final db1 = List<double>.filled(b1.length, 0);
+    final db2 = List<double>.filled(b2.length, 0);
+
+    final dW_int = zeros(W_intent.length, W_intent[0].length);
+    final db_int = List<double>.filled(b_intent.length, 0);
+
+    final dW_val = zeros(W_val.length, W_val[0].length);
+    final db_val = List<double>.filled(b_val.length, 0);
+
+    for (int t = 0; t < T; t++) {
+      final f = decisionCaches[t];
+      final k = intentChoices[t];
+      final A = adv[t];
+
+      // logits grad for categorical intent
+      final target = List<double>.filled(PolicyNetwork.kIntents, 0.0);
+      target[k] = 1.0;
+      final dz_int = List<double>.generate(PolicyNetwork.kIntents, (i) => (f.intentP[i] - target[i]) * A);
+
+      // entropy on intents (encourage exploration)
+      if (entropyBeta > 0.0) {
+        final p = f.intentP.map((x) => x.clamp(1e-8, 1.0)).toList();
+        final g = List<double>.generate(p.length, (i) => -(math.log(p[i]) + 1.0));
+        double s = 0.0; for (int i = 0; i < p.length; i++) s += p[i] * g[i];
+        for (int i = 0; i < p.length; i++) {
+          final dH_dz_i = p[i] * g[i] - p[i] * s;
+          dz_int[i] += -entropyBeta * dH_dz_i;
+        }
+      }
+
+      // value at decision time
+      final err = f.v - decisionReturns[t];
+      final dLdv = valueBeta * _huberGrad(err, huberDelta);
+
+      // heads
+      addInPlaceMat(dW_int, outer(dz_int, f.h2)); addInPlaceVec(db_int, dz_int);
+      addInPlaceMat(dW_val, outer([dLdv], f.h2)); db_val[0] += dLdv;
+
+      // backprop to trunk
+      final dh2 = List<double>.filled(f.h2.length, 0);
+      // from intent head
+      for (int i = 0; i < W_intent.length; i++) {
+        final row = W_intent[i];
+        for (int j = 0; j < row.length; j++) dh2[j] += row[j] * dz_int[i];
+      }
+      // from value head
+      for (int j = 0; j < W_val[0].length; j++) dh2[j] += W_val[0][j] * dLdv;
+
+      final dz2 = List<double>.generate(f.z2.length, (i) => dh2[i] * dRelu(f.z2[i]));
+      addInPlaceMat(dW2, outer(dz2, f.h1)); addInPlaceVec(db2, dz2);
+
+      final dh1 = List<double>.filled(f.h1.length, 0);
+      for (int i = 0; i < W2.length; i++) {
+        for (int j = 0; j < W2[0].length; j++) dh1[j] += W2[i][j] * dz2[i];
+      }
+      final dz1 = List<double>.generate(f.z1.length, (i) => dh1[i] * dRelu(f.z1[i]));
+      addInPlaceMat(dW1, outer(dz1, f.x)); addInPlaceVec(db1, dz1);
+    }
+
+    // L2
+    void addL2(List<List<double>> dW, List<List<double>> W) {
+      for (int i = 0; i < dW.length; i++) {
+        for (int j = 0; j < dW[0].length; j++) dW[i][j] += l2 * W[i][j];
+      }
+    }
+    addL2(dW1, W1); addL2(dW2, W2);
+    addL2(dW_int, W_intent); addL2(dW_val, W_val);
+
+    // clip
+    double sq = 0.0;
+    void accumM(List<List<double>> G){ for(final r in G){ for(final v in r) sq += v*v; } }
+    void accumB(List<double> g){ for(final v in g) sq += v*v; }
+    accumM(dW1); accumM(dW2); accumM(dW_int); accumM(dW_val);
+    accumB(db1); accumB(db2); accumB(db_int); accumB(db_val);
+    final clip = 5.0;
+    final nrm = math.sqrt(sq + 1e-12);
+    final sc = nrm > clip ? (clip / nrm) : 1.0;
+    if (sc != 1.0) {
+      void scaleM(List<List<double>> G){ for(final r in G){ for(int j=0;j<r.length;j++) r[j]*=sc; } }
+      void scaleB(List<double> g){ for (int j=0;j<g.length;j++) g[j]*=sc; }
+      scaleM(dW1); scaleM(dW2); scaleM(dW_int); scaleM(dW_val);
+      scaleB(db1); scaleB(db2); scaleB(db_int); scaleB(db_val);
+    }
+
+    // SGD
+    void sgdW(List<List<double>> W, List<List<double>> dW) {
+      for (int i = 0; i < W.length; i++) {
+        for (int j = 0; j < W[0].length; j++) W[i][j] -= lr * dW[i][j];
+      }
+    }
+    void sgdB(List<double> b, List<double> db) { for (int i = 0; i < b.length; i++) b[i] -= lr * db[i]; }
+
+    sgdW(W_intent, dW_int); sgdB(b_intent, db_int);
+    sgdW(W_val, dW_val);    sgdB(b_val, db_val);
+    sgdW(W2, dW2);          sgdB(b2, db2);
+    sgdW(W1, dW1);          sgdB(b1, db1);
+  }
+
+  // shared helpers
+  double _huberGrad(double error, double delta) {
+    final ae = error.abs();
+    if (ae <= delta) return error;
+    return delta * (error.isNegative ? -1.0 : 1.0);
+  }
+
+  // Public: choose which update path to use
+  void updateFromEpisode({
+    // single-stage data
+    List<_Forward>? caches,
+    List<List<int>>? actions,
+    List<double>? returns_,
+    // two-stage data
+    List<_Forward>? decisionCaches,
+    List<int>? intentChoices,
+    List<double>? decisionReturns,
+    // common hyperparams
+    double lr = 3e-4,
+    double l2 = 1e-6,
+    double entropyBeta = 0.0,
+    double valueBeta = 0.5,
+    double huberDelta = 1.0,
+    // mode
+    bool intentMode = false,
+  }) {
+    if (intentMode) {
+      _updateIntentStage(
+        decisionCaches: decisionCaches ?? const [],
+        intentChoices: intentChoices ?? const [],
+        decisionReturns: decisionReturns ?? const [],
+        lr: lr, l2: l2, entropyBeta: entropyBeta,
+        valueBeta: valueBeta, huberDelta: huberDelta,
+      );
+    } else {
+      _updateSingleStage(
+        caches: caches ?? const [],
+        actions: actions ?? const [],
+        returns_: returns_ ?? const [],
+        lr: lr, l2: l2, entropyBeta: entropyBeta,
+        valueBeta: valueBeta, huberDelta: huberDelta,
+      );
+    }
+  }
 }
 
-/// --------- Episode runner & trainer ----------
+/* --------------------------- Episode runner & trainer ------------------------- */
+
 class EpisodeResult {
   final double totalCost;
   final int steps;
   final bool landed;
-  EpisodeResult(this.totalCost, this.steps, this.landed);
+
+  // diagnostics (single-stage)
+  final int turnSteps;
+  final int leftSteps;
+  final int rightSteps;
+  final int thrustSteps;
+  final double avgThrProb;
+
+  // diagnostics (two-stage)
+  final List<int> intentCounts;   // histogram over intents
+  final int intentSwitches;
+
+  EpisodeResult(
+      this.totalCost,
+      this.steps,
+      this.landed, {
+        this.turnSteps = 0,
+        this.leftSteps = 0,
+        this.rightSteps = 0,
+        this.thrustSteps = 0,
+        this.avgThrProb = 0.0,
+        this.intentCounts = const [],
+        this.intentSwitches = 0,
+      });
 }
 
 class Trainer {
@@ -444,11 +760,17 @@ class Trainer {
   final double dt;     // seconds per step
   final double gamma;  // discount
 
-  // exploration knobs (train-time)
+  // single-stage exploration knobs (train-time)
   double tempThr;
   double tempTurn;
   double epsilon;
   final double entropyBeta;
+
+  // two-stage knobs
+  final bool twoStage;                 // if true, use planner/controller
+  final int planHold;                  // frames to hold an intent
+  final double tempIntent;             // temperature for intent sampling
+  final double intentEntropyBeta;      // entropy on intent head
 
   Trainer({
     required this.env,
@@ -461,80 +783,209 @@ class Trainer {
     this.tempTurn = 1.0,
     this.epsilon = 0.0,
     this.entropyBeta = 0.0,
+    // two-stage defaults (off by default to preserve behavior)
+    this.twoStage = true,
+    this.planHold = 12,
+    this.tempIntent = 1.0,
+    this.intentEntropyBeta = 0.0,
   }) : rnd = math.Random(seed);
 
-  /// Run one episode.
-  /// - If `greedy == true`, uses argmax/thresholded actions (deterministic).
-  /// - Otherwise, samples with temps/epsilon (stochastic).
-  /// - If engine score is reward (not cost), pass scoreIsReward=true.
   EpisodeResult runEpisode({
     bool train = true,
     double lr = 3e-4,
     bool greedy = false,
     bool scoreIsReward = false,
-    double valueBeta = 0.5,     // critic loss weight
-    double huberDelta = 1.0,    // Huber delta for value loss
+    double valueBeta = 0.5,
+    double huberDelta = 1.0,
   }) {
-    final caches = <_Forward>[];
-    final actions = <List<int>>[];
-    final costs = <double>[]; // store COST per step (positive = bad)
+    if (!twoStage) {
+      // ----------------------- Single-stage path (legacy) -----------------------
+      final caches = <_Forward>[];
+      final actions = <List<int>>[];
+      final costs = <double>[];
 
-    while (true) {
-      final x = fe.extract(env);
+      int t = 0;
+      int turnSteps = 0, leftSteps = 0, rightSteps = 0, thrustSteps = 0;
+      double thrProbSum = 0.0;
 
-      bool th, lf, rt;
-      _Forward cache;
+      while (true) {
+        final x = fe.extract(env);
 
-      if (greedy) {
-        final res = policy.actGreedy(x);
-        th = res.$1; lf = res.$2; rt = res.$3; cache = res.$5;
-      } else {
-        final res = policy.act(
-          x,
-          rnd,
-          tempThr: tempThr,
-          tempTurn: tempTurn,
-          epsilon: epsilon,
-        );
-        th = res.$1; lf = res.$2; rt = res.$3; cache = res.$5;
+        bool th, lf, rt; _Forward cache; List<double> probs;
+
+        if (greedy) {
+          final res = policy.actGreedy(x);
+          th = res.$1; lf = res.$2; rt = res.$3; probs = res.$4; cache = res.$5;
+        } else {
+          final res = policy.act(
+            x, rnd, tempThr: tempThr, tempTurn: tempTurn, epsilon: epsilon,
+          );
+          th = res.$1; lf = res.$2; rt = res.$3; probs = res.$4; cache = res.$5;
+        }
+
+        thrProbSum += probs[0];
+        if (lf || rt) turnSteps++;
+        if (lf) leftSteps++;
+        if (rt) rightSteps++;
+        if (th) thrustSteps++;
+
+        final info = env.step(dt, et.ControlInput(thrust: th, left: lf, right: rt));
+
+        // engine returns cost; convert to stored COST
+        final s = info.scoreDelta;
+        final stepCost = scoreIsReward ? -s : s;
+
+        caches.add(cache);
+        actions.add([th ? 1 : 0, lf ? 1 : 0, rt ? 1 : 0]);
+        costs.add(stepCost);
+
+        if (info.terminal || caches.length > 4000) break;
+        t++;
       }
 
-      final info = env.step(dt, et.ControlInput(thrust: th, left: lf, right: rt));
+      // returns over reward = -cost
+      final R = List<double>.filled(costs.length, 0.0);
+      double running = 0.0;
+      for (int i = costs.length - 1; i >= 0; i--) {
+        final reward = -costs[i];
+        running = reward + gamma * running;
+        R[i] = running;
+      }
 
-      // Interpret engine signal
-      final s = info.scoreDelta; // could be reward OR cost depending on engine
-      final stepCost = scoreIsReward ? -s : s; // ensure we store COST here
+      if (train && caches.isNotEmpty) {
+        policy.updateFromEpisode(
+          caches: caches,
+          actions: actions,
+          returns_: R,
+          lr: lr,
+          entropyBeta: entropyBeta,
+          valueBeta: valueBeta,
+          huberDelta: huberDelta,
+          intentMode: false,
+        );
+      }
 
-      caches.add(cache);
-      actions.add([th ? 1 : 0, lf ? 1 : 0, rt ? 1 : 0]);
-      costs.add(stepCost);
+      final landed = env.status == et.GameStatus.landed;
+      final totalCost = costs.fold(0.0, (a, b) => a + b);
+      final avgThrProb = costs.isEmpty ? 0.0 : (thrProbSum / costs.length);
 
-      if (info.terminal || caches.length > 4000) break;
-    }
+      return EpisodeResult(
+        totalCost, costs.length, landed,
+        turnSteps: turnSteps,
+        leftSteps: leftSteps,
+        rightSteps: rightSteps,
+        thrustSteps: thrustSteps,
+        avgThrProb: avgThrProb,
+      );
+    } else {
+      // ----------------------- Two-stage path (planner/controller) --------------
+      // ---------------- two-stage path ----------------
+      final decisionCaches = <_Forward>[];
+      final intentChoices  = <int>[];
+      final decisionTimes  = <int>[];
+      final costs          = <double>[];
 
-    // Discounted returns over reward = -cost
-    final R = List<double>.filled(costs.length, 0.0);
-    double running = 0.0;
-    for (int t = costs.length - 1; t >= 0; t--) {
-      final reward = -costs[t];
-      running = reward + gamma * running;
-      R[t] = running;
-    }
+      final intentCounts = List<int>.filled(PolicyNetwork.kIntents, 0);
+      int intentSwitches = 0;
 
-    if (train && caches.isNotEmpty) {
-      policy.updateFromEpisode(
-        caches: caches,
-        actions: actions,
-        returns_: R,
-        lr: lr,
-        entropyBeta: entropyBeta,
-        valueBeta: valueBeta,
-        huberDelta: huberDelta,
+      int t = 0;
+      int framesLeft = 0;
+      int currentIntentIdx = -1;
+
+      while (true) {
+        if (framesLeft <= 0) {
+          // (decide intent as you already do)
+          final xPlan = fe.extract(env);
+          int idx; List<double> probs; _Forward cache;
+
+          if (greedy) {
+            final res = policy.actIntentGreedy(xPlan);
+            idx = res.$1; probs = res.$2; cache = res.$3;
+          } else {
+            final res = policy.actIntent(xPlan, rnd, tempIntent: tempIntent, epsilon: epsilon);
+            idx = res.$1; probs = res.$2; cache = res.$3;
+          }
+
+          currentIntentIdx = idx;
+          decisionCaches.add(cache);
+          intentChoices.add(idx);
+          decisionTimes.add(t);
+          framesLeft = planHold;
+
+          // DIAGNOSTICS
+          intentCounts[idx] += 1;
+          if (intentChoices.length >= 2 &&
+              intentChoices[intentChoices.length - 1] != intentChoices[intentChoices.length - 2]) {
+            intentSwitches += 1;
+          }
+
+          // PUBLISH INTENT
+          IntentBus.instance.publishIntent(IntentEvent(
+            intent: kIntentNames[idx],
+            probs: probs,
+            step: t,
+            meta: {
+              'episode_step': t,
+              'plan_hold': planHold,
+            },
+          ));
+        }
+
+        final intent = indexToIntent(currentIntentIdx);
+        final u = controllerForIntent(intent, env);
+
+        // PUBLISH CONTROL (what the controller actually outputs)
+        IntentBus.instance.publishControl(ControlEvent(
+          thrust: u.thrust, left: u.left, right: u.right, step: t,
+          meta: {'intent': kIntentNames[currentIntentIdx]},
+        ));
+
+        final info = env.step(dt, et.ControlInput(thrust: u.thrust, left: u.left, right: u.right));
+        final s = info.scoreDelta;
+        costs.add(scoreIsReward ? -s : s);
+
+        framesLeft -= 1;
+        t += 1;
+        if (info.terminal || t > 4000) break;
+      }
+
+      // reward-to-go for each step
+      final R = List<double>.filled(costs.length, 0.0);
+      double running = 0.0;
+      for (int i = costs.length - 1; i >= 0; i--) {
+        final reward = -costs[i];
+        running = reward + gamma * running;
+        R[i] = running;
+      }
+
+      // returns at decision times
+      final decisionReturns = <double>[];
+      for (final ti in decisionTimes) {
+        final idx = ti.clamp(0, R.length - 1);
+        decisionReturns.add(R[idx]);
+      }
+
+      if (train && decisionCaches.isNotEmpty) {
+        policy.updateFromEpisode(
+          decisionCaches: decisionCaches,
+          intentChoices: intentChoices,
+          decisionReturns: decisionReturns,
+          lr: lr,
+          entropyBeta: intentEntropyBeta,
+          valueBeta: valueBeta,
+          huberDelta: huberDelta,
+          intentMode: true,
+        );
+      }
+
+      final landed = env.status == et.GameStatus.landed;
+      final totalCost = costs.fold(0.0, (a, b) => a + b);
+
+      return EpisodeResult(
+        totalCost, costs.length, landed,
+        intentCounts: intentCounts,
+        intentSwitches: intentSwitches,
       );
     }
-
-    final landed = env.status == et.GameStatus.landed;
-    final totalCost = costs.fold(0.0, (a, b) => a + b);
-    return EpisodeResult(totalCost, costs.length, landed);
   }
 }
