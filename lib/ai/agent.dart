@@ -1,15 +1,16 @@
 // lib/ai/agent.dart
-import 'dart:io' as io;
 import 'dart:math' as math;
 
 import '../engine/game_engine.dart' as eng;
 import '../engine/types.dart' as et;
-import 'intent_bus.dart'; // ControlInput (adjust/remove if yours is in game_engine.dart)
+
+// If you don't have intent_bus.dart, you can delete these imports & the two publish blocks.
+import 'intent_bus.dart';
 
 /* ----------------------------- Feature Extraction ----------------------------- */
 
 class FeatureExtractor {
-  final int groundSamples; // total number of local ground samples (even or odd)
+  final int groundSamples; // number of local ground samples (even or odd)
   final double stridePx;
   FeatureExtractor({this.groundSamples = 3, this.stridePx = 48});
 
@@ -35,7 +36,7 @@ class FeatureExtractor {
     final gyR = T.heightAt(math.min(cfg.worldW, L.pos.x + 20));
     final slope = (((gyR - gyL) / 40.0) / 0.5).clamp(-2.0, 2.0);
 
-    // Local ground samples (generate EXACTLY groundSamples, even or odd)
+    // Local ground samples (exactly groundSamples, even/odd supported)
     final n = groundSamples;
     final samples = <double>[];
     final center = (n - 1) / 2.0; // symmetric offsets for even/odd n
@@ -126,8 +127,37 @@ const List<String> kIntentNames = [
 int intentToIndex(Intent it) => it.index;
 Intent indexToIntent(int i) => Intent.values[i];
 
-/// Simple deterministic controller that converts a chosen intent into
-/// (thrust,left,right) per physics step. Tune the gains here.
+/// Shared heuristic for supervised labels (correct left/right mapping).
+int heuristicIntentLabel(eng.GameEngine env) {
+  final padCx = env.terrain.padCenter;
+  final dx = env.lander.pos.x - padCx;            // + if lander is RIGHT of pad
+  final groundY = env.terrain.heightAt(env.lander.pos.x);
+  final height = groundY - env.lander.pos.y;      // px above ground
+  final vy = env.lander.vel.y;                    // +down
+
+  final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
+      .clamp(1.0, env.cfg.worldW.toDouble());
+  final dxN = (dx.abs() / padHalfW);
+  const dxDead = 0.25;  // within 1/4 pad halfwidth ~ treated as "centered"
+  final high = height > 0.30 * env.cfg.worldH;
+
+  if (dxN > dxDead) {
+    // lander is off-center: if it's to the RIGHT (dx>0), we need to go LEFT, and vice versa.
+    return dx > 0
+        ? intentToIndex(Intent.goLeft)
+        : intentToIndex(Intent.goRight);
+  } else {
+    if (high) {
+      return intentToIndex(Intent.descendSlow);
+    } else {
+      return (vy > 55.0)
+          ? intentToIndex(Intent.brakeUp)
+          : intentToIndex(Intent.hoverCenter);
+    }
+  }
+}
+
+/// Deterministic low-level controller mapping an intent to (thrust/left/right).
 et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final L = env.lander;
   final padCx = env.terrain.padCenter;
@@ -138,7 +168,7 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
   bool left = false, right = false, thrust = false;
 
-  // angle PD toward desired angle (lean into correcting dx and vx)
+  // Angle PD toward desired angle (lean into correcting dx and vx)
   double targetAngle = 0.0;
   const kAngDx = 0.006;     // how much horizontal error affects target angle
   const kAngVx = 0.012;     // how much vx affects target angle
@@ -155,8 +185,6 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
       targetAngle = (-0.5 * kAngDx * dx - 0.5 * kAngVx * vx).clamp(-maxTilt, maxTilt);
       break;
     case Intent.descendSlow:
-      targetAngle = 0.0;
-      break;
     case Intent.brakeUp:
       targetAngle = 0.0;
       break;
@@ -166,12 +194,12 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   if (angle > targetAngle + angDead) left = true;
   if (angle < targetAngle - angDead) right = true;
 
-  // vertical PD for thrust target
+  // Vertical PD for thrust target
   double targetVy = 60.0; // px/s downward normally
   if (intent == Intent.descendSlow) targetVy = 30.0;
   if (intent == Intent.brakeUp)     targetVy = -20.0;
 
-  // stricter near ground
+  // Stricter near ground
   final groundY = env.terrain.heightAt(L.pos.x);
   final height = groundY - L.pos.y;
   if (height < 120) targetVy = math.min(targetVy, 20.0);
@@ -180,7 +208,7 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final eVy = vy - targetVy;
   thrust = eVy > 0; // burn if falling faster than target
 
-  // avoid ceiling hover
+  // Avoid ceiling hover
   if (L.pos.y < env.cfg.ceilingMargin) {
     thrust = false;
   }
@@ -317,24 +345,16 @@ extension PolicyOps on PolicyNetwork {
 
   /* --------------------------- Single-stage (legacy) -------------------------- */
 
-  /// Deterministic (greedy) action: no sampling, no temps/epsilon.
-  /// Returns (thrust, left, right, probs[ p_thr, p_turn0, p_turn1, p_turn2 ], cache)
   (bool thrust, bool left, bool right, List<double> probs, _Forward cache)
   actGreedy(List<double> x) {
     final f = _forward(x);
-
-    // throttle: STRICT tie-break → no thrust on tie
     final thrust = f.thrP > 0.5;
-
-    // turn: argmax over raw logits: classes [none, left, right]
-    final cls = _argmax(f.turnLogits);
+    final cls = _argmax(f.turnLogits); // [none, left, right]
     final left = cls == 1;
     final right = cls == 2;
-
     return (thrust, left, right, [f.thrP, ...f.turnP], f);
   }
 
-  /// Tempered + epsilon-greedy action sampling (stochastic)
   (bool thrust, bool left, bool right, List<double> probs, _Forward cache) act(
       List<double> x,
       math.Random rnd, {
@@ -344,17 +364,14 @@ extension PolicyOps on PolicyNetwork {
       }) {
     final f = _forward(x);
 
-    // temperature scaling
     final pThr = sigmoid(f.thrLogit / math.max(1e-6, tempThr));
-
     final scaled = [
       f.turnLogits[0] / math.max(1e-6, tempTurn),
       f.turnLogits[1] / math.max(1e-6, tempTurn),
       f.turnLogits[2] / math.max(1e-6, tempTurn),
     ];
-    final pTurn = softmax(scaled); // [none,left,right]
+    final pTurn = softmax(scaled);
 
-    // sample
     bool thrust = rnd.nextDouble() < pThr;
     final r = rnd.nextDouble();
     int cls;
@@ -365,7 +382,6 @@ extension PolicyOps on PolicyNetwork {
     bool left = cls == 1;
     bool right = cls == 2;
 
-    // epsilon-greedy kick
     if (epsilon > 0.0 && rnd.nextDouble() < epsilon) {
       const combos = <List<bool>>[
         [false, false, false],
@@ -384,14 +400,12 @@ extension PolicyOps on PolicyNetwork {
 
   /* ---------------------------- Two-stage (planner) --------------------------- */
 
-  /// Greedy intent selection (deterministic). Returns (intentIndex, probs[K], cache)
   (int intentIndex, List<double> probs, _Forward cache) actIntentGreedy(List<double> x) {
     final f = _forward(x);
     final idx = _argmax(f.intentLogits);
     return (idx, List<double>.from(f.intentP), f);
   }
 
-  /// Sample an intent with temperature + epsilon.
   (int intentIndex, List<double> probs, _Forward cache) actIntent(
       List<double> x,
       math.Random rnd, {
@@ -399,7 +413,10 @@ extension PolicyOps on PolicyNetwork {
         double epsilon = 0.0,
       }) {
     final f = _forward(x);
-    final scaled = List<double>.generate(PolicyNetwork.kIntents, (i) => f.intentLogits[i] / math.max(1e-6, tempIntent));
+    final scaled = List<double>.generate(
+      PolicyNetwork.kIntents,
+          (i) => f.intentLogits[i] / math.max(1e-6, tempIntent),
+    );
     final p = softmax(scaled);
     int idx;
     final r = rnd.nextDouble();
@@ -415,7 +432,6 @@ extension PolicyOps on PolicyNetwork {
 
   /* ------------------------ Updates: single & two-stage ----------------------- */
 
-  // Single-stage update (thr/turn + value + optional entropy)
   void _updateSingleStage({
     required List<_Forward> caches,
     required List<List<int>> actions, // [th, left, right]
@@ -596,7 +612,8 @@ extension PolicyOps on PolicyNetwork {
       // logits grad for categorical intent (PG)
       final target = List<double>.filled(PolicyNetwork.kIntents, 0.0);
       target[k] = 1.0;
-      final dz_int = List<double>.generate(PolicyNetwork.kIntents, (i) => (f.intentP[i] - target[i]) * A);
+      final dz_int = List<double>.generate(
+          PolicyNetwork.kIntents, (i) => (f.intentP[i] - target[i]) * A);
 
       // --- Auxiliary intent-alignment (OPTIONAL, small) ---
       if (alignWeight > 0.0 && alignLabels != null) {
@@ -703,8 +720,8 @@ extension PolicyOps on PolicyNetwork {
     List<_Forward>? decisionCaches,
     List<int>? intentChoices,
     List<double>? decisionReturns,
-    List<int>? alignLabels,           // NEW: heuristic intent labels
-    double alignWeight = 0.0,         // NEW: auxiliary loss strength
+    List<int>? alignLabels,           // heuristic intent labels
+    double alignWeight = 0.0,         // auxiliary loss strength
     // common hyperparams
     double lr = 3e-4,
     double l2 = 1e-6,
@@ -800,12 +817,286 @@ class Trainer {
     this.tempTurn = 1.0,
     this.epsilon = 0.0,
     this.entropyBeta = 0.0,
-    // two-stage defaults (off by default to preserve behavior)
+    // two-stage defaults (on by default here)
     this.twoStage = true,
     this.planHold = 12,
     this.tempIntent = 1.0,
     this.intentEntropyBeta = 0.0,
   }) : rnd = math.Random(seed);
+
+  void debugMicroOverfitIntent({
+    int perClass = 10,
+    int steps = 600,
+    double lr = 0.02,
+    double alignWeight = 10.0,
+    int seed = 42,
+  }) {
+    final rng = math.Random(seed);
+    env.reset(seed: 123456);
+
+    final xs = <List<double>>[];
+    final ys = <int>[];
+
+    void put(Intent it, {double? x, double? h, double? vx, double? vy}) {
+      final padCx = env.terrain.padCenter.toDouble();
+      final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
+          .clamp(8.0, env.cfg.worldW.toDouble());
+
+      // very separated prototypes
+      switch (it) {
+        case Intent.goLeft:      x ??= (padCx + 0.95 * padHalfW); h ??= 220; vx ??= 80;  vy ??= 40; break;
+        case Intent.goRight:     x ??= (padCx - 0.95 * padHalfW); h ??= 220; vx ??= -80; vy ??= 40; break;
+        case Intent.descendSlow: x ??= padCx;                     h ??= 0.7 * env.cfg.worldH; vx ??= 0;    vy ??= 35; break;
+        case Intent.brakeUp:     x ??= padCx;                     h ??= 60;                    vx ??= 0;    vy ??= 140; break;
+        case Intent.hoverCenter: x ??= padCx;                     h ??= 220;                   vx ??= 0;    vy ??= 12; break;
+      }
+
+      final gy = env.terrain.heightAt(x);
+      env.lander.pos.x = x.clamp(10.0, env.cfg.worldW - 10.0);
+      env.lander.pos.y = (gy - h).clamp(0.0, env.cfg.worldH - 10.0);
+      env.lander.vel.x = vx;
+      env.lander.vel.y = vy;
+      env.lander.angle = 0.0;
+      env.lander.fuel  = env.cfg.t.maxFuel;
+
+      xs.add(fe.extract(env));
+      ys.add(heuristicIntentLabel(env)); // label via the same heuristic
+    }
+
+    for (final it in Intent.values) {
+      for (int i = 0; i < perClass; i++) put(it);
+    }
+
+    // train hard on the tiny set
+    for (int t = 0; t < steps; t++) {
+      final caches = <_Forward>[];
+      final returns = <double>[];
+      final intents = <int>[];
+      final labels  = <int>[];
+      for (int i = 0; i < xs.length; i++) {
+        final res = policy.actIntentGreedy(xs[i]);
+        caches.add(res.$3);
+        returns.add(res.$3.v); // R=V → A=0 (no PG)
+        intents.add(ys[i]);
+        labels.add(ys[i]);
+      }
+      policy.updateFromEpisode(
+        decisionCaches: caches,
+        intentChoices: intents,
+        decisionReturns: returns,
+        alignLabels: labels,
+        alignWeight: alignWeight,
+        lr: lr,
+        entropyBeta: 0.0,
+        valueBeta: 0.0,
+        intentMode: true,
+      );
+    }
+
+    // confusion matrix
+    final K = PolicyNetwork.kIntents;
+    final conf = List.generate(K, (_) => List<int>.filled(K, 0));
+    int ok = 0;
+    for (int i = 0; i < xs.length; i++) {
+      final pred = policy.actIntentGreedy(xs[i]).$1;
+      conf[ys[i]][pred] += 1;
+      if (pred == ys[i]) ok++;
+    }
+    final acc = ok / xs.length;
+
+    print('MICRO-OVERFIT acc=${(acc*100).toStringAsFixed(1)}% '
+        '(N=${xs.length}, steps=$steps, lr=$lr, align=$alignWeight)');
+    final names = kIntentNames;
+    for (int r = 0; r < K; r++) {
+      print('${names[r].padRight(12)} | ' +
+          List.generate(K, (c) => conf[r][c].toString().padLeft(3)).join(' '));
+    }
+  }
+
+  /// Pretrain the intent head on synthetic snapshots (balanced, terrain inited).
+  /// Returns stats: {'acc': accuracy, 'n': sampleCount, 'acc_class_k': per-class}
+  Map<String, double> pretrainIntentOnSnapshots({
+    int samples = 6000,
+    int epochs = 2,
+    double lr = 1e-3,
+    double alignWeight = 1.5, // strength of CE assist
+    int seed = 1337,
+  }) {
+    final rng = math.Random(seed);
+
+    // 1) deterministic terrain so labels are stable
+    env.reset(seed: 123456);
+
+    // ------------ helpers ------------
+    void _setState({
+      required double x,
+      required double height,
+      required double vx,
+      required double vy,
+    }) {
+      final gy = env.terrain.heightAt(x);
+      final y = (gy - height).clamp(0.0, env.cfg.worldH - 10.0);
+      env.lander.pos.x = x.clamp(10.0, env.cfg.worldW - 10.0);
+      env.lander.pos.y = y;
+      env.lander.vel.x = vx;
+      env.lander.vel.y = vy;
+      env.lander.angle = 0.0;
+      env.lander.fuel  = env.cfg.t.maxFuel;
+    }
+
+    void _synthForIntent(Intent it) {
+      final padCx = env.terrain.padCenter.toDouble();
+      final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
+          .clamp(12.0, env.cfg.worldW.toDouble());
+
+      double x=padCx, h=200, vx=0, vy=20;
+      const triesMax = 8;
+
+      for (int tries=0; tries<triesMax; tries++) {
+        switch (it) {
+          case Intent.goLeft:
+            x  = padCx + (0.92 + 0.06 * rng.nextDouble()) * padHalfW;
+            h  = 200.0 + 100.0 * rng.nextDouble();
+            vx = 60.0 + 40.0 * rng.nextDouble();
+            vy = 30.0 + 40.0 * rng.nextDouble();
+            break;
+          case Intent.goRight:
+            x  = padCx - (0.92 + 0.06 * rng.nextDouble()) * padHalfW;
+            h  = 200.0 + 100.0 * rng.nextDouble();
+            vx = -(60.0 + 40.0 * rng.nextDouble());
+            vy = 30.0 + 40.0 * rng.nextDouble();
+            break;
+          case Intent.descendSlow:
+            x  = padCx + (rng.nextDouble()*0.06 - 0.03) * padHalfW;
+            h  = 0.65 * env.cfg.worldH + 0.15 * env.cfg.worldH * rng.nextDouble();
+            vx = (rng.nextDouble()*30.0) - 15.0;
+            vy = 28.0 + 12.0 * rng.nextDouble();
+            break;
+          case Intent.brakeUp:
+            x  = padCx + (rng.nextDouble()*0.06 - 0.03) * padHalfW;
+            h  = 50.0 + 40.0 * rng.nextDouble();
+            vx = (rng.nextDouble()*20.0) - 10.0;
+            vy = 120.0 + 40.0 * rng.nextDouble();
+            break;
+          case Intent.hoverCenter:
+            x  = padCx + (rng.nextDouble()*0.06 - 0.03) * padHalfW;
+            h  = 220.0 + 80.0 * rng.nextDouble();
+            vx = (rng.nextDouble()*20.0) - 10.0;
+            vy = 8.0 + 6.0 * rng.nextDouble();
+            break;
+        }
+
+        _setState(x: x, height: h, vx: vx, vy: vy);
+        final lab = heuristicIntentLabel(env);
+        if (lab == intentToIndex(it)) return; // label agrees → accept
+
+        if (tries == triesMax-2) {
+          if (it == Intent.goLeft)  x = padCx + 0.98 * padHalfW;
+          if (it == Intent.goRight) x = padCx - 0.98 * padHalfW;
+        }
+        if (tries == triesMax-1) {
+          if (it == Intent.brakeUp)    { vy = 160.0; h = 60.0; }
+          if (it == Intent.hoverCenter){ vy = 8.0;   h = 260.0; }
+          _setState(x: x, height: h, vx: vx, vy: vy);
+          return;
+        }
+      }
+    }
+
+    int _labelNow() => heuristicIntentLabel(env);
+
+    // ------------ training (balanced, ONLINE, same path as micro-probe) ------------
+    const int B = 1; // online updates
+    final decisionCaches = <_Forward>[];
+    final decisionReturns = <double>[];
+    final intentChoices  = <int>[];
+    final alignLabels    = <int>[];
+
+    void _flush() {
+      if (decisionCaches.isEmpty) return;
+      policy.updateFromEpisode(
+        decisionCaches: decisionCaches,
+        intentChoices: intentChoices,
+        decisionReturns: decisionReturns, // R = V → A = 0
+        alignLabels: alignLabels,
+        alignWeight: alignWeight,         // supervised kick
+        lr: lr,
+        entropyBeta: 0.0,
+        valueBeta: 0.0,                   // no critic in pretrain
+        huberDelta: 1.0,
+        intentMode: true,
+      );
+      decisionCaches.clear();
+      decisionReturns.clear();
+      intentChoices.clear();
+      alignLabels.clear();
+    }
+
+    final intents = Intent.values;
+    final perClass = (samples / intents.length).ceil();
+
+    int seen = 0, correct = 0;
+    for (int e = 0; e < epochs; e++) {
+      final order = intents.toList()..shuffle(rng);
+      for (final it in order) {
+        for (int i = 0; i < perClass; i++) {
+          _synthForIntent(it);
+
+          final x = fe.extract(env);
+          final yIdx = _labelNow();
+
+          final res = policy.actIntentGreedy(x);
+          final cache = res.$3;
+
+          // track live acc (greedy)
+          final pred = res.$1;
+          seen++; if (pred == yIdx) correct++;
+
+          decisionCaches.add(cache);
+          alignLabels.add(yIdx);
+          intentChoices.add(yIdx);
+          decisionReturns.add(cache.v);
+
+          if (decisionCaches.length >= B) _flush();
+
+          if (seen % 1000 == 0) {
+            final pct = (100.0 * correct / seen).toStringAsFixed(1);
+            // live feedback during pretrain
+            // ignore if you don’t want console spam
+            print('pretrain live acc ~ $pct%  (seen=$seen)');
+          }
+        }
+      }
+      _flush();
+    }
+
+    // ------------ evaluation ------------
+    final K = PolicyNetwork.kIntents;
+    final counts  = List<int>.filled(K, 0);
+    final correctC = List<int>.filled(K, 0);
+    int total = 0, totalCorrect = 0;
+    final evalN = math.max(2000, samples ~/ 2);
+
+    for (int i = 0; i < evalN; i++) {
+      final it = intents[rng.nextInt(intents.length)];
+      _synthForIntent(it);
+      final yIdx = _labelNow();
+
+      final pred = policy.actIntentGreedy(fe.extract(env)).$1;
+
+      counts[yIdx] += 1;
+      total += 1;
+      if (pred == yIdx) { correctC[yIdx] += 1; totalCorrect += 1; }
+    }
+
+    double acc(int c, int n) => n==0 ? 0.0 : c / n;
+    final out = <String, double>{ 'acc': acc(totalCorrect, total), 'n': total.toDouble() };
+    for (int k=0;k<K;k++) {
+      out['acc_class_$k'] = acc(correctC[k], counts[k]);
+      out['count_class_$k'] = counts[k].toDouble();
+    }
+    return out;
+  }
 
   EpisodeResult runEpisode({
     bool train = true,
@@ -878,7 +1169,7 @@ class Trainer {
           entropyBeta: entropyBeta,
           valueBeta: valueBeta,
           huberDelta: huberDelta,
-          intentMode: false, // <-- FIXED: single-stage uses false
+          intentMode: false, // single-stage uses false
         );
       }
 
@@ -901,7 +1192,7 @@ class Trainer {
       final decisionTimes  = <int>[];
       final costs          = <double>[];
 
-      // NEW: heuristic intent labels (for auxiliary alignment)
+      // Heuristic intent labels (for auxiliary alignment)
       final heuristicLabels = <int>[];
 
       final intentCounts = List<int>.filled(PolicyNetwork.kIntents, 0);
@@ -939,55 +1230,37 @@ class Trainer {
           }
 
           // ---------- Heuristic intent label (for alignment loss) ----------
-          final padCx = env.terrain.padCenter;
-          final dx = env.lander.pos.x - padCx;
-          final groundY = env.terrain.heightAt(env.lander.pos.x);
-          final height = groundY - env.lander.pos.y;        // px above ground
-          final vy = env.lander.vel.y;                      // +down
+          heuristicLabels.add(heuristicIntentLabel(env));
 
-          final padHalfW = ((env.terrain.padX2 - env.terrain.padX1) * 0.5).clamp(1.0, env.cfg.worldW);
-          final dxN = (dx.abs() / padHalfW);
-          const dxDead = 0.25;  // within 1/4 pad halfwidth ~ treated as "centered"
-          final high = height > 0.30 * env.cfg.worldH;
-
-          int desiredIdx;
-          if (dxN > dxDead) {
-            desiredIdx = (dx > 0)
-                ? intentToIndex(Intent.goRight)
-                : intentToIndex(Intent.goLeft);
-          } else {
-            if (high) {
-              desiredIdx = intentToIndex(Intent.descendSlow);
-            } else {
-              desiredIdx = (vy > 55.0)
-                  ? intentToIndex(Intent.brakeUp)
-                  : intentToIndex(Intent.hoverCenter);
-            }
-          }
-          heuristicLabels.add(desiredIdx);
-
-          // PUBLISH INTENT
+          // ---------- (Optional) Publish intent to UI ----------
+          // Remove this block if you don't use intent_bus.dart
           IntentBus.instance.publishIntent(IntentEvent(
             intent: kIntentNames[idx],
             probs: probs,
             step: t,
-            meta: {
-              'episode_step': t,
-              'plan_hold': planHold,
-            },
+            meta: {'episode_step': t, 'plan_hold': planHold},
           ));
         }
 
         final intent = indexToIntent(currentIntentIdx);
         final u = controllerForIntent(intent, env);
 
-        // PUBLISH CONTROL (what the controller actually outputs)
+        // ---------- (Optional) Publish control to UI ----------
+        // Remove this block if you don't use intent_bus.dart
         IntentBus.instance.publishControl(ControlEvent(
           thrust: u.thrust, left: u.left, right: u.right, step: t,
           meta: {'intent': kIntentNames[currentIntentIdx]},
         ));
 
-        final info = env.step(dt, et.ControlInput(thrust: u.thrust, left: u.left, right: u.right, intentIdx: currentIntentIdx,));
+        final info = env.step(
+          dt,
+          et.ControlInput(
+            thrust: u.thrust,
+            left: u.left,
+            right: u.right,
+            intentIdx: currentIntentIdx,
+          ),
+        );
         final s = info.scoreDelta;
         costs.add(scoreIsReward ? -s : s);
 
@@ -1017,8 +1290,8 @@ class Trainer {
           decisionCaches: decisionCaches,
           intentChoices: intentChoices,
           decisionReturns: decisionReturns,
-          alignLabels: heuristicLabels,    // NEW
-          alignWeight: 0.08,               // small but steady guidance (try 0.05–0.15)
+          alignLabels: heuristicLabels,    // supervised assist
+          alignWeight: 0.08,               // small but steady guidance
           lr: lr,
           entropyBeta: intentEntropyBeta,
           valueBeta: valueBeta,
