@@ -190,7 +190,7 @@ void main(List<String> args) async {
       gravity: 0.18 * uiLinearScale, // 0.54
       thrustAccel: 0.42 * uiLinearScale, // 1.26
       rotSpeed: 1.6 * uiRotScale, // 0.8
-      maxFuel: 100.0,
+      maxFuel: 1000.0,
     ),
     worldW: 360,
     worldH: 640,
@@ -291,7 +291,7 @@ void main(List<String> args) async {
     entropyBeta: trainEntropy,
     // two-stage on:
     twoStage: true,
-    planHold: 12, // re-plan intent every 12 frames (~0.2s @ 60Hz)
+    planHold: 1, // re-plan intent every 12 frames (~0.2s @ 60Hz)
     tempIntent: 0.8, // softer sampling for planner
     intentEntropyBeta: 0.01, // small entropy on intents
   );
@@ -309,7 +309,7 @@ void main(List<String> args) async {
     epsilon: 0.0,
     entropyBeta: 0.0,
     twoStage: true, // keep the same architecture
-    planHold: 12,
+    planHold: 1,
     tempIntent: 1e-6, // greedy planner
     intentEntropyBeta: 0.0,
   );
@@ -409,7 +409,7 @@ void main(List<String> args) async {
         epsilon: 0.0,
         entropyBeta: 0.0,
         twoStage: true,
-        planHold: 12,
+        planHold: 1,
         tempIntent: 1e-6,
         intentEntropyBeta: 0.0,
       );

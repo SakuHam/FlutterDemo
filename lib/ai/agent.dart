@@ -157,6 +157,154 @@ int heuristicIntentLabel(eng.GameEngine env) {
   }
 }
 
+/// Predictive labeler: look ahead tau seconds and pick the intent
+/// that will be correct *at that time*, not just now.
+int predictiveIntentLabel(eng.GameEngine env, {double tauSec = 0.6}) {
+  final L = env.lander;
+  final padCx = env.terrain.padCenter.toDouble();
+
+  // --- current state ---
+  final dx = L.pos.x - padCx;      // + if right of pad
+  final vx = L.vel.x;              // px/s
+  final vy = L.vel.y;              // +down
+  final groundY = env.terrain.heightAt(L.pos.x);
+  final height = groundY - L.pos.y;    // px above ground
+
+  // --- rough lookahead (constant-vel for x; clamp vy) ---
+  final dxFuture = dx + vx * tauSec;
+  final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
+      .clamp(1.0, env.cfg.worldW.toDouble());
+  final dxN  = (dx.abs() / padHalfW);
+  final dxfN = (dxFuture.abs() / padHalfW);
+
+  // crude time-to-contact; avoid div by zero
+  final vySafe = math.max(10.0, vy); // assume at least slow descent
+  final tGround = height / vySafe;   // s till ground if we kept vy (lower bound)
+
+  // Hysteresis bands in pad units
+  const double dxOuter = 0.30;  // clearly off-center
+  const double dxInner = 0.18;  // treat as "centered"
+  const double vxSmall = 18.0;
+
+  // --- vertical logic first near touch ---
+  // If we’ll hit ground sooner than our lookahead window and we're fast → brake
+  if (tGround < tauSec * 0.7 && vy > 55.0) {
+    return intentToIndex(Intent.brakeUp);
+  }
+
+  // If high above ground: descend gently unless way off-center in future
+  final bool high = height > 0.30 * env.cfg.worldH;
+
+  // --- horizontal logic with lookahead ---
+  if (dxfN > dxOuter) {
+    // In tau seconds we'll still be off-center → translate toward pad
+    return (dxFuture > 0)
+        ? intentToIndex(Intent.goLeft)
+        : intentToIndex(Intent.goRight);
+  }
+
+  // If we'll be centered-ish and lateral motion small → prefer vertical intents
+  if (dxfN < dxInner && vx.abs() < vxSmall) {
+    if (high) return intentToIndex(Intent.descendSlow);
+    return (vy > 55.0)
+        ? intentToIndex(Intent.brakeUp)
+        : intentToIndex(Intent.hoverCenter);
+  }
+
+  // In-between: bias to reducing future error (sign of dxFuture)
+  if (dxFuture.abs() > 0.0) {
+    return (dxFuture > 0)
+        ? intentToIndex(Intent.goLeft)
+        : intentToIndex(Intent.goRight);
+  }
+
+  // Fallback
+  return intentToIndex(Intent.hoverCenter);
+}
+
+/// Predictive-but-adaptive: short lookahead when near center,
+/// longer when far/high. Also velocity-aware.
+int predictiveIntentLabelAdaptive(
+    eng.GameEngine env, {
+      double baseTauSec = 0.45,  // nominal horizon
+      double minTauSec  = 0.20,  // never longer than needed near center
+      double maxTauSec  = 0.90,  // still look ahead when high/far
+    }) {
+  final L = env.lander;
+  final padCx = env.terrain.padCenter.toDouble();
+
+  final dx = L.pos.x - padCx;         // + if right of pad
+  final vx = L.vel.x;
+  final vy = L.vel.y;                 // +down
+  final groundY = env.terrain.heightAt(L.pos.x);
+  final height = groundY - L.pos.y;
+
+  final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
+      .clamp(1.0, env.cfg.worldW.toDouble());
+  final dxN = (dx.abs() / padHalfW);
+
+  // --- adaptive horizon ---
+  // shorter near center and when |vx| already small; longer if high/far
+  final vxAbs = vx.abs();
+  final high  = height > 0.35 * env.cfg.worldH;
+
+  double tau = baseTauSec;
+  // near center ⇒ shrink horizon
+  if (dxN < 0.22) tau *= 0.55;
+  else if (dxN < 0.30) tau *= 0.75;
+
+  // if lateral speed is already small, don’t look too far
+  if (vxAbs < 20.0) tau *= 0.75;
+
+  // if we’re really high or far, allow a bit more lookahead
+  if (high || dxN > 0.45) tau *= 1.25;
+
+  tau = tau.clamp(minTauSec, maxTauSec);
+
+  // --- future horizontal error (constant-vx approximation) ---
+  final dxFuture = dx + vx * tau;
+  final dxfN = (dxFuture.abs() / padHalfW);
+
+  // --- vertical gating close to ground ---
+  final vySafe   = math.max(10.0, vy);
+  final tGround  = height / vySafe;
+  if (tGround < tau * 0.6 && vy > 55.0) {
+    return intentToIndex(Intent.brakeUp);
+  }
+
+  // thresholds (pad units)
+  const double dxOuter = 0.30;
+  const double dxInner = 0.18;
+  const double vxSmall = 18.0;
+
+  // If future still off-center → translate toward pad
+  if (dxfN > dxOuter) {
+    return (dxFuture > 0)
+        ? intentToIndex(Intent.goLeft)
+        : intentToIndex(Intent.goRight);
+  }
+
+  // If will be centered-ish and lateral motion small → prefer vertical intents
+  if (dxfN < dxInner && vxAbs < vxSmall) {
+    if (height > 0.30 * env.cfg.worldH) {
+      return intentToIndex(Intent.descendSlow);
+    }
+    return (vy > 55.0) ? intentToIndex(Intent.brakeUp)
+        : intentToIndex(Intent.hoverCenter);
+  }
+
+  // Middle band: bias to reducing FUTURE error but don’t over-commit
+  // Use current dx sign if |vx| already small to avoid overshoot.
+  if (vxAbs < 20.0) {
+    return (dx > 0)
+        ? intentToIndex(Intent.goLeft)
+        : intentToIndex(Intent.goRight);
+  }
+  return (dxFuture > 0)
+      ? intentToIndex(Intent.goLeft)
+      : intentToIndex(Intent.goRight);
+}
+
 /// Deterministic low-level controller mapping an intent to (thrust/left/right).
 et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final L = env.lander;
@@ -819,10 +967,32 @@ class Trainer {
     this.entropyBeta = 0.0,
     // two-stage defaults (on by default here)
     this.twoStage = true,
-    this.planHold = 12,
+    this.planHold = 1,
     this.tempIntent = 1.0,
     this.intentEntropyBeta = 0.0,
   }) : rnd = math.Random(seed);
+
+  bool shouldBrakeNow(eng.GameEngine env, {double margin = 40.0}) {
+    final L = env.lander;
+    final padX = L.pos.x;
+    final groundY = env.terrain.heightAt(padX);
+    final height = groundY - L.pos.y;     // px above ground
+    final vy = L.vel.y;                   // +down, px/s
+
+    // Effective upward decel capability (px/s^2)
+    final aThrust = env.cfg.t.thrustAccel;  // engine upward accel
+    final g       = env.cfg.t.gravity;      // downward accel
+    final a = (aThrust - g).clamp(1e-6, 1e9);
+
+    // If we're already going up or essentially zero descent, no emergency brake.
+    if (vy <= 8.0) return false;
+
+    // Stopping distance with constant decel: d = vy^2 / (2a)
+    final stopDist = (vy * vy) / (2.0 * a);
+
+    // Brake if our stopping distance (plus a buffer) exceeds remaining height.
+    return (stopDist + margin) >= height;
+  }
 
   void debugMicroOverfitIntent({
     int perClass = 10,
@@ -993,7 +1163,9 @@ class Trainer {
       }
     }
 
-    int _labelNow() => heuristicIntentLabel(env);
+//    int _labelNow() => heuristicIntentLabel(env);
+//    int _labelNow() => predictiveIntentLabel(env, tauSec: 0.6);
+    int _labelNow() => predictiveIntentLabelAdaptive(env);
 
     // ------------ training buffers (mini-batch) ------------
     const int B = 32; // mini-batch size (IMPORTANT: not 1)
@@ -1279,6 +1451,15 @@ class Trainer {
             final res = policy.actIntent(xPlan, rnd, tempIntent: tempIntent, epsilon: epsilon);
             idx = res.$1; probs = res.$2; cache = res.$3;
           }
+
+          // ---------------- NEW: physics-based brake override ----------------
+          if (shouldBrakeNow(env, margin: 50.0)) {
+            idx = intentToIndex(Intent.brakeUp);
+            // optional: make probs one-hot for logging/visualization
+            probs = List<double>.filled(PolicyNetwork.kIntents, 0.0)
+              ..[idx] = 1.0;
+          }
+          // -------------------------------------------------------------------
 
           currentIntentIdx = idx;
           decisionCaches.add(cache);

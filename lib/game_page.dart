@@ -62,7 +62,7 @@ class Tunables {
     this.gravity = 0.18,
     this.thrustAccel = 0.42,
     this.rotSpeed = 1.6,
-    this.maxFuel = 100.0,
+    this.maxFuel = 1000.0,
   });
 
   Tunables copyWith({
@@ -265,13 +265,13 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         jsonText = await file.readAsString();
         pol = RuntimeTwoStagePolicy.fromJson(
           jsonText,
-          planHold: 12,
+          planHold: 1,
         );
       } else {
         // 2) Fallback: bundled asset
         pol = await RuntimeTwoStagePolicy.loadFromAsset(
           'assets/ai/policy.json',
-          planHold: 12,
+          planHold: 1,
         );
       }
 

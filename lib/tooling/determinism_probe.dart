@@ -62,7 +62,7 @@ eng.EngineConfig _baseCfg({
       gravity: 0.18,
       thrustAccel: 0.42,
       rotSpeed: 1.6,
-      maxFuel: 100.0,
+      maxFuel: 1000.0,
     ),
     seed: seed,
     stepScale: 60.0,

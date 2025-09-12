@@ -235,7 +235,7 @@ class RuntimeTwoStagePolicy {
   static RuntimeTwoStagePolicy fromJson(
       String jsonString, {
         RuntimeFeatureExtractor? fe,
-        int planHold = 12,
+        int planHold = 1,
       }) {
     final Map<String, dynamic> j = json.decode(jsonString);
 

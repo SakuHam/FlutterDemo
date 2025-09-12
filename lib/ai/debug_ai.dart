@@ -137,7 +137,7 @@ void probeTwoStagePlanner({
   required PolicyNetwork policy,
   required FeatureExtractor fe,
   int steps = 240,
-  int planHold = 12,
+  int planHold = 1,
   double dt = 1 / 60.0,
 }) {
   if (policy.W_intent.isEmpty) {
@@ -278,7 +278,7 @@ void main(List<String> args) async {
       gravity: 0.18,
       thrustAccel: 0.42,
       rotSpeed: 1.6,
-      maxFuel: 100.0,
+      maxFuel: 1000.0,
     ),
     worldW: 360,
     worldH: 640,
@@ -348,7 +348,7 @@ void main(List<String> args) async {
       policy: policy,
       fe: fe,
       steps: steps,
-      planHold: 12,
+      planHold: 1,
     );
   }
 

@@ -14,7 +14,7 @@ class Tunables {
     this.gravity = 0.18,
     this.thrustAccel = 0.42,
     this.rotSpeed = 1.6,
-    this.maxFuel = 100.0,
+    this.maxFuel = 1000.0,
   });
 
   Tunables copyWith({
