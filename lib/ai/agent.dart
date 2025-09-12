@@ -918,8 +918,8 @@ class Trainer {
   Map<String, double> pretrainIntentOnSnapshots({
     int samples = 6000,
     int epochs = 2,
-    double lr = 1e-3,
-    double alignWeight = 1.5, // strength of CE assist
+    double lr = 3e-4,          // recommend 3e-4..5e-4 for stability
+    double alignWeight = 2.0,  // supervised CE weight
     int seed = 1337,
   }) {
     final rng = math.Random(seed);
@@ -927,7 +927,7 @@ class Trainer {
     // 1) deterministic terrain so labels are stable
     env.reset(seed: 123456);
 
-    // ------------ helpers ------------
+    // ------------ helpers (state + synth) ------------
     void _setState({
       required double x,
       required double height,
@@ -950,19 +950,19 @@ class Trainer {
           .clamp(12.0, env.cfg.worldW.toDouble());
 
       double x=padCx, h=200, vx=0, vy=20;
-      const triesMax = 8;
+      const triesMax = 24; // strict; no fallback
 
       for (int tries=0; tries<triesMax; tries++) {
         switch (it) {
           case Intent.goLeft:
             x  = padCx + (0.92 + 0.06 * rng.nextDouble()) * padHalfW;
-            h  = 200.0 + 100.0 * rng.nextDouble();
+            h  = 160.0 + 120.0 * rng.nextDouble();
             vx = 60.0 + 40.0 * rng.nextDouble();
             vy = 30.0 + 40.0 * rng.nextDouble();
             break;
           case Intent.goRight:
             x  = padCx - (0.92 + 0.06 * rng.nextDouble()) * padHalfW;
-            h  = 200.0 + 100.0 * rng.nextDouble();
+            h  = 160.0 + 120.0 * rng.nextDouble();
             vx = -(60.0 + 40.0 * rng.nextDouble());
             vy = 30.0 + 40.0 * rng.nextDouble();
             break;
@@ -974,39 +974,29 @@ class Trainer {
             break;
           case Intent.brakeUp:
             x  = padCx + (rng.nextDouble()*0.06 - 0.03) * padHalfW;
-            h  = 50.0 + 40.0 * rng.nextDouble();
-            vx = (rng.nextDouble()*20.0) - 10.0;
-            vy = 120.0 + 40.0 * rng.nextDouble();
+            h  = 40.0 + 40.0 * rng.nextDouble();      // 40–80 px above ground
+            vx = (rng.nextDouble()*18.0) - 9.0;
+            vy = 140.0 + 30.0 * rng.nextDouble();     // 140–170 px/s
             break;
           case Intent.hoverCenter:
-            x  = padCx + (rng.nextDouble()*0.06 - 0.03) * padHalfW;
-            h  = 220.0 + 80.0 * rng.nextDouble();
-            vx = (rng.nextDouble()*20.0) - 10.0;
-            vy = 8.0 + 6.0 * rng.nextDouble();
+          // clearly not "high", and very gentle descent
+            x  = padCx + (rng.nextDouble()*0.04 - 0.02) * padHalfW;
+            h  = 0.22 * env.cfg.worldH + 0.02 * env.cfg.worldH * rng.nextDouble(); // ~0.22–0.24 H
+            vx = (rng.nextDouble()*14.0) - 7.0;
+            vy = 4.0 + 4.0 * rng.nextDouble();        // 4–8 px/s
             break;
         }
 
         _setState(x: x, height: h, vx: vx, vy: vy);
         final lab = heuristicIntentLabel(env);
-        if (lab == intentToIndex(it)) return; // label agrees → accept
-
-        if (tries == triesMax-2) {
-          if (it == Intent.goLeft)  x = padCx + 0.98 * padHalfW;
-          if (it == Intent.goRight) x = padCx - 0.98 * padHalfW;
-        }
-        if (tries == triesMax-1) {
-          if (it == Intent.brakeUp)    { vy = 160.0; h = 60.0; }
-          if (it == Intent.hoverCenter){ vy = 8.0;   h = 260.0; }
-          _setState(x: x, height: h, vx: vx, vy: vy);
-          return;
-        }
+        if (lab == intentToIndex(it)) return; // accept only if label agrees
       }
     }
 
     int _labelNow() => heuristicIntentLabel(env);
 
-    // ------------ training (balanced, ONLINE, same path as micro-probe) ------------
-    const int B = 1; // online updates
+    // ------------ training buffers (mini-batch) ------------
+    const int B = 32; // mini-batch size (IMPORTANT: not 1)
     final decisionCaches = <_Forward>[];
     final decisionReturns = <double>[];
     final intentChoices  = <int>[];
@@ -1017,9 +1007,9 @@ class Trainer {
       policy.updateFromEpisode(
         decisionCaches: decisionCaches,
         intentChoices: intentChoices,
-        decisionReturns: decisionReturns, // R = V → A = 0
+        decisionReturns: decisionReturns, // R = V → A = 0 (no PG term)
         alignLabels: alignLabels,
-        alignWeight: alignWeight,         // supervised kick
+        alignWeight: alignWeight,         // supervised CE
         lr: lr,
         entropyBeta: 0.0,
         valueBeta: 0.0,                   // no critic in pretrain
@@ -1032,37 +1022,87 @@ class Trainer {
       alignLabels.clear();
     }
 
-    final intents = Intent.values;
+    // small held-out train subset for a sanity probe
+    final trainXs = <List<double>>[];
+    final trainYs = <int>[];
+
+    // ------------ snapshot / restore (checkpoint best) ------------
+    List<List<List<double>>> _snapWeights() => [
+      policy.W1.map((r) => List<double>.from(r)).toList(),
+      policy.W2.map((r) => List<double>.from(r)).toList(),
+      policy.W_intent.map((r) => List<double>.from(r)).toList(),
+    ];
+    List<List<double>> _snapBiases() => [
+      List<double>.from(policy.b1),
+      List<double>.from(policy.b2),
+      List<double>.from(policy.b_intent),
+    ];
+    void _restoreWeights(List<List<List<double>>> Ws, List<List<double>> Bs) {
+      policy.W1 = Ws[0].map((r) => List<double>.from(r)).toList();
+      policy.W2 = Ws[1].map((r) => List<double>.from(r)).toList();
+      policy.W_intent = Ws[2].map((r) => List<double>.from(r)).toList();
+      policy.b1 = List<double>.from(Bs[0]);
+      policy.b2 = List<double>.from(Bs[1]);
+      policy.b_intent = List<double>.from(Bs[2]);
+    }
+    double _probeFreshAcc(int N) {
+      int ok=0, tot=0;
+      for (int i=0;i<N;i++) {
+        final it = Intent.values[rng.nextInt(Intent.values.length)];
+        _synthForIntent(it);
+        final y = _labelNow();
+        final pred = policy.actIntentGreedy(fe.extract(env)).$1;
+        ok += (pred==y) ? 1 : 0; tot++;
+      }
+      return tot==0 ? 0.0 : ok/tot;
+    }
+    var bestAcc = 0.0;
+    var bestW = _snapWeights();
+    var bestB = _snapBiases();
+
+    // ------------ balanced, interleaved training ------------
+    final intents = Intent.values;                 // 5 classes
     final perClass = (samples / intents.length).ceil();
 
-    int seen = 0, correct = 0;
+    int seen = 0, correctLive = 0;
     for (int e = 0; e < epochs; e++) {
-      final order = intents.toList()..shuffle(rng);
-      for (final it in order) {
-        for (int i = 0; i < perClass; i++) {
-          _synthForIntent(it);
+      final baseOrder = intents.toList()..shuffle(rng);
 
+      for (int i = 0; i < perClass; i++) {
+        final order = baseOrder.toList()..shuffle(rng);
+        for (final it in order) {
+          // synth & label
+          _synthForIntent(it);
           final x = fe.extract(env);
           final yIdx = _labelNow();
 
+          if (trainXs.length < 2000) { trainXs.add(List<double>.from(x)); trainYs.add(yIdx); }
+
+          // greedy pred BEFORE update (live acc)
           final res = policy.actIntentGreedy(x);
           final cache = res.$3;
-
-          // track live acc (greedy)
           final pred = res.$1;
-          seen++; if (pred == yIdx) correct++;
+          seen++; if (pred == yIdx) correctLive++;
 
+          // accumulate batch
           decisionCaches.add(cache);
-          alignLabels.add(yIdx);
           intentChoices.add(yIdx);
-          decisionReturns.add(cache.v);
+          alignLabels.add(yIdx);
+          decisionReturns.add(cache.v); // makes A=0; CE-only
 
-          if (decisionCaches.length >= B) _flush();
+          if (decisionCaches.length >= B) {
+            _flush();
+
+            // checkpoint every ~2000 seen to avoid late collapse
+            if (seen % 2000 == 0) {
+              env.reset(seed: 123456);
+              final acc = _probeFreshAcc(500);
+              if (acc > bestAcc) { bestAcc = acc; bestW = _snapWeights(); bestB = _snapBiases(); }
+            }
+          }
 
           if (seen % 1000 == 0) {
-            final pct = (100.0 * correct / seen).toStringAsFixed(1);
-            // live feedback during pretrain
-            // ignore if you don’t want console spam
+            final pct = (100.0 * correctLive / seen).toStringAsFixed(1);
             print('pretrain live acc ~ $pct%  (seen=$seen)');
           }
         }
@@ -1070,31 +1110,55 @@ class Trainer {
       _flush();
     }
 
+    // restore best checkpoint before final eval
+    _restoreWeights(bestW, bestB);
+
     // ------------ evaluation ------------
+    env.reset(seed: 123456);
+
+    // (A) accuracy on a small stored train-subset (sanity only)
+    int okTrain = 0;
+    for (int i = 0; i < trainXs.length; i++) {
+      final pred = policy.actIntentGreedy(trainXs[i]).$1;
+      if (pred == trainYs[i]) okTrain++;
+    }
+    final accTrain = trainXs.isEmpty ? 0.0 : okTrain / trainXs.length;
+
+    // (B) accuracy on a fresh synthetic set (same generator + rejection)
     final K = PolicyNetwork.kIntents;
-    final counts  = List<int>.filled(K, 0);
-    final correctC = List<int>.filled(K, 0);
-    int total = 0, totalCorrect = 0;
+    final countsFresh  = List<int>.filled(K, 0);
+    final correctFresh = List<int>.filled(K, 0);
+    final conf = List.generate(K, (_) => List<int>.filled(K, 0));
+
+    int totalFresh = 0, okFresh = 0;
     final evalN = math.max(2000, samples ~/ 2);
 
     for (int i = 0; i < evalN; i++) {
       final it = intents[rng.nextInt(intents.length)];
-      _synthForIntent(it);
+      _synthForIntent(it);                // rejection-sampled
       final yIdx = _labelNow();
-
       final pred = policy.actIntentGreedy(fe.extract(env)).$1;
 
-      counts[yIdx] += 1;
-      total += 1;
-      if (pred == yIdx) { correctC[yIdx] += 1; totalCorrect += 1; }
+      countsFresh[yIdx] += 1;
+      conf[yIdx][pred] += 1;
+      totalFresh += 1;
+      if (pred == yIdx) okFresh += 1;
     }
 
-    double acc(int c, int n) => n==0 ? 0.0 : c / n;
-    final out = <String, double>{ 'acc': acc(totalCorrect, total), 'n': total.toDouble() };
-    for (int k=0;k<K;k++) {
-      out['acc_class_$k'] = acc(correctC[k], counts[k]);
-      out['count_class_$k'] = counts[k].toDouble();
+    final accFresh = totalFresh == 0 ? 0.0 : okFresh / totalFresh;
+
+    print('Pretrain eval (train-subset) acc=${(accTrain*100).toStringAsFixed(1)}%  N=${trainXs.length}');
+    print('Pretrain eval (fresh)        acc=${(accFresh*100).toStringAsFixed(1)}%  N=$evalN');
+
+    final names = kIntentNames;
+    for (int r = 0; r < K; r++) {
+      final row = List.generate(K, (c) => conf[r][c].toString().padLeft(3)).join(' ');
+      print('${names[r].padRight(12)} | $row   (n=${countsFresh[r]})');
     }
+
+    // package metrics
+    final out = <String, double>{ 'acc': accFresh, 'n': evalN.toDouble(), 'acc_train_subset': accTrain };
+    for (int k = 0; k < K; k++) out['count_class_$k'] = countsFresh[k].toDouble();
     return out;
   }
 

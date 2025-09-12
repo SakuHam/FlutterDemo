@@ -18,7 +18,7 @@ import '../engine/game_engine.dart' as eng;
 // Use et for types/configs (Tunables, EngineConfig, etc.)
 import '../engine/types.dart' as et;
 
-/* ------------------------------ Tiny IO helpers ------------------------------ */
+/* ----------------------- Tiny IO & math helpers ----------------------- */
 
 Future<Map<String, dynamic>> _readJson(String path) async =>
     json.decode(await File(path).readAsString()) as Map<String, dynamic>;
@@ -59,29 +59,34 @@ List<double> _vec(dynamic v) =>
     ..W2 = _mat(js['W2'])
     ..b2 = _vec(js['b2']);
 
-  // heads (support both single-stage and two-stage)
+  // heads (legacy)
   if (js.containsKey('W_thr')) policy.W_thr = _mat(js['W_thr']);
   if (js.containsKey('b_thr')) policy.b_thr = _vec(js['b_thr']);
   if (js.containsKey('W_turn')) policy.W_turn = _mat(js['W_turn']);
   if (js.containsKey('b_turn')) policy.b_turn = _vec(js['b_turn']);
 
+  // two-stage planner head
   if (js.containsKey('W_intent')) policy.W_intent = _mat(js['W_intent']);
   if (js.containsKey('b_intent')) policy.b_intent = _vec(js['b_intent']);
 
+  // critic
   if (js.containsKey('W_val')) policy.W_val = _mat(js['W_val']);
   if (js.containsKey('b_val')) policy.b_val = _vec(js['b_val']);
 
-  // FE metadata
+  // At least one action head must exist
+  final hasAnyHead = (js.containsKey('W_thr') && js.containsKey('b_thr')) ||
+      (js.containsKey('W_intent') && js.containsKey('b_intent'));
+  if (!hasAnyHead) {
+    throw ArgumentError(
+      'Policy JSON has no action heads: expected either '
+          'single-stage (W_thr/W_turn) or two-stage (W_intent).',
+    );
+  }
+
   final fe = (js['fe'] as Map<String, dynamic>?) ?? const {};
+  // Training FE = 10 + groundSamples (px,py,vx,vy,ang,fuel,padCenter,dxCenter,dGround,slope)
   final gs = (fe['groundSamples'] as int?) ?? (inputSizeJ - 10);
   final stride = (fe['stridePx'] as num?)?.toDouble() ?? 48.0;
-
-  // sanity: ensure at least one head exists
-  final hasAnyHead = (js.containsKey('W_intent') && js.containsKey('b_intent')) ||
-      (js.containsKey('W_thr') && js.containsKey('b_thr') && js.containsKey('W_turn') && js.containsKey('b_turn'));
-  if (!hasAnyHead) {
-    throw ArgumentError('Policy JSON has no heads (intent or thr/turn).');
-  }
 
   return (policy, gs, stride);
 }
@@ -101,7 +106,6 @@ Future<void> _savePolicy(
     'b1': p.b1,
     'W2': p.W2,
     'b2': p.b2,
-    // save all heads
     'W_thr': p.W_thr,
     'b_thr': p.b_thr,
     'W_turn': p.W_turn,
@@ -115,14 +119,7 @@ Future<void> _savePolicy(
   await _writePrettyJson(path, js);
 }
 
-double _median(List<double> xs) {
-  if (xs.isEmpty) return 0.0;
-  final a = List<double>.from(xs)..sort();
-  final n = a.length;
-  return n.isOdd ? a[n ~/ 2] : 0.5 * (a[n ~/ 2 - 1] + a[n ~/ 2]);
-}
-
-/* ----------------------------------- Main ----------------------------------- */
+/* ------------------------------ Main --------------------------------- */
 
 void main(List<String> args) async {
   // ---------------- CLI ----------------
@@ -141,14 +138,14 @@ void main(List<String> args) async {
   bool overfit = false; // train & eval on a single fixed seed
   bool noExplore = false; // zero exploration for training (optional)
   int fixedSeed = 424242;
-  int evalSeeds = 5;
+  int evalSeeds = 5; // only used to scale realistic episodes here
   bool logEvalEverySave = false;
 
-  // Intent pretrain flags
-  int pretrainIntent = 0;     // number of snapshot samples (0 = disabled)
+  // Pretrain toggles
+  int pretrainIntent = 0;
   int pretrainEpochs = 1;
-  double pretrainAlignW = 1.0;
-  double pretrainLr = 5e-4;
+  double pretrainLr = 1e-3;
+  double pretrainAlign = 1.0;
   bool onlyPretrain = false;
 
   for (final a in args) {
@@ -168,34 +165,47 @@ void main(List<String> args) async {
     if (a.startsWith('--eval_seeds=')) evalSeeds = int.parse(a.substring(13));
     if (a == '--log_eval_on_save=true') logEvalEverySave = true;
 
-    if (a.startsWith('--pretrain_intent=')) pretrainIntent = int.parse(a.substring(18));
-    if (a.startsWith('--pretrain_epochs=')) pretrainEpochs = int.parse(a.substring(18));
-    if (a.startsWith('--pretrain_align=')) pretrainAlignW = double.parse(a.substring(17));
-    if (a.startsWith('--pretrain_lr=')) pretrainLr = double.parse(a.substring(14));
+    // pretrain flags
+    if (a.startsWith('--pretrain_intent=')) {
+      pretrainIntent = int.parse(a.substring('--pretrain_intent='.length));
+    }
+    if (a.startsWith('--pretrain_epochs=')) {
+      pretrainEpochs = int.parse(a.substring('--pretrain_epochs='.length));
+    }
+    if (a.startsWith('--pretrain_lr=')) {
+      pretrainLr = double.parse(a.substring('--pretrain_lr='.length));
+    }
+    if (a.startsWith('--pretrain_align=')) {
+      pretrainAlign = double.parse(a.substring('--pretrain_align='.length));
+    }
     if (a == '--only_pretrain=true') onlyPretrain = true;
   }
 
-  // --------------- Engine configs ---------------
-  final uiLinearScale = 3.0;   // matches UI: 0.05 * 60
-  final uiRotScale    = 0.5;   // UI halves rotation rate
+  // --------------- Engine config (Flutter-free) ---------------
+  final uiLinearScale = 3.0; // matches UI: 0.05 * 60
+  final uiRotScale = 0.5; // UI halves rotation rate
 
-  // Locked evaluation config (phone-like deterministic target)
   final cfg = et.EngineConfig(
     t: et.Tunables(
-      gravity:     0.18 * uiLinearScale,  // 0.54
-      thrustAccel: 0.42 * uiLinearScale,  // 1.26
-      rotSpeed:    1.6  * uiRotScale,     // 0.8
-      maxFuel:     100.0,
+      gravity: 0.18 * uiLinearScale, // 0.54
+      thrustAccel: 0.42 * uiLinearScale, // 1.26
+      rotSpeed: 1.6 * uiRotScale, // 0.8
+      maxFuel: 100.0,
     ),
     worldW: 360,
     worldH: 640,
+
+    // Keep walls/pad behavior consistent with the phone
     hardWalls: true,
+
+    // Deterministic terrain/spawn when locked:
     lockTerrain: true,
     terrainSeed: 12345,
     lockSpawn: true,
     randomSpawnX: false,
     spawnXMin: 0.20,
     spawnXMax: 0.80,
+
     landingSpeedMax: 12.0,
     landingAngleMaxRad: 8 * math.pi / 180.0,
     wDx: 200.0,
@@ -203,34 +213,10 @@ void main(List<String> args) async {
     wVx: 90.0,
     wVyDown: 200.0,
     wAngleDeg: 80.0,
+    // stepScale: 60.0, // default
   );
 
-  // Training config (adds diversity to make intent learn pad direction)
-  final cfgTrain = et.EngineConfig(
-    t: cfg.t,
-    worldW: cfg.worldW,
-    worldH: cfg.worldH,
-    hardWalls: cfg.hardWalls,
-    lockTerrain: true,   // you can set false later for more diversity
-    terrainSeed: 12345,
-    lockSpawn: false,    // ← unlock spawn
-    randomSpawnX: true,  // ← randomize X
-    spawnXMin: 0.15,
-    spawnXMax: 0.85,
-    landingSpeedMax: cfg.landingSpeedMax,
-    landingAngleMaxRad: cfg.landingAngleMaxRad,
-
-    // Slight curriculum: emphasize lateral correction first
-    wDx: 260.0,
-    wDy: 160.0,
-    wVx: 110.0,
-    wVyDown: 180.0,
-    wAngleDeg: cfg.wAngleDeg,
-  );
-
-  // --------------- Envs ---------------
-  final env = eng.GameEngine(cfgTrain);         // training env (diverse)
-  final evalEnvSingle = eng.GameEngine(cfg);    // single eval env for probe
+  final env = eng.GameEngine(cfg);
 
   // -------- Feature Extractor defaults --------
   int feGS = 3;
@@ -303,20 +289,16 @@ void main(List<String> args) async {
     tempTurn: trainTempTurn,
     epsilon: trainEps,
     entropyBeta: trainEntropy,
-    // two-stage — more agile planner
+    // two-stage on:
     twoStage: true,
-    planHold: 6,             // was 12
-    tempIntent: 1.1,         // was 0.8
-    intentEntropyBeta: 0.03, // was 0.01
+    planHold: 12, // re-plan intent every 12 frames (~0.2s @ 60Hz)
+    tempIntent: 0.8, // softer sampling for planner
+    intentEntropyBeta: 0.01, // small entropy on intents
   );
 
-//  trainer.debugMicroOverfitIntent(
-//      perClass: 10, steps: 300, lr: 0.01, alignWeight: 5.0);
-//  return; // early exit so you only run the probe
-
-  // Greedy evaluation trainer on a locked env
+  // Deterministic evaluation trainer (no exploration) — used for rollouts only
   final evalTrainer = Trainer(
-    env: evalEnvSingle,
+    env: env,
     fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
     policy: policy,
     dt: 1 / 60.0,
@@ -326,56 +308,76 @@ void main(List<String> args) async {
     tempTurn: 1e-6,
     epsilon: 0.0,
     entropyBeta: 0.0,
-    twoStage: true,
-    planHold: 6,
-    tempIntent: 1e-6,
+    twoStage: true, // keep the same architecture
+    planHold: 12,
+    tempIntent: 1e-6, // greedy planner
     intentEntropyBeta: 0.0,
   );
 
-  // === Pretrain intent (optional) ===
+  // Quick determinism probe (greedy rollout twice with same seed)
+      {
+    final s = fixedSeed;
+    env.reset(seed: s);
+    final ep1 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
+    env.reset(seed: s);
+    final ep2 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
+    final same = (ep1.steps == ep2.steps) &&
+        ((ep1.totalCost - ep2.totalCost).abs() < 1e-9);
+    stdout.writeln(
+        'Determinism probe: steps ${ep1.steps} vs ${ep2.steps} | '
+            'cost ${ep1.totalCost.toStringAsFixed(6)} vs ${ep2.totalCost.toStringAsFixed(6)} '
+            '=> ${same ? "OK" : "NONDETERMINISTIC!"}');
+  }
+
+  int nextEpisodeSeed() {
+    if (overfit) return fixedSeed;
+    return rnd.nextInt(1 << 30);
+  }
+
+  /* ========================== OPTIONAL PRETRAIN ========================== */
+
   if (pretrainIntent > 0) {
     stdout.writeln(
-        'Pretraining intent on $pretrainIntent snapshots (epochs=$pretrainEpochs, '
-            'align=$pretrainAlignW, lr=$pretrainLr) ...');
+        'Pretraining intent on $pretrainIntent snapshots (epochs=$pretrainEpochs, align=$pretrainAlign, lr=$pretrainLr) ...');
+
+    // NOTE: this calls your function implemented INSIDE Trainer (agent.dart).
+    // Make sure your Trainer has: Map<String,double> pretrainIntentOnSnapshots({...})
     final stats = trainer.pretrainIntentOnSnapshots(
       samples: pretrainIntent,
       epochs: pretrainEpochs,
       lr: pretrainLr,
-      alignWeight: pretrainAlignW,
+      alignWeight: pretrainAlign,
+      seed: fixedSeed,
     );
+
+    final acc = (stats['acc'] ?? 0.0) * 100.0;
+    final n = (stats['n'] ?? 0.0).toInt();
     stdout.writeln(
-      'Pretrain done → acc=${(stats["acc"]! * 100).toStringAsFixed(1)}% '
-          'over n=${stats["n"]!.toInt()} samples',
-    );
+        'Pretrain done → acc=${acc.toStringAsFixed(1)}% over n=$n samples');
 
     await _savePolicy(
         'policy_pretrained.json', policy, trainer.fe.inputSize, feGS, feStride);
 
     if (onlyPretrain) {
-      stdout.writeln('Only-pretrain mode: saved → policy_pretrained.json. Exiting.');
+      stdout.writeln(
+          'Only-pretrain mode: saved → policy_pretrained.json. Exiting.');
       return;
     }
   }
 
-  // -------- Quick determinism probe (locked env, greedy) --------
-      {
-    final s = fixedSeed;
-    evalEnvSingle.reset(seed: s);
-    final ep1 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
-    evalEnvSingle.reset(seed: s);
-    final ep2 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
-    final same =
-        (ep1.steps == ep2.steps) && ((ep1.totalCost - ep2.totalCost).abs() < 1e-9);
-    stdout.writeln(
-      'Determinism probe: steps ${ep1.steps} vs ${ep2.steps} | '
-          'cost ${ep1.totalCost.toStringAsFixed(6)} vs ${ep2.totalCost.toStringAsFixed(6)} '
-          '=> ${same ? "OK" : "NONDETERMINISTIC!"}',
-    );
-  }
+  /* ============================ RL TRAINING ============================= */
 
-  int nextEpisodeSeed() => overfit ? fixedSeed : rnd.nextInt(1 << 30);
+  // Best realistic evaluation so far
+  var bestStats = (
+  meanCost: double.infinity,
+  medianCost: double.infinity,
+  landPct: 0.0,
+  crashPct: 100.0,
+  meanSteps: double.infinity,
+  meanDxAbs: double.infinity
+  );
 
-  /// Realistic evaluation across randomized scenarios (stable seed set).
+  /// Realistic evaluation across randomized scenarios (stable seed set)
   Future<({
   double meanCost,
   double medianCost,
@@ -393,8 +395,9 @@ void main(List<String> args) async {
     double sumDxAbs = 0.0;
 
     for (final s in seeds) {
+      // Fresh env per eval episode
       final evalEnv = eng.GameEngine(cfg);
-      final etr = Trainer(
+      final evalTrainer = Trainer(
         env: evalEnv,
         fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
         policy: policy,
@@ -406,14 +409,13 @@ void main(List<String> args) async {
         epsilon: 0.0,
         entropyBeta: 0.0,
         twoStage: true,
-        planHold: 6,
+        planHold: 12,
         tempIntent: 1e-6,
         intentEntropyBeta: 0.0,
       );
 
       evalEnv.reset(seed: s);
-
-      final ep = etr.runEpisode(train: false, lr: 0.0, greedy: true);
+      final ep = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
 
       final padCx = evalEnv.terrain.padCenter;
       final dxAbs = (evalEnv.lander.pos.x - padCx).abs();
@@ -428,28 +430,25 @@ void main(List<String> args) async {
 
     double mean(List<double> a) =>
         a.isEmpty ? 0.0 : a.reduce((x, y) => x + y) / a.length;
+    double _median(List<double> xs) {
+      if (xs.isEmpty) return 0.0;
+      final a = List<double>.from(xs)..sort();
+      final n = a.length;
+      return n.isOdd ? a[n ~/ 2] : 0.5 * (a[n ~/ 2 - 1] + a[n ~/ 2]);
+    }
 
     return (
     meanCost: mean(costs),
     medianCost: _median(costs),
     landPct: seeds.isEmpty ? 0.0 : (100.0 * landed / seeds.length),
     crashPct: seeds.isEmpty ? 0.0 : (100.0 * crashed / seeds.length),
-    meanSteps: steps.isEmpty ? 0.0 : steps.reduce((a, b) => a + b) / steps.length,
+    meanSteps:
+    steps.isEmpty ? 0.0 : steps.reduce((a, b) => a + b) / steps.length,
     meanDxAbs: seeds.isEmpty ? 0.0 : (sumDxAbs / seeds.length),
     );
   }
 
-  // Best realistic evaluation so far
-  var bestStats = (
-  meanCost: double.infinity,
-  medianCost: double.infinity,
-  landPct: 0.0,
-  crashPct: 100.0,
-  meanSteps: double.infinity,
-  meanDxAbs: double.infinity
-  );
-
-  // --------------- Training loop (batched) ---------------
+  int landedTotal = 0;
   final landWindow = <bool>[];
   const landWindowSize = 200;
 
@@ -477,6 +476,7 @@ void main(List<String> args) async {
       lastTurnSteps = ep.turnSteps;
       lastThrustSteps = ep.thrustSteps;
 
+      if (ep.landed) landedTotal++;
       landWindow.add(ep.landed);
       if (landWindow.length > landWindowSize) landWindow.removeAt(0);
     }
@@ -487,7 +487,8 @@ void main(List<String> args) async {
           : (landWindow.where((x) => x).length / landWindow.length * 100.0);
 
       final turnPct = lastSteps == 0 ? 0.0 : 100.0 * (lastTurnSteps / lastSteps);
-      final thrustPct = lastSteps == 0 ? 0.0 : 100.0 * (lastThrustSteps / lastSteps);
+      final thrustPct =
+      lastSteps == 0 ? 0.0 : 100.0 * (lastThrustSteps / lastSteps);
 
       stdout.writeln(
         'Iter $it | batch=$batch | last-ep steps: $lastSteps | '
@@ -510,8 +511,13 @@ void main(List<String> args) async {
             'mean|dx|=${ev.meanDxAbs.toStringAsFixed(1)}',
       );
 
-      // Selection rule with tol
+      // Selection rule:
+      // 1) strictly lower meanCost
+      // 2) tie (±tol) → higher land%
+      // 3) still tie → lower medianCost
+      // 4) still tie → lower mean|dx| at end
       const tol = 1e-6;
+
       bool better = false;
       if (ev.meanCost + tol < bestStats.meanCost) {
         better = true;
@@ -522,7 +528,9 @@ void main(List<String> args) async {
           if (ev.medianCost + tol < bestStats.medianCost) {
             better = true;
           } else if ((ev.medianCost - bestStats.medianCost).abs() <= tol) {
-            if (ev.meanDxAbs + tol < bestStats.meanDxAbs) better = true;
+            if (ev.meanDxAbs + tol < bestStats.meanDxAbs) {
+              better = true;
+            }
           }
         }
       }
