@@ -117,7 +117,7 @@ Future<void> _savePolicy(
     'b1': p.b1,
     'W2': p.W2,
     'b2': p.b2,
-    // Save both legacy and two-stage heads if present (they always exist in PolicyNetwork)
+    // Save both legacy and two-stage heads (PolicyNetwork defines them)
     'W_thr': p.W_thr,
     'b_thr': p.b_thr,
     'W_turn': p.W_turn,
@@ -129,6 +129,15 @@ Future<void> _savePolicy(
     'fe': {'groundSamples': gs, 'stridePx': stride},
   };
   await _writePrettyJson(path, js);
+}
+
+/// Median helper
+double _median(List<double> xs) {
+  if (xs.isEmpty) return 0.0;
+  final a = List<double>.from(xs)..sort();
+  final n = a.length;
+  if (n.isOdd) return a[n ~/ 2];
+  return 0.5 * (a[n ~/ 2 - 1] + a[n ~/ 2]);
 }
 
 void main(List<String> args) async {
@@ -148,7 +157,7 @@ void main(List<String> args) async {
   bool overfit = false; // train & eval on a single fixed seed
   bool noExplore = false; // zero exploration for training (optional)
   int fixedSeed = 424242;
-  int evalSeeds = 5; // deterministic eval across N seeds
+  int evalSeeds = 5; // only used to scale realistic episodes here
   bool logEvalEverySave = false;
 
   for (final a in args) {
@@ -169,29 +178,41 @@ void main(List<String> args) async {
     if (a == '--log_eval_on_save=true') logEvalEverySave = true;
   }
 
-  // --------------- Engine config (Flutter-free) ---------------
+// --------------- Engine config (Flutter-free) ---------------
+  final uiLinearScale = 3.0;   // matches UI: 0.05 * 60
+  final uiRotScale    = 0.5;   // UI halves rotation rate
+
   final cfg = et.EngineConfig(
     t: et.Tunables(
-      gravity: 0.18,
-      thrustAccel: 0.42,
-      rotSpeed: 1.6,
-      maxFuel: 100.0,
+      gravity:     0.18 * uiLinearScale,  // 0.54
+      thrustAccel: 0.42 * uiLinearScale,  // 1.26
+      rotSpeed:    1.6  * uiRotScale,     // 0.8
+      maxFuel:     100.0,
     ),
     worldW: 360,
     worldH: 640,
-    lockTerrain: true,
+
+    // Keep walls/pad behavior consistent with the phone
+    hardWalls: true,
+
+    // The rest of your config as-is:
+    lockTerrain: false,
     terrainSeed: 12345,
-    lockSpawn: true,
-    randomSpawnX: false,
+    lockSpawn: false,
+    randomSpawnX: true,
     spawnXMin: 0.20,
     spawnXMax: 0.80,
-    landingSpeedMax: 12.0, // stricter
+    landingSpeedMax: 12.0,
     landingAngleMaxRad: 8 * math.pi / 180.0,
     wDx: 200.0,
     wDy: 180.0,
     wVx: 90.0,
-    wVyDown: 200.0, // higher with stricter landings
+    wVyDown: 200.0,
     wAngleDeg: 80.0,
+
+    // If your EngineConfig has stepScale, leave it at 60.0 (default) —
+    // the 3.0x factor above already matches the UI’s net effect.
+    // stepScale: 60.0,
   );
 
   final env = eng.GameEngine(cfg);
@@ -273,7 +294,7 @@ void main(List<String> args) async {
     intentEntropyBeta: 0.01, // small entropy on intents
   );
 
-  // Deterministic evaluation trainer (no exploration)
+  // Deterministic evaluation trainer (no exploration) — used for rollouts only
   final evalTrainer = Trainer(
     env: env,
     fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
@@ -291,7 +312,8 @@ void main(List<String> args) async {
     intentEntropyBeta: 0.0,
   );
 
-  {
+  // Quick determinism probe
+      {
     final s = fixedSeed;
     env.reset(seed: s);
     final ep1 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
@@ -310,54 +332,86 @@ void main(List<String> args) async {
     return rnd.nextInt(1 << 30);
   }
 
-  // --------------- Deterministic evaluation helper ---------------
-  Future<
-      ({
-      double avgCost,
-      int avgSteps,
-      double landPct,
-      double turnPct,
-      double thrustPct
-      })> evalDeterministic({int nSeeds = 5}) async {
-    final seeds = List.generate(
-      nSeeds,
-          (i) => overfit ? fixedSeed : (1000 + i), // fixed small set
-    );
+  /// Realistic evaluation across randomized scenarios (stable seed set)
+  Future<({
+  double meanCost,
+  double medianCost,
+  double landPct,
+  double crashPct,
+  double meanSteps,
+  double meanDxAbs
+  })> evalRealistic({int episodes = 32}) async {
+    final seeds = List<int>.generate(episodes, (i) => 1_000_000 + i);
 
-    double sumCost = 0.0;
-    int sumSteps = 0;
-    int lands = 0;
-    int sumTurnSteps = 0;
-    int sumThrustSteps = 0;
+    final costs = <double>[];
+    final steps = <int>[];
+    int landed = 0;
+    int crashed = 0;
+    double sumDxAbs = 0.0;
 
     for (final s in seeds) {
-      env.reset(seed: s);
+      // Fresh env per eval episode
+      final evalEnv = eng.GameEngine(cfg);
+      final evalTrainer = Trainer(
+        env: evalEnv,
+        fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
+        policy: policy,
+        dt: 1 / 60.0,
+        gamma: 0.99,
+        seed: 13,
+        tempThr: 1e-6,
+        tempTurn: 1e-6,
+        epsilon: 0.0,
+        entropyBeta: 0.0,
+        twoStage: true,
+        planHold: 12,
+        tempIntent: 1e-6,
+        intentEntropyBeta: 0.0,
+      );
+
+      evalEnv.reset(seed: s);
       final ep = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
-      sumCost += ep.totalCost;
-      sumSteps += ep.steps;
-      sumTurnSteps += ep.turnSteps;
-      sumThrustSteps += ep.thrustSteps;
-      if (ep.landed) lands++;
+
+      final padCx = evalEnv.terrain.padCenter;
+      final dxAbs = (evalEnv.lander.pos.x - padCx).abs();
+      sumDxAbs += dxAbs;
+
+      costs.add(ep.totalCost);
+      steps.add(ep.steps);
+
+      if (ep.landed) landed++;
+      if (!ep.landed && evalEnv.status == et.GameStatus.crashed) crashed++;
     }
 
-    final avgCost = sumCost / nSeeds;
-    final avgSteps = (sumSteps / nSeeds).round();
-    final landPct = 100.0 * lands / nSeeds;
-    final turnPct = sumSteps == 0 ? 0.0 : 100.0 * (sumTurnSteps / sumSteps);
-    final thrustPct = sumSteps == 0 ? 0.0 : 100.0 * (sumThrustSteps / sumSteps);
+    double mean(List<double> a) => a.isEmpty ? 0.0 : a.reduce((x,y)=>x+y)/a.length;
+    double _median(List<double> xs) {
+      if (xs.isEmpty) return 0.0;
+      final a = List<double>.from(xs)..sort();
+      final n = a.length;
+      return n.isOdd ? a[n ~/ 2] : 0.5 * (a[n ~/ 2 - 1] + a[n ~/ 2]);
+    }
+
     return (
-    avgCost: avgCost,
-    avgSteps: avgSteps,
-    landPct: landPct,
-    turnPct: turnPct,
-    thrustPct: thrustPct
+    meanCost: mean(costs),
+    medianCost: _median(costs),
+    landPct: seeds.isEmpty ? 0.0 : (100.0 * landed / seeds.length),
+    crashPct: seeds.isEmpty ? 0.0 : (100.0 * crashed / seeds.length),
+    meanSteps: steps.isEmpty ? 0.0 : steps.reduce((a,b)=>a+b) / steps.length,
+    meanDxAbs: seeds.isEmpty ? 0.0 : (sumDxAbs / seeds.length),
     );
   }
 
-  // --------------- Training loop (batched) ---------------
-  double bestEvalCost = double.infinity;
-  double bestEvalLandPct = 0.0;
+  // Best realistic evaluation so far
+  var bestStats = (
+  meanCost: double.infinity,
+  medianCost: double.infinity,
+  landPct: 0.0,
+  crashPct: 100.0,
+  meanSteps: double.infinity,
+  meanDxAbs: double.infinity
+  );
 
+  // --------------- Training loop (batched) ---------------
   int landedTotal = 0;
   final landWindow = <bool>[];
   const landWindowSize = 200;
@@ -400,55 +454,83 @@ void main(List<String> args) async {
       final thrustPct = lastSteps == 0 ? 0.0 : 100.0 * (lastThrustSteps / lastSteps);
 
       stdout.writeln(
-        'Iter $it | batch=$batch | last-ep steps: $lastSteps | cost: ${lastCost.toStringAsFixed(3)} '
-            '| landed: ${lastLanded ? 'Y' : 'N'} | turn%: ${turnPct.toStringAsFixed(1)} '
-            '| thrust%: ${thrustPct.toStringAsFixed(1)} | land%($landWindowSize)=${landRate.toStringAsFixed(1)}',
+        'Iter $it | batch=$batch | last-ep steps: $lastSteps | '
+            'cost: ${lastCost.toStringAsFixed(3)} | '
+            'landed: ${lastLanded ? 'Y' : 'N'} | '
+            'turn%: ${turnPct.toStringAsFixed(1)} | '
+            'thrust%: ${thrustPct.toStringAsFixed(1)} | '
+            'land%($landWindowSize)=${landRate.toStringAsFixed(1)}',
       );
 
-      // Deterministic eval for logging and model selection
-      final ev = await evalDeterministic(nSeeds: evalSeeds);
+      // Realistic evaluation (episodes scaled from evalSeeds)
+      final ev = await evalRealistic(episodes: math.max(16, evalSeeds * 6));
       stdout.writeln(
-        'Eval → avgCost=${ev.avgCost.toStringAsFixed(3)} | steps=${ev.avgSteps} '
-            '| land%=${ev.landPct.toStringAsFixed(1)} | turn%=${ev.turnPct.toStringAsFixed(1)} '
-            '| thrust%=${ev.thrustPct.toStringAsFixed(1)}',
+        'Eval(real) → '
+            'meanCost=${ev.meanCost.toStringAsFixed(3)} | '
+            'median=${ev.medianCost.toStringAsFixed(3)} | '
+            'land%=${ev.landPct.toStringAsFixed(1)} | '
+            'crash%=${ev.crashPct.toStringAsFixed(1)} | '
+            'steps=${ev.meanSteps.toStringAsFixed(1)} | '
+            'mean|dx|=${ev.meanDxAbs.toStringAsFixed(1)}',
       );
 
-      // Model selection: prefer lower cost, break ties by land%
-      bool isBest = false;
-      if (ev.avgCost < bestEvalCost - 1e-9) {
-        isBest = true;
-      } else if ((ev.avgCost - bestEvalCost).abs() <= 1e-9 &&
-          ev.landPct > bestEvalLandPct) {
-        isBest = true;
+      // Selection rule:
+      // 1) strictly lower meanCost
+      // 2) tie (±tol) → higher land%
+      // 3) still tie → lower medianCost
+      // 4) still tie → lower mean|dx| at end
+      const tol = 1e-6;
+
+      bool better = false;
+      if (ev.meanCost + tol < bestStats.meanCost) {
+        better = true;
+      } else if ((ev.meanCost - bestStats.meanCost).abs() <= tol) {
+        if (ev.landPct > bestStats.landPct + tol) {
+          better = true;
+        } else if ((ev.landPct - bestStats.landPct).abs() <= tol) {
+          if (ev.medianCost + tol < bestStats.medianCost) {
+            better = true;
+          } else if ((ev.medianCost - bestStats.medianCost).abs() <= tol) {
+            if (ev.meanDxAbs + tol < bestStats.meanDxAbs) {
+              better = true;
+            }
+          }
+        }
       }
 
-      if (isBest) {
-        bestEvalCost = ev.avgCost;
-        bestEvalLandPct = ev.landPct;
-        await _savePolicy(
-            'policy_best_eval.json', policy, trainer.fe.inputSize, feGS, feStride);
+      if (better) {
+        bestStats = ev;
+        await _savePolicy('policy_best_eval.json', policy, trainer.fe.inputSize, feGS, feStride);
+        stdout.writeln('↑ New best (realistic) — saved policy_best_eval.json');
       }
     }
 
     if (it % saveEvery == 0) {
       await _savePolicy('policy.json', policy, trainer.fe.inputSize, feGS, feStride);
       if (logEvalEverySave) {
-        final ev = await evalDeterministic(nSeeds: evalSeeds);
+        final ev = await evalRealistic(episodes: math.max(16, evalSeeds * 6));
         stdout.writeln(
-          '[On Save] Eval → avgCost=${ev.avgCost.toStringAsFixed(3)} | steps=${ev.avgSteps} '
-              '| land%=${ev.landPct.toStringAsFixed(1)} | turn%=${ev.thrustPct.toStringAsFixed(1)}',
+          '[On Save] Eval(real) → '
+              'meanCost=${ev.meanCost.toStringAsFixed(3)} | '
+              'median=${ev.medianCost.toStringAsFixed(3)} | '
+              'land%=${ev.landPct.toStringAsFixed(1)} | '
+              'crash%=${ev.crashPct.toStringAsFixed(1)} | '
+              'steps=${ev.meanSteps.toStringAsFixed(1)} | '
+              'mean|dx|=${ev.meanDxAbs.toStringAsFixed(1)}',
         );
       }
     }
   }
 
-  // Final save + deterministic eval
+  // Final save + realistic eval
   await _savePolicy('policy.json', policy, trainer.fe.inputSize, feGS, feStride);
-  final ev = await evalDeterministic(nSeeds: evalSeeds);
+  final ev = await evalRealistic(episodes: math.max(32, evalSeeds * 6));
   stdout.writeln(
-    'Done. BestEvalCost=${bestEvalCost.toStringAsFixed(3)} bestEvalLand%=${bestEvalLandPct.toStringAsFixed(1)} '
-        '| FinalEval avgCost=${ev.avgCost.toStringAsFixed(3)} steps=${ev.avgSteps} '
-        'land%=${ev.landPct.toStringAsFixed(1)} turn%=${ev.turnPct.toStringAsFixed(1)} '
-        'thrust%=${ev.thrustPct.toStringAsFixed(1)}',
+    'Done. Best(real) meanCost=${bestStats.meanCost.toStringAsFixed(3)} '
+        'land%=${bestStats.landPct.toStringAsFixed(1)} | '
+        'FinalEval(real) meanCost=${ev.meanCost.toStringAsFixed(3)} '
+        'median=${ev.medianCost.toStringAsFixed(3)} '
+        'land%=${ev.landPct.toStringAsFixed(1)} crash%=${ev.crashPct.toStringAsFixed(1)} '
+        'steps=${ev.meanSteps.toStringAsFixed(1)} mean|dx|=${ev.meanDxAbs.toStringAsFixed(1)}',
   );
 }

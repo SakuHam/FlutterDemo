@@ -29,7 +29,7 @@ class RuntimeFeatureExtractor {
     final vx = (lander.velocity.dx / 200.0).clamp(-2.0, 2.0);
     final vy = (lander.velocity.dy / 200.0).clamp(-2.0, 2.0);
     final ang = (lander.angle / math.pi).clamp(-1.5, 1.5); // angle value, not sin/cos
-    final fuel = (lander.fuel / 100.0).clamp(0.0, 1.0);    // UI Tunables.maxFuel = 100
+    final fuel = (lander.fuel / 100.0).clamp(0.0, 1.0);    // Tunables.maxFuel=100 in UI
 
     final padCenter = ((terrain.padX1 + terrain.padX2) * 0.5) / worldW;
     final dxCenter =
@@ -131,7 +131,7 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
 
   double vxDes = switch (intent) {
     Intent.goLeft       => -vxGoalAbs,
-    Intent.goRight      => vxGoalAbs,
+    Intent.goRight      =>  vxGoalAbs,
     Intent.hoverCenter  => -kDxHover * dx,
     _                   => 0.0,
   };
@@ -191,7 +191,7 @@ class RuntimeTwoStagePolicy {
   final List<List<double>> W1, W2;
   final List<double> b1, b2;
 
-  // Legacy action heads (unused for control when two-stage is on, but we load them anyway)
+  // Legacy action heads (loaded for compatibility)
   final List<List<double>> W_thr, W_turn;
   final List<double> b_thr, b_turn;
 
@@ -210,6 +210,7 @@ class RuntimeTwoStagePolicy {
   // Planner state
   int _framesLeft = 0;
   int _currentIntentIdx = -1;
+  List<double>? _lastReplanProbs;
 
   RuntimeTwoStagePolicy._({
     required this.inputSize,
@@ -274,7 +275,7 @@ class RuntimeTwoStagePolicy {
     _expect(b_thr.length == 1, 'b_thr len');
     _expect(W_turn.length == 3 && W_turn[0].length == h2, 'W_turn shape');
     _expect(b_turn.length == 3, 'b_turn len');
-    _expect(W_intent.length >= 2 && W_intent[0].length == h2, 'W_intent shape');
+    _expect(W_intent[0].length == h2, 'W_intent shape');
     _expect(b_intent.length == W_intent.length, 'b_intent len');
     _expect(W_val.length == 1 && W_val[0].length == h2, 'W_val shape');
     _expect(b_val.length == 1, 'b_val len');
@@ -299,7 +300,9 @@ class RuntimeTwoStagePolicy {
   void resetPlanner() { _framesLeft = 0; _currentIntentIdx = -1; }
 
   /// Main runtime step: choose/hold intent, emit control, publish bus events.
-  (bool thrust, bool left, bool right) actWithIntent({
+  ///
+  /// Returns low-level control AND the chosen intent index + probs for zero-lag HUD.
+  (bool thrust, bool left, bool right, int intentIdx, List<double> probs) actWithIntent({
     required Lander lander,
     required Terrain terrain,
     required double worldW,
@@ -323,8 +326,9 @@ class RuntimeTwoStagePolicy {
 
       _currentIntentIdx = idx;
       _framesLeft = planHold;
+      _lastReplanProbs = probs;
 
-      // Publish intent (UI)
+      // Publish intent (UI/debug bus)
       IntentBus.instance.publishIntent(
         IntentEvent(
           intent: kIntentNames[idx],
@@ -335,7 +339,8 @@ class RuntimeTwoStagePolicy {
       );
     }
 
-    final intent = Intent.values[_currentIntentIdx < 0 ? 0 : _currentIntentIdx];
+    final idxNow = _currentIntentIdx < 0 ? 0 : _currentIntentIdx;
+    final intent = Intent.values[idxNow];
     final ctrl = _controllerForIntentUI(
       intent,
       lander: lander,
@@ -344,18 +349,18 @@ class RuntimeTwoStagePolicy {
       worldH: worldH,
     );
 
-    // Publish control (UI)
+    // Publish control (UI/debug bus)
     IntentBus.instance.publishControl(
       ControlEvent(
         thrust: ctrl.thrust,
         left: ctrl.left,
         right: ctrl.right,
         step: step,
-        meta: {'intent': kIntentNames[_currentIntentIdx < 0 ? 0 : _currentIntentIdx]},
+        meta: {'intent': kIntentNames[idxNow]},
       ),
     );
 
     _framesLeft -= 1;
-    return (ctrl.thrust, ctrl.left, ctrl.right);
+    return (ctrl.thrust, ctrl.left, ctrl.right, idxNow, _lastReplanProbs ?? const []);
   }
 }

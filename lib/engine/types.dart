@@ -81,10 +81,26 @@ class EngineConfig {
   final double spawnXMin;    // fraction of worldW (0..1)
   final double spawnXMax;    // fraction of worldW (0..1)
 
-  final double wThrustAssist;   // bonus when thrusting while descending (px/s scaled)
-  final double wTurnAssist;     // bonus when turning to reduce |angle| (rad scaled)
-  final double wPadAlignAssist; // bonus when turning toward pad (dx scaled)
-  final double wIdlePenalty;    // penalty for doing nothing while descending fast
+  // Heuristic assists (kept; optional)
+  final double wThrustAssist;
+  final double wTurnAssist;
+  final double wPadAlignAssist;
+  final double wIdlePenalty;
+
+  // ===== Anti-hover / fuel discouragement knobs =====
+  final double fuelPenaltyPerSec;   // cost/sec while thrust is ON
+  final double upwardPenaltyPerVel; // cost per (px/s) upward velocity (vy < 0)
+  final double loiterPenaltyPerSec; // cost/sec when too high & not descending fast enough
+  final double loiterMinVyDown;     // desired minimum downward speed (px/s, vy+)
+  final double loiterAltFrac;       // start enforcing loitering above this fraction of worldH
+
+  // ===== Pad-alignment shaping =====
+  final double padTurnDeadzoneFrac;     // dx/worldW tolerance before we care
+  final double padFarFrac;              // "far" when |dx| > padFarFrac * padHalfWidth
+  final double padDirTurnPenaltyPerSec; // cost/sec if turning opposite of pad direction
+  final double padIdleTurnPenaltyPerSec;// cost/sec if not turning when far from pad
+  final double padVelAwayPenaltyPerVel; // cost per (px/s) of velocity away from pad
+  final double padAngleAwayPenaltyPerRad; // cost per rad when leaning away
 
   EngineConfig({
     required this.worldW,
@@ -126,6 +142,21 @@ class EngineConfig {
     this.wTurnAssist = 0.20,
     this.wPadAlignAssist = 0.10,
     this.wIdlePenalty = 0.10,
+
+    // Anti-hover defaults
+    this.fuelPenaltyPerSec = 6.0,
+    this.upwardPenaltyPerVel = 0.05,
+    this.loiterPenaltyPerSec = 20.0,
+    this.loiterMinVyDown = 45.0,
+    this.loiterAltFrac = 0.35,
+
+    // Pad-alignment defaults
+    this.padTurnDeadzoneFrac = 0.03,
+    this.padFarFrac = 1.0,
+    this.padDirTurnPenaltyPerSec = 6.0,
+    this.padIdleTurnPenaltyPerSec = 2.0,
+    this.padVelAwayPenaltyPerVel = 0.02,
+    this.padAngleAwayPenaltyPerRad = 0.02,
   });
 
   EngineConfig copyWith({
@@ -164,6 +195,21 @@ class EngineConfig {
     bool? randomSpawnX,
     double? spawnXMin,
     double? spawnXMax,
+    double? wThrustAssist,
+    double? wTurnAssist,
+    double? wPadAlignAssist,
+    double? wIdlePenalty,
+    double? fuelPenaltyPerSec,
+    double? upwardPenaltyPerVel,
+    double? loiterPenaltyPerSec,
+    double? loiterMinVyDown,
+    double? loiterAltFrac,
+    double? padTurnDeadzoneFrac,
+    double? padFarFrac,
+    double? padDirTurnPenaltyPerSec,
+    double? padIdleTurnPenaltyPerSec,
+    double? padVelAwayPenaltyPerVel,
+    double? padAngleAwayPenaltyPerRad,
   }) {
     return EngineConfig(
       worldW: worldW ?? this.worldW,
@@ -201,6 +247,25 @@ class EngineConfig {
       randomSpawnX: randomSpawnX ?? this.randomSpawnX,
       spawnXMin: spawnXMin ?? this.spawnXMin,
       spawnXMax: spawnXMax ?? this.spawnXMax,
+      wThrustAssist: wThrustAssist ?? this.wThrustAssist,
+      wTurnAssist: wTurnAssist ?? this.wTurnAssist,
+      wPadAlignAssist: wPadAlignAssist ?? this.wPadAlignAssist,
+      wIdlePenalty: wIdlePenalty ?? this.wIdlePenalty,
+      fuelPenaltyPerSec: fuelPenaltyPerSec ?? this.fuelPenaltyPerSec,
+      upwardPenaltyPerVel: upwardPenaltyPerVel ?? this.upwardPenaltyPerVel,
+      loiterPenaltyPerSec: loiterPenaltyPerSec ?? this.loiterPenaltyPerSec,
+      loiterMinVyDown: loiterMinVyDown ?? this.loiterMinVyDown,
+      loiterAltFrac: loiterAltFrac ?? this.loiterAltFrac,
+      padTurnDeadzoneFrac: padTurnDeadzoneFrac ?? this.padTurnDeadzoneFrac,
+      padFarFrac: padFarFrac ?? this.padFarFrac,
+      padDirTurnPenaltyPerSec:
+      padDirTurnPenaltyPerSec ?? this.padDirTurnPenaltyPerSec,
+      padIdleTurnPenaltyPerSec:
+      padIdleTurnPenaltyPerSec ?? this.padIdleTurnPenaltyPerSec,
+      padVelAwayPenaltyPerVel:
+      padVelAwayPenaltyPerVel ?? this.padVelAwayPenaltyPerVel,
+      padAngleAwayPenaltyPerRad:
+      padAngleAwayPenaltyPerRad ?? this.padAngleAwayPenaltyPerRad,
     );
   }
 }
@@ -211,8 +276,9 @@ class ControlInput {
   final bool thrust;
   final bool left;
   final bool right;
+  final int? intentIdx;
 
-  const ControlInput({required this.thrust, required this.left, required this.right});
+  const ControlInput({required this.thrust, required this.left, required this.right, this.intentIdx,});
 }
 
 class Vector2 {

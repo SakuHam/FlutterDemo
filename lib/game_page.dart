@@ -9,7 +9,6 @@ import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:path_provider/path_provider.dart';
 import 'package:flutter/services.dart' show rootBundle;
 
-// IMPORTANT: use the same package: import everywhere (UI + agent + trainer)
 import 'package:flutter_application_1/ai/intent_bus.dart';
 import 'package:flutter_application_1/ai/runtime_policy.dart';
 
@@ -90,8 +89,8 @@ class Particle {
 class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin {
   late final Ticker _ticker;
 
-  static const double kLandingSpeedMax = 5.0;                  // was 40.0
-  static const double kLandingAngleMaxRad = 8 * math.pi / 180; // was ~14.3° (0.25 rad)
+  static const double kLandingSpeedMax = 5.0;
+  static const double kLandingAngleMaxRad = 8 * math.pi / 180;
 
   Duration _lastElapsed = Duration.zero;
 
@@ -119,11 +118,14 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   RuntimeTwoStagePolicy? _policy;
   String _policyInfo = 'No policy loaded';
 
-  // IntentBus subscriptions and UI toast helpers
+  // Fast intent HUD state
+  String _intentNow = '—';
+  List<double>? _intentProbs;
+
+  // IntentBus subscriptions
   StreamSubscription<IntentEvent>? _intentSub;
   StreamSubscription<ControlEvent>? _controlSub;
   String? _lastIntent;
-  Timer? _idleToastTimer;
 
   // Demo recording
   bool recordDemos = false;
@@ -141,32 +143,21 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   bool _useFixedSeed = false; // set true to freeze terrain for debugging
 
   // Timing/frame
-  late DateTime _last;
   int _frame = 0;
 
   @override
   void initState() {
     super.initState();
-//    debugPrint('[BUS/UI] instance = ${IntentBus.instance.debugId}');
     _ticker = createTicker(_onTick)..start();
-    _last = DateTime.now();
 
-    // Subscribe to the global singleton bus
+    // Subscribe to the global singleton bus (debug prints only; HUD uses direct return)
     _intentSub = IntentBus.instance.intentsWithReplay().listen((e) {
       _lastIntent = e.intent;
-      _showIntentToast('Intent: ${e.intent}');
+      // no SnackBar here — it introduces lag
       debugPrint('[BUS/UI] intent=${e.intent} probs=${e.probs}');
     });
     _controlSub = IntentBus.instance.controlsWithReplay().listen((c) {
       debugPrint('[BUS/UI] control: T=${c.thrust} L=${c.left} R=${c.right} meta=${c.meta}');
-    });
-
-    // Idle hint if no intents arrive shortly after enabling AI
-    _idleToastTimer = Timer(const Duration(milliseconds: 1600), () {
-      if (!mounted) return;
-      if (aiPlay && _lastIntent == null) {
-        _showIntentToast('…waiting for AI intent');
-      }
     });
 
     // Auto-load policy on startup
@@ -181,44 +172,21 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     _ticker.dispose();
     _intentSub?.cancel();
     _controlSub?.cancel();
-    _idleToastTimer?.cancel();
     super.dispose();
-  }
-
-  void _showIntentToast(String text) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).hideCurrentSnackBar();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(text),
-        behavior: SnackBarBehavior.floating,
-        margin: const EdgeInsets.only(left: 12, right: 12, bottom: 18),
-        duration: const Duration(milliseconds: 900),
-      ),
-    );
   }
 
   void _toggleAI() {
     setState(() {
       aiPlay = !aiPlay;
       if (aiPlay) {
-        // When AI starts, stop recording and clear manual inputs
         recordDemos = false;
         thrust = left = right = false;
         _lastIntent = null;
-        _idleToastTimer?.cancel();
-        _idleToastTimer = Timer(const Duration(milliseconds: 1600), () {
-          if (!mounted) return;
-          if (aiPlay && _lastIntent == null) {
-            _showIntentToast('…waiting for AI intent');
-          }
-        });
       } else {
-        // On AI off, reset planner so it re-plans next time
         _policy?.resetPlanner();
       }
     });
-    _showIntentToast(aiPlay ? 'AI: ON' : 'AI: OFF');
+    _showToast(aiPlay ? 'AI: ON' : 'AI: OFF');
   }
 
   void _reset() {
@@ -251,12 +219,12 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         fuel: t.maxFuel,
       );
 
-      // Clear manual controls
       thrust = left = right = false;
       _frame = 0;
+      _intentNow = '—';
+      _intentProbs = null;
     });
 
-    // Also reset planner so the next frame will (re)plan immediately
     _policy?.resetPlanner();
 
     debugPrint('[GamePage.reset] W=${size.width.toStringAsFixed(1)} '
@@ -278,12 +246,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       final file = File('${dir.path}/demos.json');
       await file.writeAsString(ds.toPrettyJson());
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Saved ${_demoEpisodes.length} demos → ${file.path}')),
-      );
+      _showToast('Saved ${_demoEpisodes.length} demos → ${file.path}');
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Save failed: $e')));
+      _showToast('Save failed: $e');
     }
   }
 
@@ -299,7 +265,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         jsonText = await file.readAsString();
         pol = RuntimeTwoStagePolicy.fromJson(
           jsonText,
-          // Let FE be inferred from JSON's 'fe' block; planHold mirrors trainer default
           planHold: 12,
         );
       } else {
@@ -319,10 +284,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       });
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(_policyInfo)));
+      _showToast(_policyInfo);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Load policy failed: $e')));
+      _showToast('Load policy failed: $e');
     }
   }
 
@@ -330,16 +295,15 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     double dt = (elapsed - _lastElapsed).inMicroseconds / 1e6;
     _lastElapsed = elapsed;
 
-    // clamp for safety
-    if (dt <= 0) dt = 1 / 60.0;     // fallback to nominal frame
-    dt = dt.clamp(0, 1 / 20.0);     // max 50 ms step
+    if (dt <= 0) dt = 1 / 60.0;
+    dt = dt.clamp(0, 1 / 20.0);
 
     if (!mounted || status != GameStatus.playing || _terrain == null) return;
 
     setState(() {
       // --- If AI is active, compute controls here (override manual) ---
       if (aiPlay && _policy != null && _worldSize != null) {
-        final (thr, lf, rt) = _policy!.actWithIntent(
+        final (thr, lf, rt, idx, probs) = _policy!.actWithIntent(
           lander: lander,
           terrain: _terrain!,
           worldW: _worldSize!.width,
@@ -349,6 +313,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         thrust = thr;
         left = lf;
         right = rt;
+        _intentNow = kIntentNames[idx];
+        _intentProbs = probs;
       }
 
       // --- Controls & rotation (apply scale 0.5) ---
@@ -513,6 +479,19 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     ];
   }
 
+  void _showToast(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(text),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.only(left: 12, right: 12, bottom: 18),
+        duration: const Duration(milliseconds: 900),
+      ),
+    );
+  }
+
   Widget _aiToggleIcon() {
     final active = aiPlay;
     return Tooltip(
@@ -533,6 +512,29 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
             size: 22,
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _intentChip(String label, List<double>? probs) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.white12,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Intent', style: TextStyle(fontSize: 12, color: Colors.white70)),
+          Text(label, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          if (probs != null && probs.isNotEmpty)
+            Text('p:${probs.map((p)=>p.toStringAsFixed(2)).join("/")}',
+              style: const TextStyle(fontSize: 10, color: Colors.white54),
+            ),
+        ],
       ),
     );
   }
@@ -571,17 +573,18 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      // Top row: back/menu on the left, nothing on right (space)
+                      // Top row: back/menu
                       Padding(
                         padding: const EdgeInsets.all(12.0),
                         child: _menuButton(),
                       ),
 
-                      // Stats + AI toggle row (difficulty removed)
+                      // Stats + AI toggle + fast intent chip
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           _hudBox(title: 'Fuel', value: lander.fuel.toStringAsFixed(0)),
+                          /*
                           _hudBox(
                             title: 'Vx/Vy',
                             value:
@@ -591,13 +594,16 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             title: 'Angle',
                             value: '${(lander.angle * 180 / math.pi).toStringAsFixed(0)}°',
                           ),
+                          
+                           */
+                          _intentChip(_intentNow, _intentProbs),
                           _aiToggleIcon(),
                         ],
                       ),
 
                       const SizedBox(height: 8),
 
-                      // Recording controls (kept)
+                      // Recording + terrain + reset
                       Wrap(
                         spacing: 8,
                         runSpacing: 8,
@@ -614,9 +620,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             selected: recordDemos,
                             onSelected: (v) {
                               if (aiPlay && v) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(content: Text('Disable AI Play to record demos')),
-                                );
+                                _showToast('Disable AI Play to record demos');
                                 return;
                               }
                               setState(() => recordDemos = v);
@@ -671,7 +675,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                 ),
               ),
 
-              // Controls (manual only – still visible when AI plays, but toggling has no effect)
+              // Manual controls (visible always; ignored when AI is on)
               _buildControls(),
 
               // Status banner

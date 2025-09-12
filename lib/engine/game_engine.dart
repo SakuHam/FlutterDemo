@@ -131,6 +131,7 @@ class GameEngine {
       prevAngle: _lastAngle,
       dt: dt,
       u: u,
+      intentIdx: u.intentIdx,
     );
 
     // Combine effort + scoring cost

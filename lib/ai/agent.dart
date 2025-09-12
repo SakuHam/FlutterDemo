@@ -1,4 +1,5 @@
 // lib/ai/agent.dart
+import 'dart:io' as io;
 import 'dart:math' as math;
 
 import '../engine/game_engine.dart' as eng;
@@ -137,87 +138,49 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
   bool left = false, right = false, thrust = false;
 
-  // -------- Geometry helpers --------
-  final groundY = env.terrain.heightAt(L.pos.x);
-  final height  = (groundY - L.pos.y).clamp(0.0, 1e9); // px above ground
-  final ceilingDist = (L.pos.y - env.cfg.ceilingMargin).clamp(0.0, 1e9); // px below ceiling
+  // angle PD toward desired angle (lean into correcting dx and vx)
+  double targetAngle = 0.0;
+  const kAngDx = 0.006;     // how much horizontal error affects target angle
+  const kAngVx = 0.012;     // how much vx affects target angle
+  const maxTilt = 15 * math.pi / 180;
 
-  // -------- Horizontal guidance (vx target + leveling) --------
-  const double vxGoalAbs = 80.0;
-  const double kAngV     = 0.015;
-  const double kDxHover  = 0.40;
-
-  // Base max tilt; soften near ceiling
-  double maxTilt = 20 * math.pi / 180;
-  if (ceilingDist < 140) {
-    final a = (ceilingDist / 140.0).clamp(0.0, 1.0);         // 0..1
-    final softMax = 12 * math.pi / 180;                      // min tilt near ceiling
-    maxTilt = softMax + a * (maxTilt - softMax);
+  switch (intent) {
+    case Intent.goLeft:
+      targetAngle = (-kAngDx * dx - kAngVx * vx).clamp(-maxTilt, maxTilt);
+      break;
+    case Intent.goRight:
+      targetAngle = (kAngDx * dx + kAngVx * vx).clamp(-maxTilt, maxTilt);
+      break;
+    case Intent.hoverCenter:
+      targetAngle = (-0.5 * kAngDx * dx - 0.5 * kAngVx * vx).clamp(-maxTilt, maxTilt);
+      break;
+    case Intent.descendSlow:
+      targetAngle = 0.0;
+      break;
+    case Intent.brakeUp:
+      targetAngle = 0.0;
+      break;
   }
 
-  // Desired vx from intent
-  double vxDes = switch (intent) {
-    Intent.goLeft       => -vxGoalAbs,
-    Intent.goRight      => vxGoalAbs,
-    Intent.hoverCenter  => -kDxHover * dx,
-    _                   => 0.0,
-  };
-
-  // Leveling factor: when |vxErr| small, bias targetAngle→0 (keep level)
-  final vxErr = (vxDes - vx);
-  final normErr = (vxErr.abs() / vxGoalAbs).clamp(0.0, 1.0);   // 0..1
-  final levelGain = normErr * normErr;                         // s-curve (square)
-
-  // Target angle, capped by (possibly reduced) maxTilt
-  double targetAngle = (kAngV * vxErr * levelGain).clamp(-maxTilt, maxTilt);
-
-  // Map desired angle -> turn jets with deadzone
   const angDead = 3 * math.pi / 180;
   if (angle > targetAngle + angDead) left = true;
   if (angle < targetAngle - angDead) right = true;
 
-  // -------- Vertical guidance (early braking; height-based cap) --------
-  double vyCapDown = 10.0 + 1.0 * math.sqrt(height.clamp(0.0, 9999.0));
-  vyCapDown = vyCapDown.clamp(10.0, 45.0);
+  // vertical PD for thrust target
+  double targetVy = 60.0; // px/s downward normally
+  if (intent == Intent.descendSlow) targetVy = 30.0;
+  if (intent == Intent.brakeUp)     targetVy = -20.0;
 
-  double targetVy = vyCapDown;
-  if (intent == Intent.descendSlow) targetVy = math.min(targetVy, 18.0);
-  if (intent == Intent.brakeUp)     targetVy = -15.0;
-
-  if (height < 120) targetVy = math.min(targetVy, 18.0);
+  // stricter near ground
+  final groundY = env.terrain.heightAt(L.pos.x);
+  final height = groundY - L.pos.y;
+  if (height < 120) targetVy = math.min(targetVy, 20.0);
   if (height <  60) targetVy = math.min(targetVy, 10.0);
 
-  // Base thrust: brake vertical overspeed
   final eVy = vy - targetVy;
-  thrust = eVy > 0;
+  thrust = eVy > 0; // burn if falling faster than target
 
-  // -------- Horizontal assist burn (reined in) --------
-  // Only assist when:
-  //  - intent is lateral
-  //  - tilt points the right way
-  //  - sideways error is meaningful
-  //  - NOT near the ceiling
-  //  - NOT already ascending quickly
-  const double vxErrTh = 20.0;
-  final bool tiltAligned =
-      (targetAngle >  6 * math.pi / 180 && angle >  3 * math.pi / 180) ||
-          (targetAngle < -6 * math.pi / 180 && angle < -3 * math.pi / 180);
-
-  final bool lateralIntent = intent == Intent.goLeft || intent == Intent.goRight;
-  if (lateralIntent &&
-      tiltAligned &&
-      vxErr.abs() > vxErrTh &&
-      ceilingDist > 100 &&     // stay away from ceiling when vectoring
-      vy > -6) {                // don't add thrust while strongly ascending
-    thrust = true;
-  }
-
-  // Hard anti-ceiling: if too close AND going up, cut thrust
-  if (ceilingDist < 40 && vy < 2) {
-    thrust = false;
-  }
-
-  // Keep original ceiling guard
+  // avoid ceiling hover
   if (L.pos.y < env.cfg.ceilingMargin) {
     thrust = false;
   }
@@ -591,6 +554,8 @@ extension PolicyOps on PolicyNetwork {
     required List<_Forward> decisionCaches, // caches at decision times
     required List<int> intentChoices,       // indices 0..K-1
     required List<double> decisionReturns,  // rewards-to-go at decision times
+    List<int>? alignLabels,                 // OPTIONAL heuristic labels for intent
+    double alignWeight = 0.0,               // strength of auxiliary align loss
     double lr = 3e-4,
     double l2 = 1e-6,
     double entropyBeta = 0.0,
@@ -599,6 +564,8 @@ extension PolicyOps on PolicyNetwork {
   }) {
     final T = decisionCaches.length;
     if (T == 0) return;
+    assert(alignLabels == null || alignLabels!.length == T,
+    'alignLabels length must match decisionCaches length when provided.');
 
     // Advantages: A = R_decision - V(s_decision)
     final values = List<double>.generate(T, (t) => decisionCaches[t].v);
@@ -626,10 +593,21 @@ extension PolicyOps on PolicyNetwork {
       final k = intentChoices[t];
       final A = adv[t];
 
-      // logits grad for categorical intent
+      // logits grad for categorical intent (PG)
       final target = List<double>.filled(PolicyNetwork.kIntents, 0.0);
       target[k] = 1.0;
       final dz_int = List<double>.generate(PolicyNetwork.kIntents, (i) => (f.intentP[i] - target[i]) * A);
+
+      // --- Auxiliary intent-alignment (OPTIONAL, small) ---
+      if (alignWeight > 0.0 && alignLabels != null) {
+        final yIdx = alignLabels[t];
+        if (yIdx >= 0 && yIdx < PolicyNetwork.kIntents) {
+          for (int i = 0; i < PolicyNetwork.kIntents; i++) {
+            final y = (i == yIdx) ? 1.0 : 0.0;
+            dz_int[i] += alignWeight * (f.intentP[i] - y);
+          }
+        }
+      }
 
       // entropy on intents (encourage exploration)
       if (entropyBeta > 0.0) {
@@ -652,12 +630,10 @@ extension PolicyOps on PolicyNetwork {
 
       // backprop to trunk
       final dh2 = List<double>.filled(f.h2.length, 0);
-      // from intent head
       for (int i = 0; i < W_intent.length; i++) {
         final row = W_intent[i];
         for (int j = 0; j < row.length; j++) dh2[j] += row[j] * dz_int[i];
       }
-      // from value head
       for (int j = 0; j < W_val[0].length; j++) dh2[j] += W_val[0][j] * dLdv;
 
       final dz2 = List<double>.generate(f.z2.length, (i) => dh2[i] * dRelu(f.z2[i]));
@@ -727,6 +703,8 @@ extension PolicyOps on PolicyNetwork {
     List<_Forward>? decisionCaches,
     List<int>? intentChoices,
     List<double>? decisionReturns,
+    List<int>? alignLabels,           // NEW: heuristic intent labels
+    double alignWeight = 0.0,         // NEW: auxiliary loss strength
     // common hyperparams
     double lr = 3e-4,
     double l2 = 1e-6,
@@ -741,6 +719,8 @@ extension PolicyOps on PolicyNetwork {
         decisionCaches: decisionCaches ?? const [],
         intentChoices: intentChoices ?? const [],
         decisionReturns: decisionReturns ?? const [],
+        alignLabels: alignLabels,
+        alignWeight: alignWeight,
         lr: lr, l2: l2, entropyBeta: entropyBeta,
         valueBeta: valueBeta, huberDelta: huberDelta,
       );
@@ -820,7 +800,7 @@ class Trainer {
     this.tempTurn = 1.0,
     this.epsilon = 0.0,
     this.entropyBeta = 0.0,
-    // two-stage defaults (on by default here)
+    // two-stage defaults (off by default to preserve behavior)
     this.twoStage = true,
     this.planHold = 12,
     this.tempIntent = 1.0,
@@ -898,7 +878,7 @@ class Trainer {
           entropyBeta: entropyBeta,
           valueBeta: valueBeta,
           huberDelta: huberDelta,
-          intentMode: false, // FIX: train the single-stage heads here
+          intentMode: false, // <-- FIXED: single-stage uses false
         );
       }
 
@@ -921,12 +901,11 @@ class Trainer {
       final decisionTimes  = <int>[];
       final costs          = <double>[];
 
+      // NEW: heuristic intent labels (for auxiliary alignment)
+      final heuristicLabels = <int>[];
+
       final intentCounts = List<int>.filled(PolicyNetwork.kIntents, 0);
       int intentSwitches = 0;
-
-      // NEW: actuation counters for diagnostics
-      int turnSteps = 0, leftSteps = 0, rightSteps = 0, thrustSteps = 0;
-      double thrProbSum = 0.0; // stays 0.0 in two-stage (no p_thr here)
 
       int t = 0;
       int framesLeft = 0;
@@ -934,7 +913,7 @@ class Trainer {
 
       while (true) {
         if (framesLeft <= 0) {
-          // (decide intent as you already do)
+          // (decide intent)
           final xPlan = fe.extract(env);
           int idx; List<double> probs; _Forward cache;
 
@@ -959,6 +938,34 @@ class Trainer {
             intentSwitches += 1;
           }
 
+          // ---------- Heuristic intent label (for alignment loss) ----------
+          final padCx = env.terrain.padCenter;
+          final dx = env.lander.pos.x - padCx;
+          final groundY = env.terrain.heightAt(env.lander.pos.x);
+          final height = groundY - env.lander.pos.y;        // px above ground
+          final vy = env.lander.vel.y;                      // +down
+
+          final padHalfW = ((env.terrain.padX2 - env.terrain.padX1) * 0.5).clamp(1.0, env.cfg.worldW);
+          final dxN = (dx.abs() / padHalfW);
+          const dxDead = 0.25;  // within 1/4 pad halfwidth ~ treated as "centered"
+          final high = height > 0.30 * env.cfg.worldH;
+
+          int desiredIdx;
+          if (dxN > dxDead) {
+            desiredIdx = (dx > 0)
+                ? intentToIndex(Intent.goRight)
+                : intentToIndex(Intent.goLeft);
+          } else {
+            if (high) {
+              desiredIdx = intentToIndex(Intent.descendSlow);
+            } else {
+              desiredIdx = (vy > 55.0)
+                  ? intentToIndex(Intent.brakeUp)
+                  : intentToIndex(Intent.hoverCenter);
+            }
+          }
+          heuristicLabels.add(desiredIdx);
+
           // PUBLISH INTENT
           IntentBus.instance.publishIntent(IntentEvent(
             intent: kIntentNames[idx],
@@ -969,15 +976,8 @@ class Trainer {
               'plan_hold': planHold,
             },
           ));
-        } else {
-          // heartbeat so late subscribers still see something
-          IntentBus.instance.publishIntent(IntentEvent(
-            intent: kIntentNames[currentIntentIdx],
-            probs: const [], // same as prior, or omit
-            step: t,
-            meta: {'hold': true, 'framesLeft': framesLeft},
-          ));
         }
+
         final intent = indexToIntent(currentIntentIdx);
         final u = controllerForIntent(intent, env);
 
@@ -987,13 +987,7 @@ class Trainer {
           meta: {'intent': kIntentNames[currentIntentIdx]},
         ));
 
-        // NEW: count actuation for diagnostics
-        if (u.left || u.right) turnSteps++;
-        if (u.left) leftSteps++;
-        if (u.right) rightSteps++;
-        if (u.thrust) thrustSteps++;
-
-        final info = env.step(dt, et.ControlInput(thrust: u.thrust, left: u.left, right: u.right));
+        final info = env.step(dt, et.ControlInput(thrust: u.thrust, left: u.left, right: u.right, intentIdx: currentIntentIdx,));
         final s = info.scoreDelta;
         costs.add(scoreIsReward ? -s : s);
 
@@ -1023,6 +1017,8 @@ class Trainer {
           decisionCaches: decisionCaches,
           intentChoices: intentChoices,
           decisionReturns: decisionReturns,
+          alignLabels: heuristicLabels,    // NEW
+          alignWeight: 0.08,               // small but steady guidance (try 0.05–0.15)
           lr: lr,
           entropyBeta: intentEntropyBeta,
           valueBeta: valueBeta,
@@ -1036,12 +1032,6 @@ class Trainer {
 
       return EpisodeResult(
         totalCost, costs.length, landed,
-        // expose actuation diagnostics so your logs show non-zero %
-        turnSteps: turnSteps,
-        leftSteps: leftSteps,
-        rightSteps: rightSteps,
-        thrustSteps: thrustSteps,
-        avgThrProb: thrProbSum,
         intentCounts: intentCounts,
         intentSwitches: intentSwitches,
       );

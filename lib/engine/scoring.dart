@@ -20,17 +20,20 @@ class ScoringOutcome {
   });
 }
 
-/// Minimal scoring: horizontal distance to pad center + ceiling/border + landing.
+/// Shaping that encourages: (1) getting to pad center, (2) purposeful descent,
+/// (3) not hovering, (4) alignment of turn/velocity/attitude with pad direction.
+/// Collision yields terminal (land/crash). All terms are ≥ 0.
 class Scoring {
   static ScoringOutcome apply({
     required EngineConfig cfg,
     required Terrain terrain,
     required Vector2 pos,
     required Vector2 vel,
-    required double angle,      // kept only for landing check (angle tolerance)
-    required double prevAngle,  // unused (kept for signature parity)
+    required double angle,      // used for landing tolerance & attitude shaping
+    required double prevAngle,  // unused here, kept for signature parity
     required double dt,
-    required ControlInput u,    // unused in this minimal scoring
+    required ControlInput u,    // actual control chosen this frame
+    int? intentIdx,
   }) {
     double cost = 0.0;
 
@@ -38,17 +41,14 @@ class Scoring {
     if (pos.y < 0) {
       pos = Vector2(pos.x, 0);
       if (vel.y < 0) vel = Vector2(vel.x, 0);
-      cost += cfg.ceilingHitPenalty; // one-shot bump
+      cost += cfg.ceilingHitPenalty;
     }
-
-    // Continuous penalty near the top (ramps 0..1 inside margin)
     if (pos.y < cfg.ceilingMargin) {
       final frac = (1.0 - (pos.y / cfg.ceilingMargin)).clamp(0.0, 1.0);
-      cost += frac * cfg.ceilingPenaltyPerSec * dt;  // time integrated
+      cost += frac * cfg.ceilingPenaltyPerSec * dt;
     }
 
-    // ----- Border proximity penalty (if wrapping enabled) -----
-    // (Leave it off when hardWalls==true, only wrap/hit still applies.)
+    // ----- Border proximity penalty (if wrapping disabled) -----
         {
       final x = pos.x;
       final dLeft = x;
@@ -57,11 +57,11 @@ class Scoring {
 
       if (!cfg.hardWalls && dEdge < cfg.borderMargin) {
         final frac = (1.0 - (dEdge / cfg.borderMargin)).clamp(0.0, 1.0);
-        cost += frac * cfg.borderPenaltyPerSec * dt; // time integrated
+        cost += frac * cfg.borderPenaltyPerSec * dt;
       }
     }
 
-    // Wrap or hard walls (one-shot)
+    // Wrap or clamp X (one-shot)
     if (cfg.hardWalls) {
       bool hit = false;
       double x = pos.x;
@@ -77,50 +77,129 @@ class Scoring {
       if (crossed) cost += cfg.wrapPenalty;
       pos = Vector2(x, pos.y);
     }
-
-    // Clamp Y to world top (already handled above)
     if (pos.y < 0) pos = Vector2(pos.x, 0);
 
-    // =========================
-    // The ONLY dense shaping we keep: horizontal distance to pad center
-    // =========================
-    final padCenterX = terrain.padCenter;
-    final dxN = (pos.x - padCenterX).abs() / cfg.worldW; // 0..~0.5
-    cost += (cfg.wDx * dxN) * dt;
+    // ===== Pad-centering shaping (distance to pad center) =====
+    final padCx = terrain.padCenter;
+    final padHalfW = ((terrain.padX2 - terrain.padX1) * 0.5).clamp(1.0, cfg.worldW);
+    final dx = pos.x - padCx;
+    final dxN = dx.abs() / padHalfW;
+
+    double centerTerm;
+    if (dxN <= 1.0) {
+      centerTerm = dxN * dxN;                 // inside pad: quadratic
+    } else {
+      centerTerm = 1.0 + (dxN - 1.0) * 1.5;   // outside pad: steeper linear
+    }
+    cost += cfg.wDx * centerTerm * dt;
 
     // =========================
-    // Collision / Terminal (landing vs crash)
+    // Intent alignment shaping (two-stage only)
+    // Encourage goRight when left of pad, goLeft when right of pad.
+    // Penalize the opposite. Magnitude scales with |dx|.
     // =========================
+    if ((intentIdx ?? u.intentIdx) != null) {
+      final int k = (intentIdx ?? u.intentIdx)!; // 0..K-1 from your Intent enum
+      // keep in sync with your enum order:
+      // 0:hoverCenter, 1:goLeft, 2:goRight, 3:descendSlow, 4:brakeUp
+      final bool goLeft  = (k == 1);
+      final bool goRight = (k == 2);
+      if (goLeft || goRight) {
+        final bool correct = (goRight && dx < 0) || (goLeft && dx > 0);
+        final double alignMag = (dx.abs() / cfg.worldW).clamp(0.0, 0.5); // 0..0.5
+        // Use your existing weights: wPadAlignAssist as a bonus when correct.
+        // Apply a slightly larger penalty when wrong to avoid dithering.
+        if (correct) {
+          cost -= cfg.wPadAlignAssist * alignMag * dt;
+        } else {
+          cost += (cfg.wPadAlignAssist * 1.5) * alignMag * dt;
+        }
+      }
+    }
+
+    // ===== Anti-hover shaping =====
+
+    // (1) Fuel / thrust penalty (per second while burning)
+    if (u.thrust) {
+      cost += cfg.fuelPenaltyPerSec * dt;
+    }
+
+    // (2) Upward motion penalty (vy is +down; vy<0 => going up)
+    if (vel.y < 0) {
+      cost += cfg.upwardPenaltyPerVel * (-vel.y) * dt;
+    }
+
+    // (3) Loitering penalty: high altitude & not descending fast enough
+    final groundY = terrain.heightAt(pos.x);
+    final height = groundY - pos.y;       // px above ground
+    if (height > cfg.loiterAltFrac * cfg.worldH) {
+      if (vel.y < cfg.loiterMinVyDown) {
+        final deficit = (cfg.loiterMinVyDown - vel.y); // positive if too slow downward
+        final frac = (deficit / (cfg.loiterMinVyDown + 1e-6)).clamp(0.0, 1.0);
+        cost += cfg.loiterPenaltyPerSec * frac * dt;
+      }
+    }
+
+    // ===== Pad-alignment shaping (state + commanded action) =====
+    final dxFracWorld = dx.abs() / cfg.worldW;
+    final farFromPad = (dx.abs() > cfg.padFarFrac * padHalfW);
+    if (dxFracWorld > cfg.padTurnDeadzoneFrac) {
+      final desiredSign = dx.sign; // +1 => pad to the right, -1 => left
+      final turningLeft  = u.left;
+      final turningRight = u.right;
+
+      // Penalize turning opposite of pad direction
+      final turningOpposite = (desiredSign > 0 && turningLeft) || (desiredSign < 0 && turningRight);
+      if (turningOpposite) {
+        cost += cfg.padDirTurnPenaltyPerSec * dt;
+      } else if (!turningLeft && !turningRight && farFromPad) {
+        // Idle turn when far
+        cost += cfg.padIdleTurnPenaltyPerSec * dt;
+      }
+
+      // Penalize horizontal velocity away from pad (dx * vx < 0)
+      if ((dx * vel.x) < 0) {
+        cost += cfg.padVelAwayPenaltyPerVel * vel.x.abs() * dt;
+      }
+
+      // Penalize tilt away from pad (angle sign should match dx sign)
+      if ((dx * angle) < 0) {
+        final angAway = angle.abs().clamp(0.0, math.pi / 2);
+        cost += cfg.padAngleAwayPenaltyPerRad * angAway * dt;
+      }
+    }
+
+    // ===== Collision / Terminal (landing vs crash) =====
     bool terminal = false;
     bool landed = false;
     final bool onPadNow = terrain.isOnPad(pos.x);
 
-    final groundY = terrain.heightAt(pos.x);
     final collided = (pos.y >= groundY - 2.0);
-
     if (collided) {
       terminal = true;
 
-      // Use existing tolerances for a valid landing.
       final okSpeed = vel.length <= cfg.landingSpeedMax;
       final okAngle = angle.abs() <= cfg.landingAngleMaxRad;
 
       if (onPadNow && okSpeed && okAngle) {
         landed = true;
-        // Very small landing penalty (kept >=0) so "perfect" stays near 0.
-        final landPenalty = 0.2 * (vel.length / (cfg.landingSpeedMax + 1e-6)) +
-            0.2 * (angle.abs() / (cfg.landingAngleMaxRad + 1e-6));
-        cost += landPenalty.clamp(0.0, 1.0);
 
-        // Snap to pad for stable terminal state
+        // Landing shaping with center-at-touchdown
+        final landPenaltySpeed = 0.2 * (vel.length / (cfg.landingSpeedMax + 1e-6));
+        final landPenaltyAngle = 0.2 * (angle.abs() / (cfg.landingAngleMaxRad + 1e-6));
+        double landCenterPenalty;
+        if (dxN <= 1.0) landCenterPenalty = 0.6 * (dxN * dxN);
+        else landCenterPenalty = 0.6 + 0.8 * (dxN - 1);
+
+        cost += (landPenaltySpeed + landPenaltyAngle + landCenterPenalty).clamp(0.0, 2.0);
+
+        // Snap y to pad for stable terminal state
         pos = Vector2(pos.x, terrain.padY - 18.0); // halfHeight ~ 18px
       } else {
-        // Crash penalty (one-shot): bigger than border/wrap nuisances.
-        cost += 120.0;
+        cost += 120.0; // crash penalty
       }
     }
 
-    // No negative cost.
     if (cost < 0) cost = 0.0;
 
     return ScoringOutcome(
