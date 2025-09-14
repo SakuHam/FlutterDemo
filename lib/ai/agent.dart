@@ -277,8 +277,8 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
   // Angle PD toward desired angle (lean into correcting dx and vx)
   double targetAngle = 0.0;
-  const kAngDx = 0.006;     // how much horizontal error affects target angle
-  const kAngVx = 0.012;     // how much vx affects target angle
+  const kAngDx = 0.005;     // how much horizontal error affects target angle
+  const kAngVx = 0.010;     // how much vx affects target angle
   const maxTilt = 15 * math.pi / 180;
 
   switch (intent) {
