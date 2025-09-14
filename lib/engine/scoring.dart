@@ -22,8 +22,19 @@ class ScoringOutcome {
 
 /// Shaping that encourages: (1) getting to pad center, (2) purposeful descent,
 /// (3) not hovering, (4) alignment of turn/velocity/attitude with pad direction.
-/// Collision yields terminal (land/crash). All terms are ≥ 0.
+/// Collision yields terminal (land/crash). All terms are ≥ 0, except small
+/// deliberate bonuses (negative costs) noted below.
 class Scoring {
+  // NEW: conservative height→max-safe downward speed envelope (px/s).
+  //      Encourage ~fast-ish descent high up, gentler near ground.
+  static double _vyDownMax(double height, double worldH) {
+    if (height > 0.45 * worldH) return 60.0;
+    if (height > 0.28 * worldH) return 40.0;
+    if (height > 0.17 * worldH) return 25.0;
+    if (height > 0.08 * worldH) return 14.0;
+    return 8.0;
+  }
+
   static ScoringOutcome apply({
     required EngineConfig cfg,
     required Terrain terrain,
@@ -95,11 +106,9 @@ class Scoring {
 
     // =========================
     // Intent alignment shaping (two-stage only)
-    // Encourage goRight when left of pad, goLeft when right of pad.
-    // Penalize the opposite. Magnitude scales with |dx|.
     // =========================
     if ((intentIdx ?? u.intentIdx) != null) {
-      final int k = (intentIdx ?? u.intentIdx)!; // 0..K-1 from your Intent enum
+      final int k = (intentIdx ?? u.intentIdx)!; // 0..K-1
       // keep in sync with your enum order:
       // 0:hoverCenter, 1:goLeft, 2:goRight, 3:descendSlow, 4:brakeUp
       final bool goLeft  = (k == 1);
@@ -107,8 +116,6 @@ class Scoring {
       if (goLeft || goRight) {
         final bool correct = (goRight && dx < 0) || (goLeft && dx > 0);
         final double alignMag = (dx.abs() / cfg.worldW).clamp(0.0, 0.5); // 0..0.5
-        // Use your existing weights: wPadAlignAssist as a bonus when correct.
-        // Apply a slightly larger penalty when wrong to avoid dithering.
         if (correct) {
           cost -= cfg.wPadAlignAssist * alignMag * dt;
         } else {
@@ -166,6 +173,43 @@ class Scoring {
       if ((dx * angle) < 0) {
         final angAway = angle.abs().clamp(0.0, math.pi / 2);
         cost += cfg.padAngleAwayPenaltyPerRad * angAway * dt;
+      }
+    }
+
+    // =========================
+    // NEW: Vertical speed envelope (discourage "too fast down")
+    //      This creates a clear reason to burn when actually necessary.
+    // =========================
+    final vyDown = vel.y; // +down
+    final vyMax = _vyDownMax(height, cfg.worldH);
+    if (vyDown > vyMax) {
+      // Penalize only the excess downward speed, scaled by cfg.wVyDown
+      final excess = vyDown - vyMax; // px/s
+      // normalize by a typical high-speed scale (e.g., 80 px/s) to keep units tame
+      final norm = excess / 80.0;
+      cost += (cfg.wVyDown * 2.0) * norm * dt; // ×2 gives it some bite
+    }
+
+    // =========================
+    // NEW: Tilted-thrust penalty (discourage burning while translating).
+    //      Stronger when higher; fades near ground to allow flare.
+    // =========================
+    if (u.thrust) {
+      final tilt = angle.abs();
+      final tiltDead = 4.0 * math.pi / 180.0;           // ignore tiny control noise
+      if (tilt > tiltDead) {
+        final tiltFrac = ((tilt - tiltDead) / (15.0 * math.pi / 180.0)).clamp(0.0, 1.0);
+        final nearGroundScale = (height < 80.0) ? 0.40 : 1.0; // permit flare near ground
+        // Base it on your existing fuel penalty to keep magnitudes consistent
+        cost += cfg.fuelPenaltyPerSec * 0.8 * tiltFrac * nearGroundScale * dt;
+      }
+    } else {
+      // NEW: Small glide bonus for NOT burning while tilted and within envelope.
+      //      Helps the policy prefer coasting turns over thrusty ping-pong.
+      final tiltDeg = angle.abs() * 180.0 / math.pi;
+      final withinEnvelope = vyDown <= (vyMax + 6.0);
+      if (tiltDeg > 6.0 && height > 60.0 && withinEnvelope) {
+        cost -= 0.5 * cfg.wTurnAssist * ((tiltDeg / 15.0).clamp(0.0, 1.0)) * dt;
       }
     }
 

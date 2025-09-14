@@ -26,30 +26,46 @@ class _Args {
       }
     }
   }
-  String? getStr(String k, {String? def}) => _kv[k] ?? def;
-  int getInt(String k, {int def = 0}) =>
-      int.tryParse(_kv[k] ?? '') ?? def;
-  double getDouble(String k, {double def = 0.0}) =>
-      double.tryParse(_kv[k] ?? '') ?? def;
-  bool getFlag(String k, {bool def = false}) =>
-      _flags.contains(k) ? true : def;
+  String? getStr(String k, {String? def}) => _kv[k] ?? (_flags.contains(k) ? 'true' : def);
+
+  int getInt(String k, {int def = 0}) {
+    final v = getStr(k);
+    return v == null ? def : (int.tryParse(v) ?? def);
+  }
+
+  double getDouble(String k, {double def = 0.0}) {
+    final v = getStr(k);
+    return v == null ? def : (double.tryParse(v) ?? def);
+  }
+
+  bool getBool(String k, {bool def = false}) {
+    if (_flags.contains(k)) return true;
+    final v = _kv[k];
+    if (v == null) return def;
+    final s = v.toLowerCase().trim();
+    return s == '1' || s == 'true' || s == 'yes' || s == 'y';
+  }
 }
 
 /* ------------------------------- policy IO (json) ------------------------------ */
 
 Map<String, dynamic> _weightsToJson(PolicyNetwork p) {
-  // FIX: return type is List<List<double>>
   List<List<double>> to3(List<List<double>> W) =>
       W.map((r) => r.map((v) => v.toDouble()).toList()).toList();
 
   return {
     'h1': p.h1,
     'h2': p.h2,
+    // Trunk
     'W1': to3(p.W1), 'b1': p.b1,
     'W2': to3(p.W2), 'b2': p.b2,
+    // Legacy action heads (optional)
     'W_thr': to3(p.W_thr), 'b_thr': p.b_thr,
     'W_turn': to3(p.W_turn), 'b_turn': p.b_turn,
+    // Planner heads
     'W_intent': to3(p.W_intent), 'b_intent': p.b_intent,
+    'W_thrplan': to3(p.W_thrplan), 'b_thrplan': p.b_thrplan,
+    // Critic
     'W_val': to3(p.W_val), 'b_val': p.b_val,
   };
 }
@@ -88,14 +104,12 @@ bool tryLoadPolicy(String path, PolicyNetwork p) {
   }
   final m = raw as Map<String, dynamic>;
 
-  // Helper: accept either a raw List<List<num>> OR an object with {data: List<List<num>>}
   List _mat(dynamic v) {
     if (v is List) return v;
     if (v is Map && v['data'] is List) return v['data'] as List;
     throw StateError('matrix field is not a List or {data: List}');
   }
 
-  // Helper: copy if present & shape-ish, otherwise skip
   bool _tryFillMat(List<List<double>> dst, String key) {
     final v = m[key];
     if (v == null) return false;
@@ -122,7 +136,7 @@ bool tryLoadPolicy(String path, PolicyNetwork p) {
   if (_tryFillMat(p.W2, 'W2')) ok++;
   if (_tryFillVec(p.b2, 'b2')) ok++;
 
-  // Action heads (optional in old files)
+  // Legacy action heads (optional)
   total += 2;
   if (_tryFillMat(p.W_thr, 'W_thr')) ok++;
   if (_tryFillVec(p.b_thr, 'b_thr')) ok++;
@@ -131,12 +145,16 @@ bool tryLoadPolicy(String path, PolicyNetwork p) {
   if (_tryFillMat(p.W_turn, 'W_turn')) ok++;
   if (_tryFillVec(p.b_turn, 'b_turn')) ok++;
 
-  // Intent head
+  // Planner heads
   total += 2;
   if (_tryFillMat(p.W_intent, 'W_intent')) ok++;
   if (_tryFillVec(p.b_intent, 'b_intent')) ok++;
 
-  // Value head
+  total += 2;
+  if (_tryFillMat(p.W_thrplan, 'W_thrplan')) ok++;
+  if (_tryFillVec(p.b_thrplan, 'b_thrplan')) ok++;
+
+  // Critic
   total += 2;
   if (_tryFillMat(p.W_val, 'W_val')) ok++;
   if (_tryFillVec(p.b_val, 'b_val')) ok++;
@@ -246,30 +264,29 @@ void main(List<String> argv) {
   final args = _Args(argv);
 
   final seed = args.getInt('seed', def: 7);
-  final pretrainN = args.getInt('pretrain_intent', def: 6000);
-  final pretrainEpochs = args.getInt('pretrain_epochs', def: 2);
-  final pretrainAlign = args.getDouble('pretrain_align', def: 2.0);
-  final pretrainLr = args.getDouble('pretrain_lr', def: 3e-4);
-  final onlyPretrain = args.getFlag('only_pretrain', def: false);
 
-  final iters = args.getInt('train_iters', def: 200);
+  // ---- RL / planner args (with aliases) ----
+  final iters = args.getInt('train_iters', def: args.getInt('iters', def: 200));
   final batch = args.getInt('batch', def: 32);
   final lr = args.getDouble('lr', def: 3e-4);
-  final valueBeta = args.getDouble('value_beta', def: 0.5);
+  final valueBeta = args.getDouble('value_beta', def: args.getDouble('valueBeta', def: 0.5));
   final huberDelta = args.getDouble('huber_delta', def: 1.0);
 
   final planHold = args.getInt('plan_hold', def: 1);
   final tempIntent = args.getDouble('intent_temp', def: 1.0);
-  final intentEntropy = args.getDouble('intent_entropy', def: 0.0);
-  final useLearned = args.getFlag('use_learned_controller', def: false);
+  final intentEntropy = args.getDouble('intent_entropy', def: args.getDouble('intentEntropyBeta', def: 0.0));
+  final useLearned = args.getBool('use_learned_controller', def: args.getBool('use_learned', def: false));
   final blendPolicy = args.getDouble('blend_policy', def: 1.0);
 
-  final lockTerrain = args.getFlag('lock_terrain', def: false);
-  final lockSpawn = args.getFlag('lock_spawn', def: false);
-  final randomSpawnX = !args.getFlag('fixed_spawn_x', def: false);
+  // Env args
+  final lockTerrain = args.getBool('lock_terrain', def: false);
+  final lockSpawn = args.getBool('lock_spawn', def: false);
+  final randomSpawnX = !args.getBool('fixed_spawn_x', def: false);
   final maxFuel = args.getDouble('max_fuel', def: 1000.0);
 
-  final determinism = args.getFlag('determinism_probe', def: true);
+  // Pretrain control (skipped by default since Trainer.pretrainIntentOnSnapshots may be absent)
+  final doPretrain = args.getBool('do_pretrain', def: false);
+  final determinism = args.getBool('determinism_probe', def: true);
 
   final cfg = makeConfig(
     seed: seed,
@@ -310,24 +327,12 @@ void main(List<String> argv) {
     blendPolicy: blendPolicy.clamp(0.0, 1.0),
   );
 
-  print('Pretraining intent on $pretrainN snapshots (epochs=$pretrainEpochs, align=$pretrainAlign, lr=$pretrainLr) ...');
-  final stats = trainer.pretrainIntentOnSnapshots(
-    samples: pretrainN,
-    epochs: pretrainEpochs,
-    alignWeight: pretrainAlign,
-    lr: pretrainLr,
-    seed: seed ^ 0xABCD1234,
-  );
-
-  final acc = (stats['acc'] ?? 0.0) * 100.0;
-  final n = (stats['n'] ?? 0.0).toInt();
-  print('Pretrain done → acc=${acc.toStringAsFixed(1)}% over n=$n samples');
-
-  savePolicy('policy_pretrained.json', policy);
-
-  if (onlyPretrain) {
-    print('Only-pretrain mode: saved → policy_pretrained.json. Exiting.');
-    return;
+  // ---------- Optional pretrain (off by default) ----------
+  if (doPretrain) {
+    print('Pretrain requested, but this build skips pretrain unless Trainer exposes it. Proceeding without pretrain.');
+    // If you bring back Trainer.pretrainIntentOnSnapshots, you can wire it here.
+    // final stats = trainer.pretrainIntentOnSnapshots(...);
+    // savePolicy('policy_pretrained.json', policy);
   }
 
   {
@@ -372,14 +377,12 @@ void main(List<String> argv) {
 
 /* ----------------------------------- usage ------------------------------------
 
-Pretrain only:
+Example (your command with aliases supported):
   dart run lib/ai/train_agent.dart \
-    --pretrain_intent=8000 --pretrain_epochs=2 --pretrain_align=2.0 \
-    --pretrain_lr=0.001 --only_pretrain
+    --batch=1 --iters=400 --lr=2e-4 \
+    --intentEntropyBeta=0.0002 --valueBeta=0.7 \
+    --use_learned_controller=true --blend_policy=0.5
 
-Full train:
-  dart run lib/ai/train_agent.dart \
-    --pretrain_intent=8000 --pretrain_epochs=2 --pretrain_align=2.0 --pretrain_lr=0.001 \
-    --plan_hold=1 --use_learned_controller --blend_policy=1.0 \
-    --train_iters=200 --batch=32 --lr=0.0003
+Optional pretrain (if you re-add it to Trainer):
+  dart run lib/ai/train_agent.dart --do_pretrain
 -------------------------------------------------------------------------------- */
