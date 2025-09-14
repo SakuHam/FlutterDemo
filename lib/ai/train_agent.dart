@@ -1,574 +1,339 @@
 // lib/ai/train_agent.dart
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
 
-import 'agent.dart'
-    show
-    FeatureExtractor,
-    PolicyNetwork,
-    Trainer,
-    relu,
-    reluVec,
-    sigmoid,
-    softmax;
-
-// Use eng for GameEngine (physics stepper)
 import '../engine/game_engine.dart' as eng;
-// Use et for types/configs (Tunables, EngineConfig, etc.)
 import '../engine/types.dart' as et;
 
-/* ----------------------- Tiny IO & math helpers ----------------------- */
+import 'agent.dart';
 
-Future<Map<String, dynamic>> _readJson(String path) async =>
-    json.decode(await File(path).readAsString()) as Map<String, dynamic>;
-
-Future<void> _writePrettyJson(String path, Map<String, dynamic> js) async {
-  final out = const JsonEncoder.withIndent('  ').convert(js);
-  await File(path).writeAsString(out);
-  stdout.writeln('Saved policy → $path');
-}
-
-List<List<double>> _mat(dynamic m) => (m as List)
-    .map<List<double>>(
-      (r) => (r as List).map<double>((x) => (x as num).toDouble()).toList(),
-)
-    .toList();
-
-List<double> _vec(dynamic v) =>
-    (v as List).map<double>((x) => (x as num).toDouble()).toList();
-
-/// Load a policy JSON into (possibly re-instantiated) PolicyNetwork.
-/// Returns (policy, groundSamples, stridePx).
-(PolicyNetwork policy, int gs, double stride) _loadPolicyInto(
-    PolicyNetwork policy,
-    Map<String, dynamic> js,
-    ) {
-  final inputSizeJ = js['inputSize'] as int? ?? policy.inputSize;
-  final h1J = js['h1'] as int? ?? policy.h1;
-  final h2J = js['h2'] as int? ?? policy.h2;
-
-  if (policy.inputSize != inputSizeJ || policy.h1 != h1J || policy.h2 != h2J) {
-    policy = PolicyNetwork(inputSize: inputSizeJ, h1: h1J, h2: h2J, seed: 1234);
+/// ------------------------ tiny flag/arg parser (no package:args) ------------------------
+class Flags {
+  final Map<String, String> _kv = {};
+  final Set<String> _bools = {};
+  Flags(List<String> args) {
+    for (final a in args) {
+      if (!a.startsWith('--')) continue;
+      final s = a.substring(2);
+      final eq = s.indexOf('=');
+      if (eq >= 0) {
+        _kv[s.substring(0, eq)] = s.substring(eq + 1);
+      } else {
+        _bools.add(s);
+      }
+    }
   }
+  String getS(String k, String d) => _kv.containsKey(k) ? _kv[k]! : d;
+  int getI(String k, int d) => int.tryParse(getS(k, d.toString())) ?? d;
+  double getD(String k, double d) => double.tryParse(getS(k, d.toString())) ?? d;
+  bool getB(String k, bool d) =>
+      _bools.contains(k) ? true : (getS(k, d ? 'true' : 'false') == 'true');
+}
 
-  // trunk
-  policy
-    ..W1 = _mat(js['W1'])
-    ..b1 = _vec(js['b1'])
-    ..W2 = _mat(js['W2'])
-    ..b2 = _vec(js['b2']);
+/// ----------------------------- JSON I/O helpers -----------------------------
+Map<String, dynamic> _matToJson(List<List<double>> M) => {
+  'rows': M.length,
+  'cols': M.isEmpty ? 0 : M[0].length,
+  'data': M.expand((r) => r).toList(),
+};
 
-  // heads (legacy)
-  if (js.containsKey('W_thr')) policy.W_thr = _mat(js['W_thr']);
-  if (js.containsKey('b_thr')) policy.b_thr = _vec(js['b_thr']);
-  if (js.containsKey('W_turn')) policy.W_turn = _mat(js['W_turn']);
-  if (js.containsKey('b_turn')) policy.b_turn = _vec(js['b_turn']);
-
-  // two-stage planner head
-  if (js.containsKey('W_intent')) policy.W_intent = _mat(js['W_intent']);
-  if (js.containsKey('b_intent')) policy.b_intent = _vec(js['b_intent']);
-
-  // critic
-  if (js.containsKey('W_val')) policy.W_val = _mat(js['W_val']);
-  if (js.containsKey('b_val')) policy.b_val = _vec(js['b_val']);
-
-  // At least one action head must exist
-  final hasAnyHead = (js.containsKey('W_thr') && js.containsKey('b_thr')) ||
-      (js.containsKey('W_intent') && js.containsKey('b_intent'));
-  if (!hasAnyHead) {
-    throw ArgumentError(
-      'Policy JSON has no action heads: expected either '
-          'single-stage (W_thr/W_turn) or two-stage (W_intent).',
-    );
+List<List<double>> _matFromJson(Map<String, dynamic> j) {
+  final rows = j['rows'] as int;
+  final cols = j['cols'] as int;
+  final flat =
+  (j['data'] as List).cast<num>().map((e) => e.toDouble()).toList();
+  final out = <List<double>>[];
+  for (int i = 0; i < rows; i++) {
+    out.add(List<double>.from(flat.sublist(i * cols, (i + 1) * cols)));
   }
-
-  final fe = (js['fe'] as Map<String, dynamic>?) ?? const {};
-  // Training FE = 10 + groundSamples (px,py,vx,vy,ang,fuel,padCenter,dxCenter,dGround,slope)
-  final gs = (fe['groundSamples'] as int?) ?? (inputSizeJ - 10);
-  final stride = (fe['stridePx'] as num?)?.toDouble() ?? 48.0;
-
-  return (policy, gs, stride);
+  return out;
 }
 
-Future<void> _savePolicy(
-    String path,
-    PolicyNetwork p,
-    int inputSize,
-    int gs,
-    double stride,
-    ) async {
-  final js = <String, dynamic>{
-    'inputSize': inputSize,
-    'h1': p.h1,
-    'h2': p.h2,
-    'W1': p.W1,
-    'b1': p.b1,
-    'W2': p.W2,
-    'b2': p.b2,
-    'W_thr': p.W_thr,
-    'b_thr': p.b_thr,
-    'W_turn': p.W_turn,
-    'b_turn': p.b_turn,
-    'W_intent': p.W_intent,
-    'b_intent': p.b_intent,
-    'W_val': p.W_val,
-    'b_val': p.b_val,
-    'fe': {'groundSamples': gs, 'stridePx': stride},
-  };
-  await _writePrettyJson(path, js);
+Map<String, dynamic> policyToJson(PolicyNetwork p) => {
+  'inputSize': p.inputSize,
+  'h1': p.h1,
+  'h2': p.h2,
+  'W1': _matToJson(p.W1),
+  'W2': _matToJson(p.W2),
+  'b1': p.b1,
+  'b2': p.b2,
+  'W_thr': _matToJson(p.W_thr),
+  'b_thr': p.b_thr,
+  'W_turn': _matToJson(p.W_turn),
+  'b_turn': p.b_turn,
+  'W_intent': _matToJson(p.W_intent),
+  'b_intent': p.b_intent,
+  'W_val': _matToJson(p.W_val),
+  'b_val': p.b_val,
+};
+
+void policyFromJson(PolicyNetwork p, Map<String, dynamic> j) {
+  p.W1 = _matFromJson(j['W1']);
+  p.b1 = (j['b1'] as List).cast<num>().map((e) => e.toDouble()).toList();
+  p.W2 = _matFromJson(j['W2']);
+  p.b2 = (j['b2'] as List).cast<num>().map((e) => e.toDouble()).toList();
+  p.W_thr = _matFromJson(j['W_thr']);
+  p.b_thr = (j['b_thr'] as List).cast<num>().map((e) => e.toDouble()).toList();
+  p.W_turn = _matFromJson(j['W_turn']);
+  p.b_turn =
+      (j['b_turn'] as List).cast<num>().map((e) => e.toDouble()).toList();
+  p.W_intent = _matFromJson(j['W_intent']);
+  p.b_intent =
+      (j['b_intent'] as List).cast<num>().map((e) => e.toDouble()).toList();
+  p.W_val = _matFromJson(j['W_val']);
+  p.b_val = (j['b_val'] as List).cast<num>().map((e) => e.toDouble()).toList();
 }
 
-/* ------------------------------ Main --------------------------------- */
+void savePolicy(PolicyNetwork p, String path) {
+  final j = policyToJson(p);
+  File(path)
+      .writeAsStringSync(const JsonEncoder.withIndent('  ').convert(j));
+  print('Saved policy → $path');
+}
 
+bool loadPolicyIfExists(PolicyNetwork p, String path) {
+  final f = File(path);
+  if (!f.existsSync()) return false;
+  final j = jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
+  policyFromJson(p, j);
+  print('Loaded policy from $path');
+  return true;
+}
+
+/// ----------------------------- Determinism probe -----------------------------
+class _ProbeStats {
+  final int steps;
+  final double cost;
+  _ProbeStats(this.steps, this.cost);
+}
+
+_ProbeStats _roll(eng.GameEngine env, {int maxSteps = 1000, int seed = 1}) {
+  env.reset(seed: seed);
+  double cost = 0.0;
+  int t = 0;
+  while (true) {
+    final info = env.step(
+        1 / 60.0, const et.ControlInput(thrust: false, left: false, right: false));
+    cost += info.costDelta;
+    if (info.terminal || t >= maxSteps) break;
+    t++;
+  }
+  return _ProbeStats(t, cost);
+}
+
+void determinismProbe(eng.GameEngine env) {
+  final a = _roll(env, maxSteps: 1000, seed: 42);
+  final b = _roll(env, maxSteps: 1000, seed: 42);
+  final ok =
+      (a.steps == b.steps) && ((a.cost - b.cost).abs() < 1e-6);
+  print(
+      'Determinism probe: steps ${a.steps} vs ${b.steps} | cost ${a.cost} vs ${b.cost} => ${ok ? "OK" : "MISMATCH"}');
+}
+
+/// ----------------------------------- Main ------------------------------------
 void main(List<String> args) async {
-  // ---------------- CLI ----------------
-  String? initPath;
-  int iters = 20000;
-  int saveEvery = 50;
-  int batch = 16; // episodes per outer iteration
-  double baseLr = 3e-4; // per-episode LR (before /batch below)
+  final f = Flags(args);
 
-  double tempThr = 0.9; // exploration (train-time, single-stage only)
-  double tempTurn = 1.2;
-  double epsilon = 0.05;
-  double entropyBeta = 0.003;
+  // IO
+  final initPath = f.getS('init_policy', '');
+  final savePath = f.getS('save', 'policy.json');
+  final savePretrainedPath =
+  f.getS('save_pretrained', 'policy_pretrained.json');
 
-  // Deterministic overfit/eval controls
-  bool overfit = false; // train & eval on a single fixed seed
-  bool noExplore = false; // zero exploration for training (optional)
-  int fixedSeed = 424242;
-  int evalSeeds = 5; // only used to scale realistic episodes here
-  bool logEvalEverySave = false;
+  // Feature extractor
+  final gs = f.getI('fe_gs', 3);
+  final stride = f.getD('fe_stride', 48.0);
 
-  // Pretrain toggles
-  int pretrainIntent = 0;
-  int pretrainEpochs = 1;
-  double pretrainLr = 1e-3;
-  double pretrainAlign = 1.0;
-  bool onlyPretrain = false;
+  // Net sizes
+  final h1 = f.getI('h1', 64);
+  final h2 = f.getI('h2', 64);
 
-  for (final a in args) {
-    if (a.startsWith('--init=')) initPath = a.substring(7).trim();
-    if (a.startsWith('--iters=')) iters = int.parse(a.substring(8));
-    if (a.startsWith('--save_every=')) saveEvery = int.parse(a.substring(13));
-    if (a.startsWith('--batch=')) batch = int.parse(a.substring(8));
-    if (a.startsWith('--lr=')) baseLr = double.parse(a.substring(5));
-    if (a.startsWith('--temp_thr=')) tempThr = double.parse(a.substring(11));
-    if (a.startsWith('--temp_turn=')) tempTurn = double.parse(a.substring(12));
-    if (a.startsWith('--eps=')) epsilon = double.parse(a.substring(6));
-    if (a.startsWith('--entropy=')) entropyBeta = double.parse(a.substring(10));
+  // Seeds
+  final seed = f.getI('seed', 7);
 
-    if (a == '--overfit=true') overfit = true;
-    if (a == '--no_explore=true') noExplore = true;
-    if (a.startsWith('--fixed_seed=')) fixedSeed = int.parse(a.substring(13));
-    if (a.startsWith('--eval_seeds=')) evalSeeds = int.parse(a.substring(13));
-    if (a == '--log_eval_on_save=true') logEvalEverySave = true;
+  // World & tunables (match your EngineConfig ctor)
+  final worldW = f.getD('world_w', 800.0);
+  final worldH = f.getD('world_h', 480.0);
+  final maxFuel = f.getD('max_fuel', 1000.0);
+  final gravity = f.getD('gravity', 0.18);
+  final thrustAccel = f.getD('thrust_accel', 0.42);
+  final rotSpeed = f.getD('rot_speed', 1.6);
 
-    // pretrain flags
-    if (a.startsWith('--pretrain_intent=')) {
-      pretrainIntent = int.parse(a.substring('--pretrain_intent='.length));
-    }
-    if (a.startsWith('--pretrain_epochs=')) {
-      pretrainEpochs = int.parse(a.substring('--pretrain_epochs='.length));
-    }
-    if (a.startsWith('--pretrain_lr=')) {
-      pretrainLr = double.parse(a.substring('--pretrain_lr='.length));
-    }
-    if (a.startsWith('--pretrain_align=')) {
-      pretrainAlign = double.parse(a.substring('--pretrain_align='.length));
-    }
-    if (a == '--only_pretrain=true') onlyPretrain = true;
-  }
+  // Training loop
+  final episodes = f.getI('episodes', 400);
+  final greedyEval = f.getB('greedy_eval', false);
+  final scoreIsReward = f.getB('score_is_reward', false);
 
-  // --------------- Engine config (Flutter-free) ---------------
-  final uiLinearScale = 3.0; // matches UI: 0.05 * 60
-  final uiRotScale = 0.5; // UI halves rotation rate
+  // Single-stage exploration (if two_stage=false)
+  final singleTempThr = f.getD('temp_thr', 1.0);
+  final singleTempTurn = f.getD('temp_turn', 1.0);
+  final singleEps = f.getD('epsilon', 0.0);
+  final singleEntropy = f.getD('entropy_beta', 0.0);
+
+  // Two-stage planner
+  final twoStage = f.getB('two_stage', true);
+  final planHold = f.getI('plan_hold', 1);
+  final tempIntent = f.getD('temp_intent', 1.0);
+  final intentEntropyBeta = f.getD('intent_entropy_beta', 0.0);
+  final valueBeta = f.getD('value_beta', 0.5);
+  final huberDelta = f.getD('huber_delta', 1.0);
+  final lr = f.getD('lr', 3e-4);
+
+  // Learned controller
+  final useLearnedController = f.getB('use_learned_controller', false);
+  final blendPolicy = f.getD('blend_policy', 1.0);
+
+  // Pretrain intent
+  final preN = f.getI('pretrain_intent', 0);
+  final preEpochs = f.getI('pretrain_epochs', 2);
+  final preAlign = f.getD('pretrain_align', 2.0);
+  final preLr = f.getD('pretrain_lr', 3e-4);
+  final onlyPretrain = f.getB('only_pretrain', false);
+
+  // Optional safety knob echo (agent has fixed 50.0 margin for now)
+  final brakeMargin = f.getD('brake_margin', 50.0);
+  print('Note: brake_margin=$brakeMargin (agent.dart currently hardcodes its margin).');
+
+  // --- Build EngineConfig & env (your ctor requires worldW, worldH, t)
+  final tun = et.Tunables(
+    gravity: gravity,
+    thrustAccel: thrustAccel,
+    rotSpeed: rotSpeed,
+    maxFuel: maxFuel,
+  );
 
   final cfg = et.EngineConfig(
-    t: et.Tunables(
-      gravity: 0.18 * uiLinearScale, // 0.54
-      thrustAccel: 0.42 * uiLinearScale, // 1.26
-      rotSpeed: 1.6 * uiRotScale, // 0.8
-      maxFuel: 1000.0,
-    ),
-    worldW: 360,
-    worldH: 640,
-
-    // Keep walls/pad behavior consistent with the phone
-    hardWalls: true,
-
-    // Deterministic terrain/spawn when locked:
-    lockTerrain: true,
-    terrainSeed: 12345,
-    lockSpawn: true,
-    randomSpawnX: false,
-    spawnXMin: 0.20,
-    spawnXMax: 0.80,
-
-    landingSpeedMax: 12.0,
-    landingAngleMaxRad: 8 * math.pi / 180.0,
-    wDx: 200.0,
-    wDy: 180.0,
-    wVx: 90.0,
-    wVyDown: 200.0,
-    wAngleDeg: 80.0,
-    // stepScale: 60.0, // default
+    worldW: worldW,
+    worldH: worldH,
+    t: tun,
+    seed: seed,
+    // The rest use your EngineConfig defaults. Override here if desired:
+    // lockTerrain: true, terrainSeed: 12345, randomSpawnX: true, etc.
   );
 
   final env = eng.GameEngine(cfg);
 
-  // -------- Feature Extractor defaults --------
-  int feGS = 3;
-  double feStride = 48.0;
+  final fe = FeatureExtractor(groundSamples: gs, stridePx: stride);
+  final policy =
+  PolicyNetwork(inputSize: fe.inputSize, h1: h1, h2: h2, seed: seed);
 
-  // --------------- Policy ---------------
-  var policy = PolicyNetwork(
-    inputSize: FeatureExtractor(groundSamples: feGS, stridePx: feStride).inputSize,
-    h1: 64,
-    h2: 64,
-    seed: 1234,
-  );
-
-  // Bias throttle slightly off at the start (legacy head)
-  policy.b_thr[0] = -0.2;
-
-  // --------------- Load init (BC or previous) ---------------
-  Map<String, dynamic>? initJs;
-  if (initPath != null && await File(initPath!).exists()) {
-    initJs = await _readJson(initPath!);
+  // Load initial policy if provided
+  if (initPath.isNotEmpty && File(initPath).existsSync()) {
+    loadPolicyIfExists(policy, initPath);
   } else {
-    if (await File('policy_bc_init.json').exists()) {
-      initJs = await _readJson('policy_bc_init.json');
-    } else if (await File('policy.json').exists()) {
-      initJs = await _readJson('policy.json');
-    }
+    print('Loaded init policy. h1=$h1 h2=$h2 | FE(gs=$gs stride=$stride)');
   }
 
-  if (initJs != null) {
-    final loaded = _loadPolicyInto(policy, initJs);
-    policy = loaded.$1;
-    feGS = loaded.$2;
-    feStride = loaded.$3;
-    stdout.writeln(
-      'Loaded init policy. h1=${policy.h1} h2=${policy.h2} | FE(gs=$feGS stride=$feStride)',
-    );
-  } else {
-    stdout.writeln('No init policy found; training from scratch.');
-  }
+  // Determinism check
+  determinismProbe(env);
 
-  // -------- Strict FE–policy size validation --------
-  final feCheck = FeatureExtractor(groundSamples: feGS, stridePx: feStride);
-  if (feCheck.inputSize != policy.inputSize) {
-    stderr.writeln(
-      'ERROR: FeatureExtractor.inputSize=${feCheck.inputSize} '
-          '!= policy.inputSize=${policy.inputSize}. '
-          'Fix your JSON/FE config to match exactly.',
-    );
-    exit(1);
-  }
-
-  // --------------- Trainers ---------------
-  final rnd = math.Random(7);
-
-  // Train-time exploration (optionally disabled)
-  final double trainEps = noExplore ? 0.0 : epsilon;
-  final double trainTempThr = noExplore ? 0.2 : tempThr; // (legacy head)
-  final double trainTempTurn = noExplore ? 0.7 : tempTurn;
-  final double trainEntropy = noExplore ? 0.01 : entropyBeta;
-
+  // --- Trainer
   final trainer = Trainer(
     env: env,
-    fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
+    fe: fe,
     policy: policy,
     dt: 1 / 60.0,
     gamma: 0.99,
-    seed: 13,
-    // single-stage exploration (unused when twoStage=true)
-    tempThr: trainTempThr,
-    tempTurn: trainTempTurn,
-    epsilon: trainEps,
-    entropyBeta: trainEntropy,
-    // two-stage on:
-    twoStage: true,
-    planHold: 1, // re-plan intent every 12 frames (~0.2s @ 60Hz)
-    tempIntent: 0.8, // softer sampling for planner
-    intentEntropyBeta: 0.01, // small entropy on intents
+    seed: seed,
+    // single-stage
+    tempThr: singleTempThr,
+    tempTurn: singleTempTurn,
+    epsilon: singleEps,
+    entropyBeta: singleEntropy,
+    // two-stage
+    twoStage: twoStage,
+    planHold: planHold,
+    tempIntent: tempIntent,
+    intentEntropyBeta: intentEntropyBeta,
+    // learned controller
+    useLearnedController: useLearnedController,
+    blendPolicy: blendPolicy,
   );
 
-  // Deterministic evaluation trainer (no exploration) — used for rollouts only
-  final evalTrainer = Trainer(
-    env: env,
-    fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
-    policy: policy,
-    dt: 1 / 60.0,
-    gamma: 0.99,
-    seed: 13,
-    tempThr: 1e-6,
-    tempTurn: 1e-6,
-    epsilon: 0.0,
-    entropyBeta: 0.0,
-    twoStage: true, // keep the same architecture
-    planHold: 1,
-    tempIntent: 1e-6, // greedy planner
-    intentEntropyBeta: 0.0,
-  );
-
-  // Quick determinism probe (greedy rollout twice with same seed)
-      {
-    final s = fixedSeed;
-    env.reset(seed: s);
-    final ep1 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
-    env.reset(seed: s);
-    final ep2 = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
-    final same = (ep1.steps == ep2.steps) &&
-        ((ep1.totalCost - ep2.totalCost).abs() < 1e-9);
-    stdout.writeln(
-        'Determinism probe: steps ${ep1.steps} vs ${ep2.steps} | '
-            'cost ${ep1.totalCost.toStringAsFixed(6)} vs ${ep2.totalCost.toStringAsFixed(6)} '
-            '=> ${same ? "OK" : "NONDETERMINISTIC!"}');
-  }
-
-  int nextEpisodeSeed() {
-    if (overfit) return fixedSeed;
-    return rnd.nextInt(1 << 30);
-  }
-
-  /* ========================== OPTIONAL PRETRAIN ========================== */
-
-  if (pretrainIntent > 0) {
-    stdout.writeln(
-        'Pretraining intent on $pretrainIntent snapshots (epochs=$pretrainEpochs, align=$pretrainAlign, lr=$pretrainLr) ...');
-
-    // NOTE: this calls your function implemented INSIDE Trainer (agent.dart).
-    // Make sure your Trainer has: Map<String,double> pretrainIntentOnSnapshots({...})
+  // --- Pretrain intent head (optional)
+  if (preN > 0) {
+    print(
+        'Pretraining intent on $preN snapshots (epochs=$preEpochs, align=$preAlign, lr=$preLr) ...');
     final stats = trainer.pretrainIntentOnSnapshots(
-      samples: pretrainIntent,
-      epochs: pretrainEpochs,
-      lr: pretrainLr,
-      alignWeight: pretrainAlign,
-      seed: fixedSeed,
+      samples: preN,
+      epochs: preEpochs,
+      lr: preLr,
+      alignWeight: preAlign,
+      seed: seed ^ 0xA5A5A5A5,
     );
-
-    final acc = (stats['acc'] ?? 0.0) * 100.0;
-    final n = (stats['n'] ?? 0.0).toInt();
-    stdout.writeln(
-        'Pretrain done → acc=${acc.toStringAsFixed(1)}% over n=$n samples');
-
-    await _savePolicy(
-        'policy_pretrained.json', policy, trainer.fe.inputSize, feGS, feStride);
+    final accPct = (stats['acc'] ?? 0.0) * 100.0;
+    print(
+        'Pretrain eval → acc=${accPct.toStringAsFixed(1)}% over n=${stats['n']?.toInt()} samples');
+    savePolicy(policy, savePretrainedPath);
 
     if (onlyPretrain) {
-      stdout.writeln(
-          'Only-pretrain mode: saved → policy_pretrained.json. Exiting.');
+      print('Only-pretrain mode: saved → $savePretrainedPath. Exiting.');
       return;
     }
   }
 
-  /* ============================ RL TRAINING ============================= */
+  // --- Main training loop
+  double bestScore = double.infinity;
+  String bestPath = savePath;
 
-  // Best realistic evaluation so far
-  var bestStats = (
-  meanCost: double.infinity,
-  medianCost: double.infinity,
-  landPct: 0.0,
-  crashPct: 100.0,
-  meanSteps: double.infinity,
-  meanDxAbs: double.infinity
-  );
+  for (int ep = 0; ep < episodes; ep++) {
+    env.reset(seed: seed + ep * 1337);
 
-  /// Realistic evaluation across randomized scenarios (stable seed set)
-  Future<({
-  double meanCost,
-  double medianCost,
-  double landPct,
-  double crashPct,
-  double meanSteps,
-  double meanDxAbs
-  })> evalRealistic({int episodes = 32}) async {
-    final seeds = List<int>.generate(episodes, (i) => 1_000_000 + i);
-
-    final costs = <double>[];
-    final steps = <int>[];
-    int landed = 0;
-    int crashed = 0;
-    double sumDxAbs = 0.0;
-
-    for (final s in seeds) {
-      // Fresh env per eval episode
-      final evalEnv = eng.GameEngine(cfg);
-      final evalTrainer = Trainer(
-        env: evalEnv,
-        fe: FeatureExtractor(groundSamples: feGS, stridePx: feStride),
-        policy: policy,
-        dt: 1 / 60.0,
-        gamma: 0.99,
-        seed: 13,
-        tempThr: 1e-6,
-        tempTurn: 1e-6,
-        epsilon: 0.0,
-        entropyBeta: 0.0,
-        twoStage: true,
-        planHold: 1,
-        tempIntent: 1e-6,
-        intentEntropyBeta: 0.0,
-      );
-
-      evalEnv.reset(seed: s);
-      final ep = evalTrainer.runEpisode(train: false, lr: 0.0, greedy: true);
-
-      final padCx = evalEnv.terrain.padCenter;
-      final dxAbs = (evalEnv.lander.pos.x - padCx).abs();
-      sumDxAbs += dxAbs;
-
-      costs.add(ep.totalCost);
-      steps.add(ep.steps);
-
-      if (ep.landed) landed++;
-      if (!ep.landed && evalEnv.status == et.GameStatus.crashed) crashed++;
-    }
-
-    double mean(List<double> a) =>
-        a.isEmpty ? 0.0 : a.reduce((x, y) => x + y) / a.length;
-    double _median(List<double> xs) {
-      if (xs.isEmpty) return 0.0;
-      final a = List<double>.from(xs)..sort();
-      final n = a.length;
-      return n.isOdd ? a[n ~/ 2] : 0.5 * (a[n ~/ 2 - 1] + a[n ~/ 2]);
-    }
-
-    return (
-    meanCost: mean(costs),
-    medianCost: _median(costs),
-    landPct: seeds.isEmpty ? 0.0 : (100.0 * landed / seeds.length),
-    crashPct: seeds.isEmpty ? 0.0 : (100.0 * crashed / seeds.length),
-    meanSteps:
-    steps.isEmpty ? 0.0 : steps.reduce((a, b) => a + b) / steps.length,
-    meanDxAbs: seeds.isEmpty ? 0.0 : (sumDxAbs / seeds.length),
+    final res = trainer.runEpisode(
+      train: true,
+      lr: lr,
+      greedy: false,
+      scoreIsReward: scoreIsReward,
+      valueBeta: valueBeta,
+      huberDelta: huberDelta,
     );
-  }
 
-  int landedTotal = 0;
-  final landWindow = <bool>[];
-  const landWindowSize = 200;
+    final landed = res.landed ? '✓' : '×';
+    final cost = res.totalCost.toStringAsFixed(3);
 
-  for (int it = 1; it <= iters; it++) {
-    // Per-episode LR: split across episodes in batch
-    final epLr = baseLr / batch;
-
-    double lastCost = 0.0;
-    int lastSteps = 0;
-    bool lastLanded = false;
-    int lastTurnSteps = 0;
-    int lastThrustSteps = 0;
-
-    for (int k = 0; k < batch; k++) {
-      env.reset(seed: nextEpisodeSeed());
-      final ep = trainer.runEpisode(
-        train: true,
-        lr: epLr,
-        greedy: false, // IMPORTANT: always sample during training
-      );
-
-      lastCost = ep.totalCost;
-      lastSteps = ep.steps;
-      lastLanded = ep.landed;
-      lastTurnSteps = ep.turnSteps;
-      lastThrustSteps = ep.thrustSteps;
-
-      if (ep.landed) landedTotal++;
-      landWindow.add(ep.landed);
-      if (landWindow.length > landWindowSize) landWindow.removeAt(0);
+    if (twoStage) {
+      final switches = res.intentSwitches;
+      final countsStr = res.intentCounts.isEmpty
+          ? ''
+          : ' | intents=' +
+          List.generate(
+              PolicyNetwork.kIntents, (i) => res.intentCounts[i])
+              .join(',');
+      print(
+          'EP ${ep.toString().padLeft(4)} | steps=${res.steps.toString().padLeft(4)} | cost=$cost | landed=$landed | switches=$switches$countsStr');
+    } else {
+      print(
+          'EP ${ep.toString().padLeft(4)} | steps=${res.steps.toString().padLeft(4)} | cost=$cost | landed=$landed '
+              '| turn=${res.turnSteps} L=${res.leftSteps} R=${res.rightSteps} thr=${res.thrustSteps} p_thr=${res.avgThrProb.toStringAsFixed(2)}');
     }
 
-    if (it % 5 == 0) {
-      final landRate = landWindow.isEmpty
-          ? 0.0
-          : (landWindow.where((x) => x).length / landWindow.length * 100.0);
-
-      final turnPct = lastSteps == 0 ? 0.0 : 100.0 * (lastTurnSteps / lastSteps);
-      final thrustPct =
-      lastSteps == 0 ? 0.0 : 100.0 * (lastThrustSteps / lastSteps);
-
-      stdout.writeln(
-        'Iter $it | batch=$batch | last-ep steps: $lastSteps | '
-            'cost: ${lastCost.toStringAsFixed(3)} | '
-            'landed: ${lastLanded ? 'Y' : 'N'} | '
-            'turn%: ${turnPct.toStringAsFixed(1)} | '
-            'thrust%: ${thrustPct.toStringAsFixed(1)} | '
-            'land%($landWindowSize)=${landRate.toStringAsFixed(1)}',
-      );
-
-      // Realistic evaluation (episodes scaled from evalSeeds)
-      final ev = await evalRealistic(episodes: math.max(16, evalSeeds * 6));
-      stdout.writeln(
-        'Eval(real) → '
-            'meanCost=${ev.meanCost.toStringAsFixed(3)} | '
-            'median=${ev.medianCost.toStringAsFixed(3)} | '
-            'land%=${ev.landPct.toStringAsFixed(1)} | '
-            'crash%=${ev.crashPct.toStringAsFixed(1)} | '
-            'steps=${ev.meanSteps.toStringAsFixed(1)} | '
-            'mean|dx|=${ev.meanDxAbs.toStringAsFixed(1)}',
-      );
-
-      // Selection rule:
-      // 1) strictly lower meanCost
-      // 2) tie (±tol) → higher land%
-      // 3) still tie → lower medianCost
-      // 4) still tie → lower mean|dx| at end
-      const tol = 1e-6;
-
-      bool better = false;
-      if (ev.meanCost + tol < bestStats.meanCost) {
-        better = true;
-      } else if ((ev.meanCost - bestStats.meanCost).abs() <= tol) {
-        if (ev.landPct > bestStats.landPct + tol) {
-          better = true;
-        } else if ((ev.landPct - bestStats.landPct).abs() <= tol) {
-          if (ev.medianCost + tol < bestStats.medianCost) {
-            better = true;
-          } else if ((ev.medianCost - bestStats.medianCost).abs() <= tol) {
-            if (ev.meanDxAbs + tol < bestStats.meanDxAbs) {
-              better = true;
-            }
-          }
-        }
-      }
-
-      if (better) {
-        bestStats = ev;
-        await _savePolicy(
-            'policy_best_eval.json', policy, trainer.fe.inputSize, feGS, feStride);
-        stdout.writeln('↑ New best (realistic) — saved policy_best_eval.json');
-      }
+    if (res.totalCost < bestScore) {
+      bestScore = res.totalCost;
+      bestPath = savePath;
+      savePolicy(policy, bestPath);
     }
 
-    if (it % saveEvery == 0) {
-      await _savePolicy('policy.json', policy, trainer.fe.inputSize, feGS, feStride);
-      if (logEvalEverySave) {
-        final ev = await evalRealistic(episodes: math.max(16, evalSeeds * 6));
-        stdout.writeln(
-          '[On Save] Eval(real) → '
-              'meanCost=${ev.meanCost.toStringAsFixed(3)} | '
-              'median=${ev.medianCost.toStringAsFixed(3)} | '
-              'land%=${ev.landPct.toStringAsFixed(1)} | '
-              'crash%=${ev.crashPct.toStringAsFixed(1)} | '
-              'steps=${ev.meanSteps.toStringAsFixed(1)} | '
-              'mean|dx|=${ev.meanDxAbs.toStringAsFixed(1)}',
-        );
-      }
+    if (ep % 50 == 0 && ep > 0) {
+      final cp = savePath.replaceFirst('.json', '_ep$ep.json');
+      savePolicy(policy, cp);
+    }
+
+    if (greedyEval && (ep % 20 == 0)) {
+      env.reset(seed: seed + 777 + ep);
+      final evalRes = trainer.runEpisode(
+        train: false,
+        lr: lr,
+        greedy: true,
+        scoreIsReward: scoreIsReward,
+        valueBeta: valueBeta,
+        huberDelta: huberDelta,
+      );
+      final eCost = evalRes.totalCost.toStringAsFixed(3);
+      final eLanded = evalRes.landed ? '✓' : '×';
+      print('  [GreedyEval] steps=${evalRes.steps} cost=$eCost landed=$eLanded');
     }
   }
 
-  // Final save + realistic eval
-  await _savePolicy('policy.json', policy, trainer.fe.inputSize, feGS, feStride);
-  final ev = await evalRealistic(episodes: math.max(32, evalSeeds * 6));
-  stdout.writeln(
-    'Done. Best(real) meanCost=${bestStats.meanCost.toStringAsFixed(3)} '
-        'land%=${bestStats.landPct.toStringAsFixed(1)} | '
-        'FinalEval(real) meanCost=${ev.meanCost.toStringAsFixed(3)} '
-        'median=${ev.medianCost.toStringAsFixed(3)} '
-        'land%=${ev.landPct.toStringAsFixed(1)} crash%=${ev.crashPct.toStringAsFixed(1)} '
-        'steps=${ev.meanSteps.toStringAsFixed(1)} mean|dx|=${ev.meanDxAbs.toStringAsFixed(1)}',
-  );
+  print(
+      'Training complete. Best cost=${bestScore.toStringAsFixed(3)} → saved $bestPath');
 }
