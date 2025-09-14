@@ -69,7 +69,7 @@ void _from3(List<List<double>> dst, List src) {
   }
 }
 
-bool tryLoadPolicyStrict(String path, PolicyNetwork p) {
+bool tryLoadPolicy(String path, PolicyNetwork p) {
   final f = File(path);
   if (!f.existsSync()) return false;
 
@@ -80,17 +80,20 @@ bool tryLoadPolicyStrict(String path, PolicyNetwork p) {
     print('Failed to parse $path: $e');
     return false;
   }
+
   if (raw is! Map<String, dynamic>) {
     print('Unexpected JSON root in $path (expected object). Skipping load.');
     return false;
   }
   final m = raw as Map<String, dynamic>;
 
+  // Helper: accept either a raw List<List<num>> OR an object with {data: List<List<num>>}
   List _mat(dynamic v) {
     if (v is List) return v;
     if (v is Map && v['data'] is List) return v['data'] as List;
     throw StateError('matrix field is not a List or {data: List}');
   }
+
   bool _tryFillMat(List<List<double>> dst, String key) {
     final v = m[key];
     if (v == null) return false;
@@ -109,6 +112,7 @@ bool tryLoadPolicyStrict(String path, PolicyNetwork p) {
 
   int ok = 0, total = 0;
 
+  // Trunk
   total += 2;
   if (_tryFillMat(p.W1, 'W1')) ok++;
   if (_tryFillVec(p.b1, 'b1')) ok++;
@@ -116,6 +120,7 @@ bool tryLoadPolicyStrict(String path, PolicyNetwork p) {
   if (_tryFillMat(p.W2, 'W2')) ok++;
   if (_tryFillVec(p.b2, 'b2')) ok++;
 
+  // Action heads (optional in old files)
   total += 2;
   if (_tryFillMat(p.W_thr, 'W_thr')) ok++;
   if (_tryFillVec(p.b_thr, 'b_thr')) ok++;
@@ -124,17 +129,19 @@ bool tryLoadPolicyStrict(String path, PolicyNetwork p) {
   if (_tryFillMat(p.W_turn, 'W_turn')) ok++;
   if (_tryFillVec(p.b_turn, 'b_turn')) ok++;
 
+  // Intent head
   total += 2;
   if (_tryFillMat(p.W_intent, 'W_intent')) ok++;
   if (_tryFillVec(p.b_intent, 'b_intent')) ok++;
 
+  // Value head
   total += 2;
   if (_tryFillMat(p.W_val, 'W_val')) ok++;
   if (_tryFillVec(p.b_val, 'b_val')) ok++;
 
-  final strict = (ok == total);
-  print('Loaded policy ← $path ($ok/$total tensors filled)  ${strict ? "OK" : "(PARTIAL — IGNORING)"}');
-  return strict;
+  final part = (ok == total) ? '' : '  (PARTIAL — IGNORING)';
+  print('Loaded policy ← $path ($ok/$total tensors filled)$part');
+  return ok > 0;
 }
 
 /* --------------------------------- env config --------------------------------- */
@@ -232,199 +239,34 @@ EvalStats evaluate({
   return st;
 }
 
-/* ---------------------------- local pretrain routine --------------------------- */
-
-/// Simple supervised pretrain on synthetic snapshots with predictive labels.
-/// Returns accuracy over a fresh probe set.
-Map<String, double> pretrainIntentOnSnapshots({
-  required eng.GameEngine env,
-  required FeatureExtractor fe,
-  required PolicyNetwork policy,
-  int samples = 6000,
-  int epochs = 2,
-  double lr = 3e-4,
-  double alignWeight = 2.0,
-  int seed = 1337,
-}) {
-  final rng = math.Random(seed);
-
-  // Lock terrain for stable labels
-  env.reset(seed: 123456);
-  fe.reset();
-
-  // Helpers to set a synthetic state
-  void _setState({
-    required double x,
-    required double height,
-    required double vx,
-    required double vy,
-  }) {
-    final gy = env.terrain.heightAt(x);
-    final y = (gy - height).clamp(0.0, env.cfg.worldH - 10.0);
-    env.lander.pos.x = x.clamp(10.0, env.cfg.worldW - 10.0);
-    env.lander.pos.y = y;
-    env.lander.vel.x = vx;
-    env.lander.vel.y = vy;
-    env.lander.angle = 0.0;
-    env.lander.fuel  = env.cfg.t.maxFuel;
-    // reset FE velocity history so accel feature doesn't spike due to teleports
-    fe.reset();
-  }
-
-  // Synthesize examples for each intent
-  void _synthForIntent(Intent it) {
-    final padCx = env.terrain.padCenter.toDouble();
-    final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
-        .clamp(12.0, env.cfg.worldW.toDouble());
-
-    double x=padCx, h=200, vx=0, vy=20;
-    switch (it) {
-      case Intent.goLeft:
-        x  = padCx + (0.90 + 0.08 * rng.nextDouble()) * padHalfW;
-        h  = 160.0 + 120.0 * rng.nextDouble();
-        vx = 60.0 + 40.0 * rng.nextDouble();
-        vy = 30.0 + 40.0 * rng.nextDouble();
-        break;
-      case Intent.goRight:
-        x  = padCx - (0.90 + 0.08 * rng.nextDouble()) * padHalfW;
-        h  = 160.0 + 120.0 * rng.nextDouble();
-        vx = -(60.0 + 40.0 * rng.nextDouble());
-        vy = 30.0 + 40.0 * rng.nextDouble();
-        break;
-      case Intent.descendSlow:
-        x  = padCx + (rng.nextDouble()*0.06 - 0.03) * padHalfW;
-        h  = 0.65 * env.cfg.worldH + 0.15 * env.cfg.worldH * rng.nextDouble();
-        vx = (rng.nextDouble()*30.0) - 15.0;
-        vy = 28.0 + 12.0 * rng.nextDouble();
-        break;
-      case Intent.brakeUp:
-        x  = padCx + (rng.nextDouble()*0.06 - 0.03) * padHalfW;
-        h  = 40.0 + 40.0 * rng.nextDouble();
-        vx = (rng.nextDouble()*18.0) - 9.0;
-        vy = 140.0 + 30.0 * rng.nextDouble();
-        break;
-      case Intent.hoverCenter:
-        x  = padCx + (rng.nextDouble()*0.04 - 0.02) * padHalfW;
-        h  = 0.22 * env.cfg.worldH + 0.02 * env.cfg.worldH * rng.nextDouble();
-        vx = (rng.nextDouble()*14.0) - 7.0;
-        vy = 4.0 + 6.0 * rng.nextDouble();
-        break;
-    }
-
-    _setState(x: x, height: h, vx: vx, vy: vy);
-  }
-
-  int _labelNow() => predictiveIntentLabelAdaptive(
-    env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35,
-  );
-
-  // Mini-batch buffers
-  const int B = 32;
-  final decisionCaches = [];
-  final decisionRewards = <double>[]; // zeros during pretrain; we use align loss
-  final intentChoices  = <int>[];
-  final alignLabels    = <int>[];
-
-  void _accOne(dynamic cache, int yIdx) {
-    decisionCaches.add(cache);
-    intentChoices.add(yIdx);
-    alignLabels.add(yIdx);
-    decisionRewards.add(0.0); // no RL signal in pretrain
-  }
-
-  void _flush() {
-    if (decisionCaches.isEmpty) return;
-    policy.updateFromEpisode(
-      decisionCaches: decisionCaches as dynamic,
-      intentChoices: intentChoices,
-      decisionRewards: decisionRewards,
-      gamma: 0.99,                // unused because rewards are zeros
-      gaeLambda: 0.95,
-      bootstrap: false,
-      alignLabels: alignLabels,
-      alignWeight: alignWeight,   // supervised CE on intent head
-      lr: lr,
-      entropyBeta: 0.0,
-      valueBeta: 0.0,             // no critic in pretrain
-      huberDelta: 1.0,
-    );
-    decisionCaches.clear();
-    decisionRewards.clear();
-    intentChoices.clear();
-    alignLabels.clear();
-  }
-
-  // small held-out probe
-  double _probeAcc(int N) {
-    int ok=0;
-    for (int i=0;i<N;i++) {
-      final it = Intent.values[rng.nextInt(Intent.values.length)];
-      _synthForIntent(it);
-      final y = _labelNow();
-      final pred = policy.actIntentGreedy(fe.extract(env)).$1;
-      if (pred == y) ok++;
-    }
-    return N == 0 ? 0.0 : ok / N;
-  }
-
-  // Training
-  final intents = Intent.values;
-  final perClass = (samples / intents.length).ceil();
-
-  for (int e = 0; e < epochs; e++) {
-    final baseOrder = intents.toList()..shuffle(rng);
-
-    for (int i = 0; i < perClass; i++) {
-      final order = baseOrder.toList()..shuffle(rng);
-      for (final it in order) {
-        _synthForIntent(it);
-        final x = fe.extract(env);
-        final yIdx = _labelNow();
-        final res = policy.actIntentGreedy(x);
-        _accOne(res.$3, yIdx);
-
-        if (decisionCaches.length >= B) _flush();
-      }
-    }
-    _flush();
-    final acc = _probeAcc(400);
-    print('pretrain epoch ${e+1}/$epochs  probe acc=${(acc*100).toStringAsFixed(1)}%');
-  }
-
-  final acc = _probeAcc(1200);
-  return {'acc': acc, 'n': 1200.0};
-}
-
 /* ------------------------------------ main ------------------------------------ */
 
 void main(List<String> argv) {
   final args = _Args(argv);
 
-  // General / training knobs
   final seed = args.getInt('seed', def: 7);
-
-  // Pretrain knobs (+ aliases)
   final pretrainN = args.getInt('pretrain_intent', def: 6000);
   final pretrainEpochs = args.getInt('pretrain_epochs', def: 2);
   final pretrainAlign = args.getDouble('pretrain_align', def: 2.0);
   final pretrainLr = args.getDouble('pretrain_lr', def: 3e-4);
-  final onlyPretrain = args.getFlag('only_pretrain', def: args.getFlag('only_pretrain=true', def: false));
+  final onlyPretrain = args.getFlag('only_pretrain', def: false);
 
-  // RL knobs (+ aliases for your previous runs)
-  final iters = args.getInt('train_iters', def: args.getInt('iters', def: 200));
+  final iters = args.getInt('train_iters', def: 200);
   final batch = args.getInt('batch', def: 32);
   final lr = args.getDouble('lr', def: 3e-4);
-  final valueBeta = args.getDouble('value_beta', def: args.getDouble('valueBeta', def: 0.5));
+  final valueBeta = args.getDouble('value_beta', def: 0.5);
   final huberDelta = args.getDouble('huber_delta', def: 1.0);
 
   final planHold = args.getInt('plan_hold', def: 1);
   final tempIntent = args.getDouble('intent_temp', def: 1.0);
-  final intentEntropy =
-  args.getDouble('intent_entropy', def: args.getDouble('intentEntropyBeta', def: 0.0));
-  final useLearned = args.getFlag('use_learned_controller', def: args.getFlag('use_learned_controller=true', def: false));
+  final intentEntropy = args.getDouble('intent_entropy', def: 0.0);
+  final useLearned = args.getFlag('use_learned_controller', def: false);
   final blendPolicy = args.getDouble('blend_policy', def: 1.0);
 
-  // Env toggles
+  // New knobs to steer early supervision from CLI
+  final intentAlignWeight = args.getDouble('intent_align', def: 0.25);
+  final actionAlignWeight = args.getDouble('action_align', def: 0.0);
+
   final lockTerrain = args.getFlag('lock_terrain', def: false);
   final lockSpawn = args.getFlag('lock_spawn', def: false);
   final randomSpawnX = !args.getFlag('fixed_spawn_x', def: false);
@@ -441,12 +283,11 @@ void main(List<String> argv) {
   );
   final env = eng.GameEngine(cfg);
 
-  final fe = FeatureExtractor(groundSamples: 3, stridePx: 48, dt: 1/60.0);
+  final fe = FeatureExtractor(groundSamples: 3, stridePx: 48);
   final policy = PolicyNetwork(inputSize: fe.inputSize, h1: 64, h2: 64, seed: seed);
   print('Loaded init policy. h1=${policy.h1} h2=${policy.h2} | FE(gs=${fe.groundSamples} stride=${fe.stridePx})');
 
-  // Load if exact match; ignore partials
-  final loaded = tryLoadPolicyStrict('policy_pretrained.json', policy);
+  tryLoadPolicy('policy_pretrained.json', policy);
 
   if (determinism) {
     env.reset(seed: 1234);
@@ -470,16 +311,14 @@ void main(List<String> argv) {
     intentEntropyBeta: intentEntropy,
     useLearnedController: useLearned,
     blendPolicy: blendPolicy.clamp(0.0, 1.0),
-    segHardMax: 150,
-    segMin: 50,
+    // NEW
+    intentAlignWeight: intentAlignWeight,
+    actionAlignWeight: actionAlignWeight,
+    normalizeFeatures: true, // turn on online feature normalization
   );
 
-  // Always (re)pretrain unless user really wants to skip — ensures 14/14 tensors match the new heads.
   print('Pretraining intent on $pretrainN snapshots (epochs=$pretrainEpochs, align=$pretrainAlign, lr=$pretrainLr) ...');
-  final stats = pretrainIntentOnSnapshots(
-    env: env,
-    fe: fe,
-    policy: policy,
+  final stats = trainer.pretrainIntentOnSnapshots(
     samples: pretrainN,
     epochs: pretrainEpochs,
     alignWeight: pretrainAlign,
@@ -542,12 +381,19 @@ void main(List<String> argv) {
 
 Pretrain only:
   dart run lib/ai/train_agent.dart \
-    --pretrain_intent=10000 --pretrain_epochs=2 --pretrain_align=2.0 \
+    --pretrain_intent=8000 --pretrain_epochs=2 --pretrain_align=2.0 \
     --pretrain_lr=0.0005 --only_pretrain
 
-Full train (heuristic turns; segmented GAE inside agent):
+Full train (phase 1: learn intents, heuristic controller):
   dart run lib/ai/train_agent.dart \
-    --pretrain_intent=10000 --pretrain_epochs=2 --pretrain_align=2.0 --pretrain_lr=0.0005 \
-    --plan_hold=2 --use_learned_controller=false --blend_policy=0.0 \
-    --train_iters=300 --batch=24 --lr=0.0003 --value_beta=0.5
+    --pretrain_intent=8000 --pretrain_epochs=2 --pretrain_align=2.0 --pretrain_lr=0.0005 \
+    --plan_hold=2 --use_learned_controller=false \
+    --train_iters=200 --batch=16 --lr=0.0003 \
+    --intent_align=0.25 --action_align=0.0 --intent_entropy=0.0001
+
+Phase 2 (distill controller once intents are stable):
+  dart run lib/ai/train_agent.dart \
+    --train_iters=150 --batch=16 --lr=0.0003 \
+    --use_learned_controller=true --blend_policy=0.5 \
+    --intent_align=0.10 --action_align=0.6 --intent_entropy=0.00005
 -------------------------------------------------------------------------------- */

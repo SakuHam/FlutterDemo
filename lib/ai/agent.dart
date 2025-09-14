@@ -4,62 +4,29 @@ import 'dart:math' as math;
 import '../engine/game_engine.dart' as eng;
 import '../engine/types.dart' as et;
 
-// If you don't have intent_bus.dart, you can delete these imports & the two publish blocks.
+// If you don't have intent_bus.dart, you can delete this import and the two publish blocks.
 import 'intent_bus.dart';
 
 /* ----------------------------- Feature Extraction ----------------------------- */
 
-/// Feature extractor with a tiny internal state so we can estimate acceleration
-/// from velocity deltas (no engine changes required).
 class FeatureExtractor {
   final int groundSamples; // number of local ground samples (even or odd)
   final double stridePx;
-  final double dt;         // seconds per physics step (e.g. 1/60)
-
-  // persistent tiny state (reset each episode)
-  double _lastVx = 0.0;
-  double _lastVy = 0.0;
-  bool _haveLastVel = false;
-
-  FeatureExtractor({
-    this.groundSamples = 3,
-    this.stridePx = 48,
-    this.dt = 1 / 60.0,
-  });
-
-  void reset() {
-    _haveLastVel = false;
-    _lastVx = 0.0;
-    _lastVy = 0.0;
-  }
+  FeatureExtractor({this.groundSamples = 3, this.stridePx = 48});
 
   List<double> extract(eng.GameEngine e) {
     final L = e.lander;
     final T = e.terrain;
     final cfg = e.cfg;
 
-    // Normalize base kinematics
-    final px = L.pos.x / cfg.worldW;                 // 0..1
-    final py = L.pos.y / cfg.worldH;                 // 0..1
-    final vx = (L.vel.x / 200.0).clamp(-2.0, 2.0);   // ~-1..1
+    final px = L.pos.x / cfg.worldW; // 0..1
+    final py = L.pos.y / cfg.worldH; // 0..1
+    final vx = (L.vel.x / 200.0).clamp(-2.0, 2.0); // ~-1..1
     final vy = (L.vel.y / 200.0).clamp(-2.0, 2.0);
     final ang = (L.angle / math.pi).clamp(-1.5, 1.5);
     final fuel = (L.fuel / cfg.t.maxFuel).clamp(0.0, 1.0);
 
-    // Estimated acceleration from velocity deltas (engine+gravity+tilt effect).
-    double axEst = 0.0, ayEst = 0.0;
-    if (_haveLastVel && dt > 0) {
-      axEst = ((L.vel.x - _lastVx) / dt) / 400.0; // normalize a bit
-      ayEst = ((L.vel.y - _lastVy) / dt) / 400.0;
-      axEst = axEst.clamp(-2.0, 2.0);
-      ayEst = ayEst.clamp(-2.0, 2.0);
-    }
-    _lastVx = L.vel.x;
-    _lastVy = L.vel.y;
-    _haveLastVel = true;
-
-    // Pad info
-    final padCenter = T.padCenter / cfg.worldW;      // 0..1
+    final padCenter = T.padCenter / cfg.worldW; // 0..1
     final dxCenter = ((L.pos.x - T.padCenter) / cfg.worldW).clamp(-1.0, 1.0);
 
     // Distance to ground & slope near feet
@@ -85,18 +52,57 @@ class FeatureExtractor {
       px, py, vx, vy, ang, fuel,
       padCenter, dxCenter,
       dGround, slope,
-      axEst, ayEst,       // NEW: engine+gravity proxy
       ...samples,
     ];
   }
 
-  int get inputSize => 12 + groundSamples; // (10 base + 2 accel) + samples
+  int get inputSize => 10 + groundSamples;
+}
+
+/* -------------------------- Online feature normalization ---------------------- */
+
+class RunningNorm {
+  final int dim;
+  final double momentum; // 0..1
+  late List<double> mean;
+  late List<double> var_;
+  bool inited = false;
+
+  RunningNorm(this.dim, {this.momentum = 0.995}) {
+    mean = List.filled(dim, 0.0);
+    var_ = List.filled(dim, 1.0);
+  }
+
+  List<double> normalize(List<double> x, {bool update = true}) {
+    if (!inited) {
+      mean = List.from(x);
+      var_ = List.filled(dim, 1.0);
+      inited = true;
+      // Return zeros at first step for stability
+      return List.filled(dim, 0.0);
+    }
+    if (update) {
+      for (int i = 0; i < dim; i++) {
+        final m = mean[i] * momentum + x[i] * (1 - momentum);
+        final v = var_[i] * momentum + (x[i] - m) * (x[i] - m) * (1 - momentum);
+        mean[i] = m;
+        var_[i] = v;
+      }
+    }
+    final out = List<double>.filled(dim, 0.0);
+    for (int i = 0; i < dim; i++) {
+      final s = var_[i] > 1e-6 ? math.sqrt(var_[i]) : 1.0;
+      out[i] = (x[i] - mean[i]) / s;
+    }
+    return out;
+  }
 }
 
 /* ----------------------------- Tiny Linear Algebra ---------------------------- */
 
 List<double> vecAdd(List<double> a, List<double> b) {
-  final n = a.length; final out = List<double>.filled(n, 0);
+  final n = a.length;
+  final out = List<double>.filled(n, 0);
   for (int i = 0; i < n; i++) out[i] = a[i] + b[i];
   return out;
 }
@@ -105,7 +111,8 @@ List<double> matVec(List<List<double>> W, List<double> x) {
   final m = W.length, n = W[0].length;
   final out = List<double>.filled(m, 0);
   for (int i = 0; i < m; i++) {
-    double s = 0.0; final Wi = W[i];
+    double s = 0.0;
+    final Wi = W[i];
     for (int j = 0; j < n; j++) s += Wi[j] * x[j];
     out[i] = s;
   }
@@ -128,6 +135,7 @@ List<List<double>> outer(List<double> a, List<double> b) {
 void addInPlaceVec(List<double> a, List<double> b) {
   for (int i = 0; i < a.length; i++) a[i] += b[i];
 }
+
 void addInPlaceMat(List<List<double>> A, List<List<double>> B) {
   for (int i = 0; i < A.length; i++) {
     final Ai = A[i], Bi = B[i];
@@ -137,17 +145,18 @@ void addInPlaceMat(List<List<double>> A, List<List<double>> B) {
 
 /* -------------------------------- Nonlinearities ------------------------------ */
 
-double relu(double x) => x > 0 ? x : 0.0;
-double dRelu(double x) => x > 0 ? 1.0 : 0.0;
-double sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
+// LeakyReLU (prevents dead units)
+double lrelu(double x, {double a = 0.05}) => x >= 0 ? x : a * x;
+double dlrelu(double x, {double a = 0.05}) => x >= 0 ? 1.0 : a;
+List<double> lreluVec(List<double> v) => v.map(lrelu).toList();
 
-List<double> reluVec(List<double> v) => v.map(relu).toList();
+double sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
 
 List<double> softmax(List<double> z) {
   final m = z.reduce(math.max);
   final exps = z.map((v) => math.exp(v - m)).toList();
-  final s = exps.reduce((a,b)=>a+b);
-  return exps.map((e)=> e / s).toList();
+  final s = exps.reduce((a, b) => a + b);
+  return exps.map((e) => e / s).toList();
 }
 
 /* ----------------------- Intents & tiny low-level controller ------------------ */
@@ -164,35 +173,38 @@ Intent indexToIntent(int i) => Intent.values[i];
 /// Shared heuristic for supervised labels (correct left/right mapping).
 int heuristicIntentLabel(eng.GameEngine env) {
   final padCx = env.terrain.padCenter;
-  final dx = env.lander.pos.x - padCx;            // + if lander is RIGHT of pad
+  final dx = env.lander.pos.x - padCx; // + if lander is RIGHT of pad
   final groundY = env.terrain.heightAt(env.lander.pos.x);
-  final height = groundY - env.lander.pos.y;      // px above ground
-  final vy = env.lander.vel.y;                    // +down
+  final height = groundY - env.lander.pos.y; // px above ground
+  final vy = env.lander.vel.y; // +down
 
   final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
       .clamp(1.0, env.cfg.worldW.toDouble());
   final dxN = (dx.abs() / padHalfW);
-  const dxDead = 0.25;  // within 1/4 pad halfwidth ~ treated as "centered"
+  const dxDead = 0.25; // within 1/4 pad halfwidth ~ treated as "centered"
   final high = height > 0.30 * env.cfg.worldH;
 
   if (dxN > dxDead) {
     return dx > 0 ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
   } else {
     if (high) return intentToIndex(Intent.descendSlow);
-    return (vy > 55.0) ? intentToIndex(Intent.brakeUp) : intentToIndex(Intent.hoverCenter);
+    return (vy > 55.0)
+        ? intentToIndex(Intent.brakeUp)
+        : intentToIndex(Intent.hoverCenter);
   }
 }
 
-/// Predictive labeler: look ahead tau seconds and pick the intent that will be correct.
+/// Predictive labelers …
+
 int predictiveIntentLabel(eng.GameEngine env, {double tauSec = 0.6}) {
   final L = env.lander;
   final padCx = env.terrain.padCenter.toDouble();
 
-  final dx = L.pos.x - padCx;      // + if right of pad
-  final vx = L.vel.x;              // px/s
-  final vy = L.vel.y;              // +down
+  final dx = L.pos.x - padCx; // + if right of pad
+  final vx = L.vel.x; // px/s
+  final vy = L.vel.y; // +down
   final groundY = env.terrain.heightAt(L.pos.x);
-  final height = groundY - L.pos.y;    // px above ground
+  final height = groundY - L.pos.y; // px above ground
 
   final dxFuture = dx + vx * tauSec;
   final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
@@ -206,33 +218,40 @@ int predictiveIntentLabel(eng.GameEngine env, {double tauSec = 0.6}) {
   const double dxInner = 0.18;
   const double vxSmall = 18.0;
 
-  if (tGround < tauSec * 0.7 && vy > 55.0) return intentToIndex(Intent.brakeUp);
+  if (tGround < tauSec * 0.7 && vy > 55.0) {
+    return intentToIndex(Intent.brakeUp);
+  }
 
   final bool high = height > 0.30 * env.cfg.worldH;
 
   if (dxfN > dxOuter) {
-    return (dxFuture > 0) ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
+    return (dxFuture > 0)
+        ? intentToIndex(Intent.goLeft)
+        : intentToIndex(Intent.goRight);
   }
   if (dxfN < dxInner && vx.abs() < vxSmall) {
     if (high) return intentToIndex(Intent.descendSlow);
-    return (vy > 55.0) ? intentToIndex(Intent.brakeUp) : intentToIndex(Intent.hoverCenter);
+    return (vy > 55.0)
+        ? intentToIndex(Intent.brakeUp)
+        : intentToIndex(Intent.hoverCenter);
   }
-  return (dxFuture > 0) ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
+  return (dxFuture > 0)
+      ? intentToIndex(Intent.goLeft)
+      : intentToIndex(Intent.goRight);
 }
 
-/// Predictive-but-adaptive: ~1.0s lookahead, adapts with distance/height.
 int predictiveIntentLabelAdaptive(
     eng.GameEngine env, {
       double baseTauSec = 1.00,
-      double minTauSec  = 0.45,
-      double maxTauSec  = 1.35,
+      double minTauSec = 0.45,
+      double maxTauSec = 1.35,
     }) {
   final L = env.lander;
   final padCx = env.terrain.padCenter.toDouble();
 
-  final dx = L.pos.x - padCx;         // + if right of pad
-  final vx = L.vel.x;                  // px/s
-  final vy = L.vel.y;                  // +down
+  final dx = L.pos.x - padCx;
+  final vx = L.vel.x;
+  final vy = L.vel.y;
   final groundY = env.terrain.heightAt(L.pos.x);
   final height = groundY - L.pos.y;
 
@@ -254,7 +273,7 @@ int predictiveIntentLabelAdaptive(
   final dxFuture = dx + vx * tau;
   final dxfN = (dxFuture.abs() / padHalfW);
 
-  final vySafe  = math.max(10.0, vy);
+  final vySafe = math.max(10.0, vy);
   final tGround = height / vySafe;
   if (tGround < tau * 0.70 && vy > 55.0) {
     return intentToIndex(Intent.brakeUp);
@@ -274,16 +293,15 @@ int predictiveIntentLabelAdaptive(
     if (height > 0.30 * env.cfg.worldH) {
       return intentToIndex(Intent.descendSlow);
     }
-    return (vy > 55.0) ? intentToIndex(Intent.brakeUp)
+    return (vy > 55.0)
+        ? intentToIndex(Intent.brakeUp)
         : intentToIndex(Intent.hoverCenter);
   }
 
   if (vx.abs() < 20.0) {
-    return (dx > 0) ? intentToIndex(Intent.goLeft)
-        : intentToIndex(Intent.goRight);
+    return (dx > 0) ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
   }
-  return (dxFuture > 0) ? intentToIndex(Intent.goLeft)
-      : intentToIndex(Intent.goRight);
+  return (dxFuture > 0) ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
 }
 
 /// Deterministic low-level controller mapping an intent to (thrust/left/right).
@@ -299,8 +317,8 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
   // Angle PD toward desired angle (lean into correcting dx and vx)
   double targetAngle = 0.0;
-  const kAngDx = 0.005;     // how much horizontal error affects target angle
-  const kAngVx = 0.010;     // how much vx affects target angle
+  const kAngDx = 0.005; // how much horizontal error affects target angle
+  const kAngVx = 0.010; // how much vx affects target angle
   const maxTilt = 15 * math.pi / 180;
 
   switch (intent) {
@@ -311,7 +329,8 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
       targetAngle = (kAngDx * dx + kAngVx * vx).clamp(-maxTilt, maxTilt);
       break;
     case Intent.hoverCenter:
-      targetAngle = (-0.5 * kAngDx * dx - 0.5 * kAngVx * vx).clamp(-maxTilt, maxTilt);
+      targetAngle =
+          (-0.5 * kAngDx * dx - 0.5 * kAngVx * vx).clamp(-maxTilt, maxTilt);
       break;
     case Intent.descendSlow:
     case Intent.brakeUp:
@@ -332,13 +351,13 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   // Vertical PD for thrust target
   double targetVy = 60.0; // px/s downward normally
   if (intent == Intent.descendSlow) targetVy = 30.0;
-  if (intent == Intent.brakeUp)     targetVy = -20.0;
+  if (intent == Intent.brakeUp) targetVy = -20.0;
 
   // Stricter near ground
   final groundY = env.terrain.heightAt(L.pos.x);
   final height = groundY - L.pos.y;
   if (height < 120) targetVy = math.min(targetVy, 20.0);
-  if (height <  60) targetVy = math.min(targetVy, 10.0);
+  if (height < 60) targetVy = math.min(targetVy, 10.0);
 
   final eVy = vy - targetVy;
   thrust = eVy > 0; // burn if falling faster than target
@@ -362,20 +381,20 @@ class PolicyNetwork {
   late List<List<double>> W1, W2;
   late List<double> b1, b2;
 
-  // Action Heads (single-stage; also used for learned controller)
-  late List<List<double>> W_thr;   // (1, h2)
-  late List<double> b_thr;         // (1)
-  late List<List<double>> W_turn;  // (3, h2)  [none,left,right]
-  late List<double> b_turn;        // (3)
+  // Action Heads (single-stage)
+  late List<List<double>> W_thr; // (1, h2)
+  late List<double> b_thr; // (1)
+  late List<List<double>> W_turn; // (3, h2)  [none,left,right]
+  late List<double> b_turn; // (3)
 
-  // Intent Head (planner)
-  static const int kIntents = 5;   // keep in sync with Intent enum
+  // Intent Head (two-stage)
+  static const int kIntents = 5; // keep in sync with Intent enum
   late List<List<double>> W_intent; // (K, h2)
-  late List<double> b_intent;       // (K)
+  late List<double> b_intent; // (K)
 
   // Value Head (critic)
-  late List<List<double>> W_val;   // (1, h2)
-  late List<double> b_val;         // (1)
+  late List<List<double>> W_val; // (1, h2)
+  late List<double> b_val; // (1)
 
   final math.Random rnd;
 
@@ -387,26 +406,33 @@ class PolicyNetwork {
   }) : rnd = math.Random(seed) {
     W1 = _init(h1, inputSize);
     W2 = _init(h2, h1);
-    b1 = List<double>.filled(h1, 0);
-    b2 = List<double>.filled(h2, 0);
+    // Small positive biases to avoid dead units
+    b1 = List<double>.filled(h1, 0.1);
+    b2 = List<double>.filled(h2, 0.1);
 
     // single-stage heads
-    W_thr = _init(1, h2);   b_thr = List<double>.filled(1, 0);
-    W_turn = _init(3, h2);  b_turn = List<double>.filled(3, 0);
+    W_thr = _init(1, h2);
+    b_thr = List<double>.filled(1, 0);
+    W_turn = _init(3, h2);
+    b_turn = List<double>.filled(3, 0);
 
-    // planner head
+    // two-stage planner head
     W_intent = _init(kIntents, h2);
     b_intent = List<double>.filled(kIntents, 0);
 
     // critic
-    W_val = _init(1, h2);   b_val = List<double>.filled(1, 0);
+    W_val = _init(1, h2);
+    b_val = List<double>.filled(1, 0);
   }
 
   List<List<double>> _init(int rows, int cols) {
     final limit = math.sqrt(6.0 / (rows + cols));
     return List.generate(
       rows,
-          (_) => List<double>.generate(cols, (_) => (rnd.nextDouble() * 2 - 1) * limit),
+          (_) => List<double>.generate(
+        cols,
+            (_) => (rnd.nextDouble() * 2 - 1) * limit,
+      ),
     );
   }
 }
@@ -422,16 +448,24 @@ class _Forward {
   final double thrLogit, thrP;
   final List<double> turnLogits, turnP;
 
-  // planner
+  // two-stage planner
   final List<double> intentLogits, intentP;
 
   // critic
   final double v;
 
   _Forward(
-      this.x, this.z1, this.h1, this.z2, this.h2,
-      this.thrLogit, this.thrP, this.turnLogits, this.turnP,
-      this.intentLogits, this.intentP,
+      this.x,
+      this.z1,
+      this.h1,
+      this.z2,
+      this.h2,
+      this.thrLogit,
+      this.thrP,
+      this.turnLogits,
+      this.turnP,
+      this.intentLogits,
+      this.intentP,
       this.v,
       );
 }
@@ -441,11 +475,11 @@ class _Forward {
 extension PolicyOps on PolicyNetwork {
   _Forward _forward(List<double> x) {
     final z1 = vecAdd(matVec(W1, x), b1);
-    final h1v = reluVec(z1);
+    final h1v = lreluVec(z1);
     final z2 = vecAdd(matVec(W2, h1v), b2);
-    final h2v = reluVec(z2);
+    final h2v = lreluVec(z2);
 
-    // action heads
+    // single-stage heads
     final thrLogit = matVec(W_thr, h2v)[0] + b_thr[0];
     final thrP = sigmoid(thrLogit);
 
@@ -453,18 +487,28 @@ extension PolicyOps on PolicyNetwork {
     for (int i = 0; i < 3; i++) turnLogits[i] += b_turn[i];
     final turnP = softmax(turnLogits);
 
-    // planner head
+    // two-stage planner head
     final intentLogits = matVec(W_intent, h2v);
-    for (int i = 0; i < PolicyNetwork.kIntents; i++) intentLogits[i] += b_intent[i];
+    for (int i = 0; i < PolicyNetwork.kIntents; i++) {
+      intentLogits[i] += b_intent[i];
+    }
     final intentP = softmax(intentLogits);
 
     // critic
     final v = matVec(W_val, h2v)[0] + b_val[0];
 
     return _Forward(
-      x, z1, h1v, z2, h2v,
-      thrLogit, thrP, turnLogits, turnP,
-      intentLogits, intentP,
+      x,
+      z1,
+      h1v,
+      z2,
+      h2v,
+      thrLogit,
+      thrP,
+      turnLogits,
+      turnP,
+      intentLogits,
+      intentP,
       v,
     );
   }
@@ -473,7 +517,10 @@ extension PolicyOps on PolicyNetwork {
     var bi = 0;
     var bv = v[0];
     for (int i = 1; i < v.length; i++) {
-      if (v[i] > bv) { bv = v[i]; bi = i; }
+      if (v[i] > bv) {
+        bv = v[i];
+        bi = i;
+      }
     }
     return bi;
   }
@@ -510,9 +557,13 @@ extension PolicyOps on PolicyNetwork {
     bool thrust = rnd.nextDouble() < pThr;
     final r = rnd.nextDouble();
     int cls;
-    if (r < pTurn[0]) cls = 0;
-    else if (r < pTurn[0] + pTurn[1]) cls = 1;
-    else cls = 2;
+    if (r < pTurn[0]) {
+      cls = 0;
+    } else if (r < pTurn[0] + pTurn[1]) {
+      cls = 1;
+    } else {
+      cls = 2;
+    }
 
     bool left = cls == 1;
     bool right = cls == 2;
@@ -520,14 +571,16 @@ extension PolicyOps on PolicyNetwork {
     if (epsilon > 0.0 && rnd.nextDouble() < epsilon) {
       const combos = <List<bool>>[
         [false, false, false],
-        [true,  false, false],
-        [false, true,  false],
-        [false, false, true ],
-        [true,  true,  false],
-        [true,  false, true ],
+        [true, false, false],
+        [false, true, false],
+        [false, false, true],
+        [true, true, false],
+        [true, false, true],
       ];
       final pick = combos[rnd.nextInt(combos.length)];
-      thrust = pick[0]; left = pick[1]; right = pick[2];
+      thrust = pick[0];
+      left = pick[1];
+      right = pick[2];
     }
 
     return (thrust, left, right, [pThr, ...pTurn], f);
@@ -535,7 +588,8 @@ extension PolicyOps on PolicyNetwork {
 
   /* ---------------------------- Two-stage (planner) --------------------------- */
 
-  (int intentIndex, List<double> probs, _Forward cache) actIntentGreedy(List<double> x) {
+  (int intentIndex, List<double> probs, _Forward cache) actIntentGreedy(
+      List<double> x) {
     final f = _forward(x);
     final idx = _argmax(f.intentLogits);
     return (idx, List<double>.from(f.intentP), f);
@@ -556,7 +610,10 @@ extension PolicyOps on PolicyNetwork {
     int idx;
     final r = rnd.nextDouble();
     double c = 0.0;
-    for (idx = 0; idx < PolicyNetwork.kIntents; idx++) { c += p[idx]; if (r <= c) break; }
+    for (idx = 0; idx < PolicyNetwork.kIntents; idx++) {
+      c += p[idx];
+      if (r <= c) break;
+    }
     if (idx >= PolicyNetwork.kIntents) idx = PolicyNetwork.kIntents - 1;
 
     if (epsilon > 0.0 && rnd.nextDouble() < epsilon) {
@@ -567,51 +624,216 @@ extension PolicyOps on PolicyNetwork {
 
   /* ------------------------ Updates: single & two-stage ----------------------- */
 
-  // --- GAE helper (on decision points) ---
-  List<double> _gaeAdvantages({
-    required List<double> rewards,    // r_t at decision steps
-    required List<double> values,     // V(s_t) at decision steps
-    required double gamma,
-    double lambda_ = 0.95,
-    double bootstrapV = 0.0,
+  void _updateSingleStage({
+    required List<_Forward> caches,
+    required List<List<int>> actions, // [th, left, right]
+    required List<double> returns_,
+    double lr = 3e-4,
+    double l2 = 1e-6,
+    double entropyBeta = 0.0,
+    double valueBeta = 0.5,
+    double huberDelta = 1.0,
   }) {
-    final T = rewards.length;
-    final adv = List<double>.filled(T, 0.0);
-    double nextAdv = 0.0;
-    double nextV = bootstrapV;
-    for (int t = T - 1; t >= 0; t--) {
-      final delta = rewards[t] + gamma * nextV - values[t];
-      nextAdv = delta + gamma * lambda_ * nextAdv;
-      adv[t] = nextAdv;
-      nextV = values[t];
+    final T = caches.length;
+    if (T == 0) return;
+
+    // Advantages: A = R - V
+    final values = List<double>.generate(T, (t) => caches[t].v);
+    final adv = List<double>.generate(T, (t) => returns_[t] - values[t]);
+    final mean = adv.reduce((a, b) => a + b) / T;
+    double var0 = 0.0;
+    for (final v in adv) var0 += (v - mean) * (v - mean);
+    var0 /= T;
+    final std = math.sqrt(var0 + 1e-8);
+    for (int i = 0; i < T; i++) {
+      adv[i] = (adv[i] - mean) / std;
     }
-    // normalize
-    if (T > 0) {
-      final m = adv.reduce((a,b)=>a+b) / T;
-      double v = 0.0; for (final a in adv) v += (a - m)*(a - m);
-      v = math.sqrt((v / T) + 1e-8);
-      if (v > 0) for (int i=0;i<T;i++) adv[i] = (adv[i] - m) / v;
+
+    // Accumulators
+    final dW1 = zeros(W1.length, W1[0].length);
+    final dW2 = zeros(W2.length, W2[0].length);
+    final db1 = List<double>.filled(b1.length, 0);
+    final db2 = List<double>.filled(b2.length, 0);
+
+    final dW_thr = zeros(W_thr.length, W_thr[0].length);
+    final db_thr = List<double>.filled(b_thr.length, 0);
+    final dW_turn = zeros(W_turn.length, W_turn[0].length);
+    final db_turn = List<double>.filled(b_turn.length, 0);
+
+    final dW_val = zeros(W_val.length, W_val[0].length);
+    final db_val = List<double>.filled(b_val.length, 0);
+
+    for (int t = 0; t < T; t++) {
+      final f = caches[t];
+      final a = actions[t];
+      final A = adv[t];
+
+      // logits grads = (p - a) * A
+      final a_thr = a[0].toDouble();
+      final a_turn = <double>[1 - a[1] - a[2] + 0.0, a[1] + 0.0, a[2] + 0.0];
+
+      double dz_thr = (f.thrP - a_thr) * A;
+      final dz_turn =
+      List<double>.generate(3, (k) => (f.turnP[k] - a_turn[k]) * A);
+
+      // entropy bonus
+      if (entropyBeta > 0.0) {
+        final p = f.thrP.clamp(1e-6, 1 - 1e-6);
+        final dH_dz_thr = math.log((1 - p) / p) * p * (1 - p);
+        dz_thr += -entropyBeta * dH_dz_thr;
+
+        final p3 = f.turnP.map((x) => x.clamp(1e-8, 1.0)).toList();
+        final g =
+        List<double>.generate(3, (i) => -(math.log(p3[i]) + 1.0));
+        double s = 0.0;
+        for (int i = 0; i < 3; i++) s += p3[i] * g[i];
+        for (int i = 0; i < 3; i++) {
+          final dH_dz_i = p3[i] * g[i] - p3[i] * s; // (diag(p)-pp^T)g
+          dz_turn[i] += -entropyBeta * dH_dz_i;
+        }
+      }
+
+      // value head (Huber on v - R)
+      final err = f.v - returns_[t];
+      final dLdv = valueBeta * _huberGrad(err, huberDelta);
+
+      // heads
+      addInPlaceMat(dW_thr, outer([dz_thr], f.h2));
+      db_thr[0] += dz_thr;
+      addInPlaceMat(dW_turn, outer(dz_turn, f.h2));
+      addInPlaceVec(db_turn, dz_turn);
+      addInPlaceMat(dW_val, outer([dLdv], f.h2));
+      db_val[0] += dLdv;
+
+      // backprop to trunk
+      final dh2 = List<double>.filled(f.h2.length, 0);
+      for (int j = 0; j < W_thr[0].length; j++) {
+        dh2[j] += W_thr[0][j] * dz_thr;
+      }
+      for (int i = 0; i < 3; i++) {
+        final row = W_turn[i];
+        for (int j = 0; j < row.length; j++) {
+          dh2[j] += row[j] * dz_turn[i];
+        }
+      }
+      for (int j = 0; j < W_val[0].length; j++) {
+        dh2[j] += W_val[0][j] * dLdv;
+      }
+
+      final dz2 =
+      List<double>.generate(f.z2.length, (i) => dh2[i] * dlrelu(f.z2[i]));
+      addInPlaceMat(dW2, outer(dz2, f.h1));
+      addInPlaceVec(db2, dz2);
+
+      final dh1 = List<double>.filled(f.h1.length, 0);
+      for (int i = 0; i < W2.length; i++) {
+        for (int j = 0; j < W2[0].length; j++) {
+          dh1[j] += W2[i][j] * dz2[i];
+        }
+      }
+      final dz1 =
+      List<double>.generate(f.z1.length, (i) => dh1[i] * dlrelu(f.z1[i]));
+      addInPlaceMat(dW1, outer(dz1, f.x));
+      addInPlaceVec(db1, dz1);
     }
-    return adv;
+
+    // L2
+    void addL2(List<List<double>> dW, List<List<double>> W) {
+      for (int i = 0; i < dW.length; i++) {
+        for (int j = 0; j < dW[0].length; j++) {
+          dW[i][j] += l2 * W[i][j];
+        }
+      }
+    }
+
+    addL2(dW1, W1);
+    addL2(dW2, W2);
+    addL2(dW_thr, W_thr);
+    addL2(dW_turn, W_turn);
+    addL2(dW_val, W_val);
+
+    // global norm clip
+    double sq = 0.0;
+    void accumM(List<List<double>> G) {
+      for (final r in G) {
+        for (final v in r) sq += v * v;
+      }
+    }
+
+    void accumB(List<double> g) {
+      for (final v in g) sq += v * v;
+    }
+
+    accumM(dW1);
+    accumM(dW2);
+    accumM(dW_thr);
+    accumM(dW_turn);
+    accumM(dW_val);
+    accumB(db1);
+    accumB(db2);
+    accumB(db_thr);
+    accumB(db_turn);
+    accumB(db_val);
+    final clip = 5.0;
+    final nrm = math.sqrt(sq + 1e-12);
+    final sc = nrm > clip ? (clip / nrm) : 1.0;
+    if (sc != 1.0) {
+      void scaleM(List<List<double>> G) {
+        for (final r in G) {
+          for (int j = 0; j < r.length; j++) r[j] *= sc;
+        }
+      }
+
+      void scaleB(List<double> g) {
+        for (int j = 0; j < g.length; j++) g[j] *= sc;
+        ;
+      }
+
+      scaleM(dW1);
+      scaleM(dW2);
+      scaleM(dW_thr);
+      scaleM(dW_turn);
+      scaleM(dW_val);
+      scaleB(db1);
+      scaleB(db2);
+      scaleB(db_thr);
+      scaleB(db_turn);
+      scaleB(db_val);
+    }
+
+    // SGD
+    void sgdW(List<List<double>> W, List<List<double>> dW) {
+      for (int i = 0; i < W.length; i++) {
+        for (int j = 0; j < W[0].length; j++) W[i][j] -= lr * dW[i][j];
+      }
+    }
+
+    void sgdB(List<double> b, List<double> db) {
+      for (int i = 0; i < b.length; i++) b[i] -= lr * db[i];
+    }
+
+    sgdW(W_thr, dW_thr);
+    sgdB(b_thr, db_thr);
+    sgdW(W_turn, dW_turn);
+    sgdB(b_turn, db_turn);
+    sgdW(W_val, dW_val);
+    sgdB(b_val, db_val);
+    sgdW(W2, dW2);
+    sgdB(b2, db2);
+    sgdW(W1, dW1);
+    sgdB(b1, db1);
   }
 
+  // Two-stage update (intent categorical + value + optional entropy)
   void _updateIntentStage({
     required List<_Forward> decisionCaches, // caches at decision times
-    required List<int> intentChoices,       // indices 0..K-1
-    required List<double> decisionRewards,  // per-decision summed rewards
-    required double gamma,
-    double gaeLambda = 0.95,
-    bool bootstrap = true,        // if last step non-terminal, bootstrap V
-    double bootstrapV = 0.0,      // supply when bootstrap==true
-
-    List<int>? alignLabels,       // OPTIONAL heuristic labels for intent
-    double alignWeight = 0.0,     // strength of auxiliary align loss
-
-    // Optional supervised distillation of action heads at decision states
+    required List<int> intentChoices, // indices 0..K-1
+    required List<double> decisionReturns, // rewards-to-go at decision times
+    List<int>? alignLabels, // OPTIONAL heuristic labels for intent
+    double alignWeight = 0.0, // strength of auxiliary align loss
+    // NEW: supervised action cloning (distill controller)
     List<List<int>>? actionLabels, // OPTIONAL: [thr,left,right]
     double actionAlignWeight = 0.0,
-
-    // common
     double lr = 3e-4,
     double l2 = 1e-6,
     double entropyBeta = 0.0,
@@ -620,23 +842,26 @@ extension PolicyOps on PolicyNetwork {
   }) {
     final T = decisionCaches.length;
     if (T == 0) return;
-    if (intentChoices.length != T) return;
-    if (decisionRewards.length != T) return;
-
-    // Values at decision points
-    final values = List<double>.generate(T, (t) => decisionCaches[t].v);
-
-    // Compute GAE advantages on decisions
-    final adv = _gaeAdvantages(
-      rewards: decisionRewards,              // already aggregated per decision
-      values: values,
-      gamma: gamma,
-      lambda_: gaeLambda,
-      bootstrapV: bootstrap ? bootstrapV : 0.0,
+    assert(
+    alignLabels == null || alignLabels!.length == T,
+    'alignLabels length must match decisionCaches length when provided.',
+    );
+    assert(
+    actionLabels == null || actionLabels!.length == T,
+    'actionLabels length must match decisionCaches length when provided.',
     );
 
-    // Returns for critic: V + A
-    final decisionReturns = List<double>.generate(T, (i) => values[i] + adv[i]);
+    // Advantages: A = R_decision - V(s_decision)
+    final values = List<double>.generate(T, (t) => decisionCaches[t].v);
+    final adv = List<double>.generate(T, (t) => decisionReturns[t] - values[t]);
+    final mean = adv.reduce((a, b) => a + b) / T;
+    double var0 = 0.0;
+    for (final v in adv) var0 += (v - mean) * (v - mean);
+    var0 /= T;
+    final std = math.sqrt(var0 + 1e-8);
+    for (int i = 0; i < T; i++) {
+      adv[i] = (adv[i] - mean) / std;
+    }
 
     // Accumulators
     final dW1 = zeros(W1.length, W1[0].length);
@@ -647,6 +872,7 @@ extension PolicyOps on PolicyNetwork {
     final dW_int = zeros(W_intent.length, W_intent[0].length);
     final db_int = List<double>.filled(b_intent.length, 0);
 
+    // NEW: action heads
     final dW_thr = zeros(W_thr.length, W_thr[0].length);
     final db_thr = List<double>.filled(b_thr.length, 0);
     final dW_turn = zeros(W_turn.length, W_turn[0].length);
@@ -660,14 +886,16 @@ extension PolicyOps on PolicyNetwork {
       final k = intentChoices[t];
       final A = adv[t];
 
-      // logits grad for categorical intent (PG): (p - onehot) * A
+      // logits grad for categorical intent (PG)
       final target = List<double>.filled(PolicyNetwork.kIntents, 0.0);
-      if (k >= 0 && k < PolicyNetwork.kIntents) target[k] = 1.0;
+      target[k] = 1.0;
       final dz_int = List<double>.generate(
-          PolicyNetwork.kIntents, (i) => (f.intentP[i] - target[i]) * A);
+        PolicyNetwork.kIntents,
+            (i) => (f.intentP[i] - target[i]) * A,
+      );
 
-      // Auxiliary intent alignment
-      if (alignWeight > 0.0 && alignLabels != null && alignLabels.length == T) {
+      // Auxiliary intent alignment (CE assist)
+      if (alignWeight > 0.0 && alignLabels != null) {
         final yIdx = alignLabels[t];
         if (yIdx >= 0 && yIdx < PolicyNetwork.kIntents) {
           for (int i = 0; i < PolicyNetwork.kIntents; i++) {
@@ -680,65 +908,82 @@ extension PolicyOps on PolicyNetwork {
       // entropy on intents
       if (entropyBeta > 0.0) {
         final p = f.intentP.map((x) => x.clamp(1e-8, 1.0)).toList();
-        final g = List<double>.generate(p.length, (i) => -(math.log(p[i]) + 1.0));
-        double s = 0.0; for (int i = 0; i < p.length; i++) s += p[i] * g[i];
+        final g =
+        List<double>.generate(p.length, (i) => -(math.log(p[i]) + 1.0));
+        double s = 0.0;
+        for (int i = 0; i < p.length; i++) s += p[i] * g[i];
         for (int i = 0; i < p.length; i++) {
           final dH_dz_i = p[i] * g[i] - p[i] * s;
           dz_int[i] += -entropyBeta * dH_dz_i;
         }
       }
 
-      // value head (Huber on v - R)
+      // value at decision time
       final err = f.v - decisionReturns[t];
-      double _huberGrad(double error, double delta) {
-        final ae = error.abs();
-        if (ae <= delta) return error;
-        return delta * (error.isNegative ? -1.0 : 1.0);
-      }
       final dLdv = valueBeta * _huberGrad(err, huberDelta);
 
       // heads: intent + value
-      addInPlaceMat(dW_int, outer(dz_int, f.h2)); addInPlaceVec(db_int, dz_int);
-      addInPlaceMat(dW_val, outer([dLdv], f.h2)); db_val[0] += dLdv;
+      addInPlaceMat(dW_int, outer(dz_int, f.h2));
+      addInPlaceVec(db_int, dz_int);
+      addInPlaceMat(dW_val, outer([dLdv], f.h2));
+      db_val[0] += dLdv;
 
-      // backprop to trunk accumulates here
+      // TRUNK backprop accumulates here
       final dh2 = List<double>.filled(f.h2.length, 0);
       for (int i = 0; i < W_intent.length; i++) {
         final row = W_intent[i];
-        for (int j = 0; j < row.length; j++) dh2[j] += row[j] * dz_int[i];
+        for (int j = 0; j < row.length; j++) {
+          dh2[j] += row[j] * dz_int[i];
+        }
       }
-      for (int j = 0; j < W_val[0].length; j++) dh2[j] += W_val[0][j] * dLdv;
+      for (int j = 0; j < W_val[0].length; j++) {
+        dh2[j] += W_val[0][j] * dLdv;
+      }
 
-      // Optional: supervised action cloning grads at decision states
-      if (actionAlignWeight > 0.0 && actionLabels != null && actionLabels.length == T) {
+      // NEW: supervised action cloning grads (cross-entropy) at decision states
+      if (actionAlignWeight > 0.0 && actionLabels != null) {
         final lab = actionLabels[t]; // [thr,left,right]
-        if (lab.length == 3) {
-          final yThr = lab[0].toDouble();
-          final yTurn = <double>[1 - lab[1] - lab[2] + 0.0, lab[1] + 0.0, lab[2] + 0.0];
+        final yThr = lab[0].toDouble();
+        final yTurn =
+        <double>[1 - lab[1] - lab[2] + 0.0, lab[1] + 0.0, lab[2] + 0.0];
 
-          final dz_thr_sup = (f.thrP - yThr) * actionAlignWeight;
-          final dz_turn_sup = List<double>.generate(3, (i) => (f.turnP[i] - yTurn[i]) * actionAlignWeight);
+        final dz_thr_sup = (f.thrP - yThr) * actionAlignWeight;
+        final dz_turn_sup = List<double>.generate(
+          3,
+              (i) => (f.turnP[i] - yTurn[i]) * actionAlignWeight,
+        );
 
-          addInPlaceMat(dW_thr, outer([dz_thr_sup], f.h2)); db_thr[0] += dz_thr_sup;
-          addInPlaceMat(dW_turn, outer(dz_turn_sup, f.h2)); addInPlaceVec(db_turn, dz_turn_sup);
+        addInPlaceMat(dW_thr, outer([dz_thr_sup], f.h2));
+        db_thr[0] += dz_thr_sup;
+        addInPlaceMat(dW_turn, outer(dz_turn_sup, f.h2));
+        addInPlaceVec(db_turn, dz_turn_sup);
 
-          for (int j = 0; j < W_thr[0].length; j++) dh2[j] += W_thr[0][j] * dz_thr_sup;
-          for (int i = 0; i < 3; i++) {
-            final row = W_turn[i];
-            for (int j = 0; j < row.length; j++) dh2[j] += row[j] * dz_turn_sup[i];
+        for (int j = 0; j < W_thr[0].length; j++) {
+          dh2[j] += W_thr[0][j] * dz_thr_sup;
+        }
+        for (int i = 0; i < 3; i++) {
+          final row = W_turn[i];
+          for (int j = 0; j < row.length; j++) {
+            dh2[j] += row[j] * dz_turn_sup[i];
           }
         }
       }
 
-      final dz2 = List<double>.generate(f.z2.length, (i) => dh2[i] * dRelu(f.z2[i]));
-      addInPlaceMat(dW2, outer(dz2, f.h1)); addInPlaceVec(db2, dz2);
+      final dz2 =
+      List<double>.generate(f.z2.length, (i) => dh2[i] * dlrelu(f.z2[i]));
+      addInPlaceMat(dW2, outer(dz2, f.h1));
+      addInPlaceVec(db2, dz2);
 
       final dh1 = List<double>.filled(f.h1.length, 0);
       for (int i = 0; i < W2.length; i++) {
-        for (int j = 0; j < W2[0].length; j++) dh1[j] += W2[i][j] * dz2[i];
+        for (int j = 0; j < W2[0].length; j++) {
+          dh1[j] += W2[i][j] * dz2[i];
+        }
       }
-      final dz1 = List<double>.generate(f.z1.length, (i) => dh1[i] * dRelu(f.z1[i]));
-      addInPlaceMat(dW1, outer(dz1, f.x)); addInPlaceVec(db1, dz1);
+      final dz1 =
+      List<double>.generate(f.z1.length, (i) => dh1[i] * dlrelu(f.z1[i]));
+      addInPlaceMat(dW1, outer(dz1, f.x));
+      addInPlaceVec(db1, dz1);
     }
 
     // L2
@@ -747,24 +992,64 @@ extension PolicyOps on PolicyNetwork {
         for (int j = 0; j < dW[0].length; j++) dW[i][j] += l2 * W[i][j];
       }
     }
-    addL2(dW1, W1); addL2(dW2, W2);
-    addL2(dW_int, W_intent); addL2(dW_val, W_val);
-    addL2(dW_thr, W_thr); addL2(dW_turn, W_turn);
+
+    addL2(dW1, W1);
+    addL2(dW2, W2);
+    addL2(dW_int, W_intent);
+    addL2(dW_val, W_val);
+    addL2(dW_thr, W_thr);
+    addL2(dW_turn, W_turn);
 
     // clip
     double sq = 0.0;
-    void accumM(List<List<double>> G){ for(final r in G){ for(final v in r) sq += v*v; } }
-    void accumB(List<double> g){ for(final v in g) sq += v*v; }
-    accumM(dW1); accumM(dW2); accumM(dW_int); accumM(dW_val); accumM(dW_thr); accumM(dW_turn);
-    accumB(db1); accumB(db2); accumB(db_int); accumB(db_val); accumB(db_thr); accumB(db_turn);
+    void accumM(List<List<double>> G) {
+      for (final r in G) {
+        for (final v in r) sq += v * v;
+      }
+    }
+
+    void accumB(List<double> g) {
+      for (final v in g) sq += v * v;
+    }
+
+    accumM(dW1);
+    accumM(dW2);
+    accumM(dW_int);
+    accumM(dW_val);
+    accumM(dW_thr);
+    accumM(dW_turn);
+    accumB(db1);
+    accumB(db2);
+    accumB(db_int);
+    accumB(db_val);
+    accumB(db_thr);
+    accumB(db_turn);
     final clip = 5.0;
     final nrm = math.sqrt(sq + 1e-12);
     final sc = nrm > clip ? (clip / nrm) : 1.0;
     if (sc != 1.0) {
-      void scaleM(List<List<double>> G){ for(final r in G){ for(int j=0;j<r.length;j++) r[j]*=sc; } }
-      void scaleB(List<double> g){ for (int j=0;j<g.length;j++) g[j]*=sc; }
-      scaleM(dW1); scaleM(dW2); scaleM(dW_int); scaleM(dW_val); scaleM(dW_thr); scaleM(dW_turn);
-      scaleB(db1); scaleB(db2); scaleB(db_int); scaleB(db_val); scaleB(db_thr); scaleB(db_turn);
+      void scaleM(List<List<double>> G) {
+        for (final r in G) {
+          for (int j = 0; j < r.length; j++) r[j] *= sc;
+        }
+      }
+
+      void scaleB(List<double> g) {
+        for (int j = 0; j < g.length; j++) g[j] *= sc;
+      }
+
+      scaleM(dW1);
+      scaleM(dW2);
+      scaleM(dW_int);
+      scaleM(dW_val);
+      scaleM(dW_thr);
+      scaleM(dW_turn);
+      scaleB(db1);
+      scaleB(db2);
+      scaleB(db_int);
+      scaleB(db_val);
+      scaleB(db_thr);
+      scaleB(db_turn);
     }
 
     // SGD
@@ -773,57 +1058,85 @@ extension PolicyOps on PolicyNetwork {
         for (int j = 0; j < W[0].length; j++) W[i][j] -= lr * dW[i][j];
       }
     }
-    void sgdB(List<double> b, List<double> db) { for (int i = 0; i < b.length; i++) b[i] -= lr * db[i]; }
 
-    sgdW(W_intent, dW_int); sgdB(b_intent, db_int);
-    sgdW(W_val, dW_val);    sgdB(b_val, db_val);
-    sgdW(W_thr, dW_thr);    sgdB(b_thr, db_thr);
-    sgdW(W_turn, dW_turn);  sgdB(b_turn, db_turn);
-    sgdW(W2, dW2);          sgdB(b2, db2);
-    sgdW(W1, dW1);          sgdB(b1, db1);
+    void sgdB(List<double> b, List<double> db) {
+      for (int i = 0; i < b.length; i++) b[i] -= lr * db[i];
+    }
+
+    sgdW(W_intent, dW_int);
+    sgdB(b_intent, db_int);
+    sgdW(W_val, dW_val);
+    sgdB(b_val, db_val);
+    sgdW(W_thr, dW_thr);
+    sgdB(b_thr, db_thr);
+    sgdW(W_turn, dW_turn);
+    sgdB(b_turn, db_turn);
+    sgdW(W2, dW2);
+    sgdB(b2, db2);
+    sgdW(W1, dW1);
+    sgdB(b1, db1);
+  }
+
+  // shared helpers
+  double _huberGrad(double error, double delta) {
+    final ae = error.abs();
+    if (ae <= delta) return error;
+    return delta * (error.isNegative ? -1.0 : 1.0);
   }
 
   // Public: choose which update path to use
-// AFTER
   void updateFromEpisode({
+    // single-stage data
+    List<_Forward>? caches,
+    List<List<int>>? actions,
+    List<double>? returns_,
+
     // two-stage data
-    List<dynamic>? decisionCaches,              // <— accept dynamic from train_agent.dart
+    List<_Forward>? decisionCaches,
     List<int>? intentChoices,
-    List<double>? decisionRewards, // summed per decision interval
-    required double gamma,
-    double gaeLambda = 0.95,
-    bool bootstrap = true,
-    double bootstrapV = 0.0,
-    List<int>? alignLabels,
-    double alignWeight = 0.0,
+    List<double>? decisionReturns,
+    List<int>? alignLabels, // heuristic intent labels
+    double alignWeight = 0.0, // auxiliary loss strength
+    // NEW: supervised action cloning at decision states
     List<List<int>>? actionLabels,
     double actionAlignWeight = 0.0,
+
     // common hyperparams
     double lr = 3e-4,
     double l2 = 1e-6,
     double entropyBeta = 0.0,
     double valueBeta = 0.5,
     double huberDelta = 1.0,
+    // mode
+    bool intentMode = true,
   }) {
-    // Safely cast the dynamic list to the private type used inside this file.
-    final List<_Forward> _dc =
-    (decisionCaches ?? const <dynamic>[]).cast<_Forward>();
-
-    _updateIntentStage(
-      decisionCaches: _dc,
-      intentChoices: intentChoices ?? const [],
-      decisionRewards: decisionRewards ?? const [],
-      gamma: gamma,
-      gaeLambda: gaeLambda,
-      bootstrap: bootstrap,
-      bootstrapV: bootstrapV,
-      alignLabels: alignLabels,
-      alignWeight: alignWeight,
-      actionLabels: actionLabels,
-      actionAlignWeight: actionAlignWeight,
-      lr: lr, l2: l2, entropyBeta: entropyBeta,
-      valueBeta: valueBeta, huberDelta: huberDelta,
-    );
+    if (intentMode) {
+      _updateIntentStage(
+        decisionCaches: decisionCaches ?? const [],
+        intentChoices: intentChoices ?? const [],
+        decisionReturns: decisionReturns ?? const [],
+        alignLabels: alignLabels,
+        alignWeight: alignWeight,
+        actionLabels: actionLabels,
+        actionAlignWeight: actionAlignWeight,
+        lr: lr,
+        l2: l2,
+        entropyBeta: entropyBeta,
+        valueBeta: valueBeta,
+        huberDelta: huberDelta,
+      );
+    } else {
+      _updateSingleStage(
+        caches: caches ?? const [],
+        actions: actions ?? const [],
+        returns_: returns_ ?? const [],
+        lr: lr,
+        l2: l2,
+        entropyBeta: entropyBeta,
+        valueBeta: valueBeta,
+        huberDelta: huberDelta,
+      );
+    }
   }
 }
 
@@ -834,14 +1147,26 @@ class EpisodeResult {
   final int steps;
   final bool landed;
 
+  // diagnostics (single-stage)
+  final int turnSteps;
+  final int leftSteps;
+  final int rightSteps;
+  final int thrustSteps;
+  final double avgThrProb;
+
   // diagnostics (two-stage)
-  final List<int> intentCounts;   // histogram over intents
+  final List<int> intentCounts; // histogram over intents
   final int intentSwitches;
 
   EpisodeResult(
       this.totalCost,
       this.steps,
       this.landed, {
+        this.turnSteps = 0,
+        this.leftSteps = 0,
+        this.rightSteps = 0,
+        this.thrustSteps = 0,
+        this.avgThrProb = 0.0,
         this.intentCounts = const [],
         this.intentSwitches = 0,
       });
@@ -853,31 +1178,43 @@ class Trainer {
   final PolicyNetwork policy;
   final math.Random rnd;
 
-  final double dt;     // seconds per step
-  final double gamma;  // discount
+  final double dt; // seconds per step
+  final double gamma; // discount
+
+  // single-stage exploration knobs (train-time)
+  double tempThr;
+  double tempTurn;
+  double epsilon;
+  final double entropyBeta;
 
   // two-stage knobs
-  final bool twoStage;                 // if true, use planner/controller
-  final int planHold;                  // frames to hold an intent
-  final double tempIntent;             // temperature for intent sampling
-  final double intentEntropyBeta;      // entropy on intent head
+  final bool twoStage; // if true, use planner/controller
+  final int planHold; // frames to hold an intent
+  final double tempIntent; // temperature for intent sampling
+  final double intentEntropyBeta; // entropy on intent head
 
-  // learned controller switch/blend (usually off early in training)
-  final bool useLearnedController;     // use action heads to drive controls
-  final double blendPolicy;            // 0=heuristic, 1=policy (simple blend gate)
+  // learned controller switch/blend
+  final bool useLearnedController; // use action heads to drive controls
+  final double blendPolicy; // 0=heuristic, 1=policy
 
-  // segmenting
-  final int segHardMax;    // hard cap frames per segment
-  final int segMin;        // minimum frames before allowing a boundary
-  int _segmentsFlushed = 0;
+  // early supervision strengths (configurable)
+  final double intentAlignWeight;
+  final double actionAlignWeight;
+
+  // online feature normalization (optional)
+  final RunningNorm? norm;
 
   Trainer({
     required this.env,
     required this.fe,
     required this.policy,
-    this.dt = 1/60.0,
+    this.dt = 1 / 60.0,
     this.gamma = 0.99,
     int seed = 7,
+    this.tempThr = 1.0,
+    this.tempTurn = 1.0,
+    this.epsilon = 0.0,
+    this.entropyBeta = 0.0,
     // two-stage defaults
     this.twoStage = true,
     this.planHold = 1,
@@ -886,21 +1223,26 @@ class Trainer {
     // learned controller defaults
     this.useLearnedController = false,
     this.blendPolicy = 1.0,
-    // segment settings (works well in practice)
-    this.segHardMax = 150,
-    this.segMin = 50,
-  }) : rnd = math.Random(seed);
+    // supervision defaults
+    this.intentAlignWeight = 0.25,
+    this.actionAlignWeight = 0.0,
+    // normalize features
+    bool normalizeFeatures = true,
+  })  : rnd = math.Random(seed),
+        norm = normalizeFeatures
+            ? RunningNorm(fe.inputSize, momentum: 0.995)
+            : null;
 
   bool shouldBrakeNow(eng.GameEngine env, {double margin = 40.0}) {
     final L = env.lander;
     final padX = L.pos.x;
     final groundY = env.terrain.heightAt(padX);
-    final height = groundY - L.pos.y;     // px above ground
-    final vy = L.vel.y;                   // +down, px/s
+    final height = groundY - L.pos.y; // px above ground
+    final vy = L.vel.y; // +down, px/s
 
     // Effective upward decel capability (px/s^2)
-    final aThrust = env.cfg.t.thrustAccel;  // engine upward accel
-    final g       = env.cfg.t.gravity;      // downward accel
+    final aThrust = env.cfg.t.thrustAccel; // engine upward accel
+    final g = env.cfg.t.gravity; // downward accel
     final a = (aThrust - g).clamp(1e-6, 1e9);
 
     if (vy <= 8.0) return false;
@@ -911,14 +1253,219 @@ class Trainer {
     return (stopDist + margin) >= height;
   }
 
-  // Height-based envelope (duplicate of scoring helper; local quick version)
-  double _vyMaxForHeight(double h) {
-    if (h > 260) return 60;
-    if (h > 160) return 40;
-    if (h > 100) return 25;
-    if (h >  50) return 14;
-    return 8;
+  /* --------------------------- Pretraining on snapshots --------------------------- */
+
+  void debugMicroOverfitIntent({
+    int perClass = 10,
+    int steps = 600,
+    double lr = 0.02,
+    double alignWeight = 10.0,
+    int seed = 42,
+  }) {
+    // (left empty here to keep file tight — optional helper)
   }
+
+  Map<String, double> pretrainIntentOnSnapshots({
+    int samples = 6000,
+    int epochs = 3,
+    double lr = 5e-4,
+    double alignWeight = 3.0,
+    int seed = 1337,
+  }) {
+    final rng = math.Random(seed);
+    final K = PolicyNetwork.kIntents;
+    final targetPerClass = (samples / K).ceil();
+
+    // Balanced buffers
+    final xsByK = List.generate(K, (_) => <List<double>>[]);
+    final ysByK = List.generate(K, (_) => <int>[]);
+
+    // Helper: set lander to a synthetic but plausible state
+    void _setState({
+      required double x,
+      required double height,
+      required double vx,
+      required double vy,
+    }) {
+      final gy = env.terrain.heightAt(x);
+      final y = (gy - height).clamp(0.0, env.cfg.worldH - 10.0);
+      env.lander.pos.x = x.clamp(10.0, env.cfg.worldW - 10.0);
+      env.lander.pos.y = y;
+      env.lander.vel.x = vx;
+      env.lander.vel.y = vy;
+      env.lander.angle = 0.0;
+      env.lander.fuel = env.cfg.t.maxFuel;
+    }
+
+    // Deterministic terrain so labels are stable
+    env.reset(seed: 123456);
+
+    // Attempt to synthesize one sample for a target intent; accept only if predictive label agrees
+    bool _synthOneFor(int intentIdx, math.Random r) {
+      final padCx = env.terrain.padCenter.toDouble();
+      final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
+          .clamp(12.0, env.cfg.worldW.toDouble());
+
+      // draw a synthetic prototype per intent (loose ranges)
+      double x = padCx, h = 180, vx = 0, vy = 20;
+      switch (intentIdx) {
+      // 0:hoverCenter, 1:goLeft, 2:goRight, 3:descendSlow, 4:brakeUp
+        case 1: // goLeft
+          x = padCx + (0.90 + 0.08 * r.nextDouble()) * padHalfW;
+          h = 140 + 140 * r.nextDouble();
+          vx = 40 + 50 * r.nextDouble();
+          vy = 25 + 35 * r.nextDouble();
+          break;
+        case 2: // goRight
+          x = padCx - (0.90 + 0.08 * r.nextDouble()) * padHalfW;
+          h = 140 + 140 * r.nextDouble();
+          vx = -(40 + 50 * r.nextDouble());
+          vy = 25 + 35 * r.nextDouble();
+          break;
+        case 3: // descendSlow
+          x = padCx + (r.nextDouble() * 0.05 - 0.025) * padHalfW;
+          h = 0.55 * env.cfg.worldH + 0.20 * env.cfg.worldH * r.nextDouble();
+          vx = (r.nextDouble() * 24.0) - 12.0;
+          vy = 24.0 + 12.0 * r.nextDouble();
+          break;
+        case 4: // brakeUp
+          x = padCx + (r.nextDouble() * 0.05 - 0.025) * padHalfW;
+          h = 40.0 + 50.0 * r.nextDouble(); // 40–90 px above ground
+          vx = (r.nextDouble() * 14.0) - 7.0;
+          vy = 120.0 + 50.0 * r.nextDouble(); // 120–170 px/s down
+          break;
+        case 0: // hoverCenter
+        default:
+          x = padCx + (r.nextDouble() * 0.03 - 0.015) * padHalfW;
+          h = 0.20 * env.cfg.worldH + 0.15 * env.cfg.worldH * r.nextDouble();
+          vx = (r.nextDouble() * 10.0) - 5.0;
+          vy = (r.nextDouble() * 10.0) - 5.0;
+          break;
+      }
+
+      _setState(x: x, height: h, vx: vx, vy: vy);
+
+      // Predictive label must match the desired intent for acceptance
+      final y = predictiveIntentLabelAdaptive(
+        env,
+        baseTauSec: 1.0,
+        minTauSec: 0.45,
+        maxTauSec: 1.35,
+      );
+      if (y != intentIdx) return false;
+
+      final feat = fe.extract(env);
+      xsByK[intentIdx].add(feat);
+      ysByK[intentIdx].add(intentIdx);
+      return true;
+    }
+
+    // Collect balanced dataset with bounded attempts per class (prevents hangs)
+    const maxAttemptsPerClass = 20000;
+    for (int k = 0; k < K; k++) {
+      int attempts = 0;
+      while (xsByK[k].length < targetPerClass &&
+          attempts < maxAttemptsPerClass) {
+        _synthOneFor(k, rng);
+        attempts++;
+      }
+      if (xsByK[k].isEmpty) {
+        // In a pinch, copy some neighbors to avoid empty class
+        final fallback = (k == 0 ? 3 : 0);
+        while (xsByK[k].length < math.max(16, targetPerClass ~/ 4) &&
+            xsByK[fallback].isNotEmpty) {
+          xsByK[k].add(List<double>.from(
+              xsByK[fallback][rng.nextInt(xsByK[fallback].length)]));
+          ysByK[k].add(k);
+        }
+      }
+    }
+
+    // Flatten & shuffle
+    final xs = <List<double>>[];
+    final ys = <int>[];
+    for (int k = 0; k < K; k++) {
+      xs.addAll(xsByK[k]);
+      ys.addAll(ysByK[k]);
+    }
+    final N = xs.length;
+    final perm = List<int>.generate(N, (i) => i)..shuffle(rng);
+    final xsShuf = List<List<double>>.generate(N, (i) => xs[perm[i]]);
+    final ysShuf = List<int>.generate(N, (i) => ys[perm[i]]);
+
+    // Warm up normalizer on data, then freeze
+    for (final x in xsShuf) {
+      _maybeNorm(x, update: true);
+    }
+
+    // Train CE-only on intent head
+    const B = 64;
+    for (int ep = 0; ep < epochs; ep++) {
+      perm.shuffle(rng);
+      for (int off = 0; off < N; off += B) {
+        final end = math.min(off + B, N);
+        final decisionCaches = <_Forward>[];
+        final intentChoices = <int>[];
+        final decisionReturns = <double>[];
+        final alignLabels = <int>[];
+
+        for (int i = off; i < end; i++) {
+          final idx = perm[i];
+          final xN = _maybeNorm(xs[idx], update: false);
+          final (_pred, _p, cache) = policy.actIntentGreedy(xN);
+          decisionCaches.add(cache);
+          intentChoices.add(ys[idx]);
+          decisionReturns.add(cache.v); // A=0 trick
+          alignLabels.add(ys[idx]);
+        }
+
+        policy.updateFromEpisode(
+          decisionCaches: decisionCaches,
+          intentChoices: intentChoices,
+          decisionReturns: decisionReturns,
+          alignLabels: alignLabels,
+          alignWeight: alignWeight,
+          lr: lr,
+          entropyBeta: 0.0,
+          valueBeta: 0.0,
+          huberDelta: 1.0,
+          intentMode: true,
+        );
+      }
+    }
+
+    // Evaluate & confusion
+    final conf = List.generate(K, (_) => List<int>.filled(K, 0));
+    final counts = List<int>.filled(K, 0);
+    int correct = 0;
+    for (int i = 0; i < N; i++) {
+      final xN = _maybeNorm(xsShuf[i], update: false);
+      final (pred, _p, _cache) = policy.actIntentGreedy(xN);
+      final y = ysShuf[i];
+      counts[y] += 1;
+      conf[y][pred] += 1;
+      if (pred == y) correct++;
+    }
+    final acc = N == 0 ? 0.0 : correct / N;
+
+    print('Pretrain confusion (rows=label, cols=pred):');
+    for (int r = 0; r < K; r++) {
+      final row =
+      List.generate(K, (c) => conf[r][c].toString().padLeft(4)).join(' ');
+      final rowAcc = counts[r] == 0 ? 0.0 : conf[r][r] / counts[r];
+      print(
+          '${kIntentNames[r].padRight(12)} | $row   (acc=${(rowAcc * 100).toStringAsFixed(1)}%  n=${counts[r]})');
+    }
+
+    return {'acc': acc, 'n': N.toDouble()};
+  }
+
+  List<double> _maybeNorm(List<double> x, {bool update = true}) {
+    if (norm == null) return x;
+    return norm!.normalize(x, update: update);
+  }
+
+  /* ----------------------------------- Run episode ----------------------------------- */
 
   EpisodeResult runEpisode({
     bool train = true,
@@ -928,256 +1475,329 @@ class Trainer {
     double valueBeta = 0.5,
     double huberDelta = 1.0,
   }) {
-    // Reset per-episode extractor state
-    fe.reset();
+    if (!twoStage) {
+      // ----------------------- Single-stage path (legacy) -----------------------
+      final caches = <_Forward>[];
+      final actions = <List<int>>[];
+      final costs = <double>[];
 
-    // ----------------------- Two-stage path (planner/controller) --------------
-    final decisionCaches = <_Forward>[];   // at decision points
-    final intentChoices  = <int>[];
-    final decisionRewards = <double>[];    // summed -cost between decisions
-    final heuristicLabels = <int>[];       // optional small assist
-    final actionLabels    = <List<int>>[]; // supervisor controls for distillation (optional)
+      int turnSteps = 0, leftSteps = 0, rightSteps = 0, thrustSteps = 0;
+      double thrProbSum = 0.0;
 
-    final intentCounts = List<int>.filled(PolicyNetwork.kIntents, 0);
-    int intentSwitches = 0;
+      while (true) {
+        var x = fe.extract(env);
+        x = _maybeNorm(x, update: true);
 
-    // Per-frame accumulators for the *current* segment
-    double segRewardAcc = 0.0;
-    int segLen = 0;
-    bool segTerminal = false;
-
-    double totalCost = 0.0;
-
-    int t = 0;
-    int framesLeft = 0;
-    int currentIntentIdx = -1;
-
-    // helpers
-    void _startNewDecision(int idx, _Forward cache, {int? heurLab, List<int>? actionLab}) {
-      decisionCaches.add(cache);
-      intentChoices.add(idx);
-      if (heurLab != null) heuristicLabels.add(heurLab); else heuristicLabels.add(-1);
-      if (actionLab != null) actionLabels.add(actionLab); else actionLabels.add(const [0,0,0]);
-      // Close previous segment (if any) by pushing its summed reward
-      if (decisionRewards.length < decisionCaches.length - 1) {
-        decisionRewards.add(segRewardAcc);
-        segRewardAcc = 0.0;
-        segLen = 0;
-      }
-    }
-
-    while (true) {
-      final L = env.lander;
-
-      // Decide intent when needed
-      if (framesLeft <= 0) {
-        final xPlan = fe.extract(env);
-        int idx; List<double> probs; _Forward cache;
+        bool th, lf, rt;
+        _Forward cache;
+        List<double> probs;
 
         if (greedy) {
-          final res = policy.actIntentGreedy(xPlan);
-          idx = res.$1; probs = res.$2; cache = res.$3;
+          final res = policy.actGreedy(x);
+          th = res.$1;
+          lf = res.$2;
+          rt = res.$3;
+          probs = res.$4;
+          cache = res.$5;
         } else {
-          final res = policy.actIntent(xPlan, rnd, tempIntent: tempIntent, epsilon: 0.0);
-          idx = res.$1; probs = res.$2; cache = res.$3;
+          final res = policy.act(
+            x,
+            rnd,
+            tempThr: tempThr,
+            tempTurn: tempTurn,
+            epsilon: epsilon,
+          );
+          th = res.$1;
+          lf = res.$2;
+          rt = res.$3;
+          probs = res.$4;
+          cache = res.$5;
         }
 
-        // physics-based brake override (safety)
-        if (shouldBrakeNow(env, margin: 50.0)) {
-          idx = intentToIndex(Intent.brakeUp);
-          probs = List<double>.filled(PolicyNetwork.kIntents, 0.0)..[idx] = 1.0;
+        thrProbSum += probs[0];
+        if (lf || rt) turnSteps++;
+        if (lf) leftSteps++;
+        if (rt) rightSteps++;
+        if (th) thrustSteps++;
+
+        final info = env.step(
+          dt,
+          et.ControlInput(thrust: th, left: lf, right: rt),
+        );
+
+        final s = info.scoreDelta;
+        final stepCost = scoreIsReward ? -s : s;
+
+        caches.add(cache);
+        actions.add([th ? 1 : 0, lf ? 1 : 0, rt ? 1 : 0]);
+        costs.add(stepCost);
+
+        if (info.terminal || caches.length > 4000) break;
+      }
+
+      final R = List<double>.filled(costs.length, 0.0);
+      double running = 0.0;
+      for (int i = costs.length - 1; i >= 0; i--) {
+        final reward = -costs[i];
+        running = reward + gamma * running;
+        R[i] = running;
+      }
+
+      if (train && caches.isNotEmpty) {
+        policy.updateFromEpisode(
+          caches: caches,
+          actions: actions,
+          returns_: R,
+          lr: lr,
+          entropyBeta: entropyBeta,
+          valueBeta: valueBeta,
+          huberDelta: huberDelta,
+          intentMode: false, // single-stage uses false
+        );
+      }
+
+      final landed = env.status == et.GameStatus.landed;
+      final totalCost = costs.fold(0.0, (a, b) => a + b);
+      final avgThrProb = costs.isEmpty ? 0.0 : (thrProbSum / costs.length);
+
+      return EpisodeResult(
+        totalCost,
+        costs.length,
+        landed,
+        turnSteps: turnSteps,
+        leftSteps: leftSteps,
+        rightSteps: rightSteps,
+        thrustSteps: thrustSteps,
+        avgThrProb: avgThrProb,
+      );
+    } else {
+      // ----------------------- Two-stage path (planner/controller) --------------
+      final decisionCaches = <_Forward>[];
+      final intentChoices = <int>[];
+      final decisionTimes = <int>[];
+      final costs = <double>[];
+
+      // Heuristic intent labels (for auxiliary alignment)
+      final heuristicLabels = <int>[];
+
+      // Action labels for distillation of the controller
+      final actionLabels = <List<int>>[];
+
+      final intentCounts = List<int>.filled(PolicyNetwork.kIntents, 0);
+      int intentSwitches = 0;
+
+      int t = 0;
+      int framesLeft = 0;
+      int currentIntentIdx = -1;
+
+      while (true) {
+        if (framesLeft <= 0) {
+          // Decide intent
+          var xPlan = fe.extract(env);
+          xPlan = _maybeNorm(xPlan, update: true);
+
+          int idx;
+          List<double> probs;
+          _Forward cache;
+
+          if (greedy) {
+            final res = policy.actIntentGreedy(xPlan);
+            idx = res.$1;
+            probs = res.$2;
+            cache = res.$3;
+          } else {
+            final res =
+            policy.actIntent(xPlan, rnd, tempIntent: tempIntent, epsilon: epsilon);
+            idx = res.$1;
+            probs = res.$2;
+            cache = res.$3;
+          }
+
+          // physics-based brake override (safety)
+          if (shouldBrakeNow(env, margin: 50.0)) {
+            idx = intentToIndex(Intent.brakeUp);
+            probs = List<double>.filled(PolicyNetwork.kIntents, 0.0)..[idx] = 1.0;
+          }
+
+          // Hysteresis: avoid switching to descendSlow prematurely
+          if (currentIntentIdx == -1) currentIntentIdx = idx;
+          if (idx == intentToIndex(Intent.descendSlow)) {
+            final L = env.lander;
+            final padCx = env.terrain.padCenter.toDouble();
+            final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
+                .clamp(1.0, env.cfg.worldW.toDouble());
+            final dx = L.pos.x - padCx;
+            final vx = L.vel.x;
+
+            final tauHys = 1.0;
+            final dxf = dx + vx * tauHys;
+            final dxfN = (dxf.abs() / padHalfW);
+
+            const dxInnerStrict = 0.15;
+            const vxSmallStrict = 14.0;
+
+            final wasLateral =
+                (currentIntentIdx == intentToIndex(Intent.goLeft)) ||
+                    (currentIntentIdx == intentToIndex(Intent.goRight));
+            final centeredEnough =
+                (dxfN < dxInnerStrict) && (vx.abs() < vxSmallStrict);
+
+            if (wasLateral && !centeredEnough) {
+              idx = currentIntentIdx;
+            }
+          }
+
+          currentIntentIdx = idx;
+          decisionCaches.add(cache);
+          intentChoices.add(idx);
+          decisionTimes.add(t);
+          framesLeft = planHold;
+
+          // DIAGNOSTICS
+          intentCounts[idx] += 1;
+          if (intentChoices.length >= 2 &&
+              intentChoices.last != intentChoices[intentChoices.length - 2]) {
+            intentSwitches += 1;
+          }
+
+          // Heuristic intent label (for auxiliary alignment)
+          heuristicLabels.add(heuristicIntentLabel(env));
+
+          // (Optional) Publish intent to UI
+          IntentBus.instance.publishIntent(
+            IntentEvent(
+              intent: kIntentNames[idx],
+              probs: probs,
+              step: t,
+              meta: {'episode_step': t, 'plan_hold': planHold},
+            ),
+          );
         }
 
-        // Hysteresis: avoid switching to descendSlow too early if still off-center
-        if (currentIntentIdx == -1) currentIntentIdx = idx; // guard first
-        if (idx == intentToIndex(Intent.descendSlow)) {
-          final padCx = env.terrain.padCenter.toDouble();
-          final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
-              .clamp(1.0, env.cfg.worldW.toDouble());
-          final dx = L.pos.x - padCx;
-          final vx = L.vel.x;
+        final intent = indexToIntent(currentIntentIdx);
 
-          final tauHys = 1.0; // match predictive horizon
-          final dxf = dx + vx * tauHys;
-          final dxfN = (dxf.abs() / padHalfW);
+        // Teacher (heuristic) control:
+        final uHeur = controllerForIntent(intent, env);
 
-          const dxInnerStrict = 0.15;
-          const vxSmallStrict = 14.0;
+        // Policy action heads (student) control:
+        et.ControlInput uPol;
+        {
+          var xAct = fe.extract(env);
+          xAct = _maybeNorm(xAct, update: true);
+          final res = policy.actGreedy(xAct);
+          uPol = et.ControlInput(thrust: res.$1, left: res.$2, right: res.$3);
+        }
 
-          final wasLateral = (currentIntentIdx == intentToIndex(Intent.goLeft)) ||
-              (currentIntentIdx == intentToIndex(Intent.goRight));
-          final centeredEnough = (dxfN < dxInnerStrict) && (vx.abs() < vxSmallStrict);
-
-          if (wasLateral && !centeredEnough) {
-            // hold previous lateral
-            idx = currentIntentIdx;
+        // Choose control (blend/simple gate)
+        et.ControlInput u = uHeur;
+        if (useLearnedController) {
+          if (blendPolicy >= 1.0) {
+            u = uPol;
+          } else if (blendPolicy <= 0.0) {
+            u = uHeur;
+          } else {
+            // Simple gate blend: policy decides turns, heuristic decides thrust
+            final usePolicyTurns = blendPolicy >= 0.5;
+            final thrust = (blendPolicy >= 0.5) ? uPol.thrust : uHeur.thrust;
+            final left = usePolicyTurns ? uPol.left : uHeur.left;
+            final right = usePolicyTurns ? uPol.right : uHeur.right;
+            u = et.ControlInput(thrust: thrust, left: left, right: right);
           }
         }
 
-        // Segment boundary by intent change: push accumulated reward for old segment
-        if (decisionCaches.isNotEmpty && idx != currentIntentIdx) {
-          decisionRewards.add(segRewardAcc);
-          segRewardAcc = 0.0;
-          segLen = 0;
-          intentSwitches += 1;
+        // Log teacher labels for distillation (once per decision step)
+        if (framesLeft == planHold) {
+          actionLabels
+              .add([uHeur.thrust ? 1 : 0, uHeur.left ? 1 : 0, uHeur.right ? 1 : 0]);
         }
 
-        currentIntentIdx = idx;
-        framesLeft = planHold;
+        // (Optional) Publish control to UI
+        IntentBus.instance.publishControl(
+          ControlEvent(
+            thrust: u.thrust,
+            left: u.left,
+            right: u.right,
+            step: t,
+            meta: {'intent': kIntentNames[currentIntentIdx]},
+          ),
+        );
 
-        // DIAGNOSTICS
-        intentCounts[idx] += 1;
+        final info = env.step(
+          dt,
+          et.ControlInput(
+            thrust: u.thrust,
+            left: u.left,
+            right: u.right,
+            intentIdx: currentIntentIdx,
+          ),
+        );
+        final s = info.scoreDelta;
+        costs.add(scoreIsReward ? -s : s);
 
-        // Optional: heuristic label for mild alignment
-        final heurLab = heuristicIntentLabel(env);
-
-        // Action label for distillation (use teacher controller at decision time)
-        final teachU = controllerForIntent(indexToIntent(idx), env);
-        final actLab = [teachU.thrust ? 1 : 0, teachU.left ? 1 : 0, teachU.right ? 1 : 0];
-
-        _startNewDecision(idx, cache, heurLab: heurLab, actionLab: actLab);
-
-        // (Optional) Publish intent to UI
-        IntentBus.instance.publishIntent(IntentEvent(
-          intent: kIntentNames[idx],
-          probs: probs,
-          step: t,
-          meta: {'episode_step': t, 'plan_hold': planHold},
-        ));
+        framesLeft -= 1;
+        t += 1;
+        if (info.terminal || t > 4000) break;
       }
 
-      // Low-level control
-      final intent = indexToIntent(currentIntentIdx);
-      final uHeur = controllerForIntent(intent, env);
-
-      // Policy action heads (student) control:
-      et.ControlInput uPol;
-      {
-        final res = policy.actGreedy(fe.extract(env));
-        uPol = et.ControlInput(thrust: res.$1, left: res.$2, right: res.$3);
+      // reward-to-go for each step
+      final R = List<double>.filled(costs.length, 0.0);
+      double running = 0.0;
+      for (int i = costs.length - 1; i >= 0; i--) {
+        final reward = -costs[i];
+        running = reward + gamma * running;
+        R[i] = running;
       }
 
-      // Choose control (blend/simple gate)
-      et.ControlInput u = uHeur;
-      if (useLearnedController) {
-        if (blendPolicy >= 1.0) {
-          u = uPol;
-        } else if (blendPolicy <= 0.0) {
-          u = uHeur;
-        } else {
-          // Simple gate blend: policy decides turns, heuristic decides thrust
-          final usePolicyTurns = blendPolicy >= 0.5;
-          final thrust = (blendPolicy >= 0.5) ? uPol.thrust : uHeur.thrust;
-          final left   = usePolicyTurns ? uPol.left  : uHeur.left;
-          final right  = usePolicyTurns ? uPol.right : uHeur.right;
-          u = et.ControlInput(thrust: thrust, left: left, right: right);
+      // returns at decision times
+      final decisionReturns = <double>[];
+      for (final ti in decisionTimes) {
+        final idx = ti.clamp(0, R.length - 1);
+        decisionReturns.add(R[idx]);
+      }
+
+      // Normalize decision returns (stabilize PG scale)
+      if (decisionReturns.isNotEmpty) {
+        final mu =
+            decisionReturns.reduce((a, b) => a + b) / decisionReturns.length;
+        double var0 = 0.0;
+        for (final v in decisionReturns) {
+          final d = v - mu;
+          var0 += d * d;
+        }
+        var0 /= math.max(1, decisionReturns.length - 1);
+        final sd = math.sqrt(var0 + 1e-8);
+        for (int i = 0; i < decisionReturns.length; i++) {
+          decisionReturns[i] = (decisionReturns[i] - mu) / sd;
         }
       }
 
-      // (Optional) Publish control to UI
-      IntentBus.instance.publishControl(ControlEvent(
-        thrust: u.thrust, left: u.left, right: u.right, step: t,
-        meta: {'intent': kIntentNames[currentIntentIdx]},
-      ));
+      if (train && decisionCaches.isNotEmpty) {
+        policy.updateFromEpisode(
+          decisionCaches: decisionCaches,
+          intentChoices: intentChoices,
+          decisionReturns: decisionReturns,
+          alignLabels: heuristicLabels,
+          alignWeight: intentAlignWeight, // configurable
+          actionLabels: actionLabels,
+          actionAlignWeight: actionAlignWeight,
+          lr: lr,
+          entropyBeta: intentEntropyBeta,
+          valueBeta: valueBeta,
+          huberDelta: huberDelta,
+          intentMode: true,
+        );
+      }
 
-      final info = env.step(
-        dt,
-        et.ControlInput(
-          thrust: u.thrust,
-          left: u.left,
-          right: u.right,
-          intentIdx: currentIntentIdx,
-        ),
+      final landed = env.status == et.GameStatus.landed;
+      final totalCost = costs.fold(0.0, (a, b) => a + b);
+
+      return EpisodeResult(
+        totalCost,
+        costs.length,
+        landed,
+        intentCounts: intentCounts,
+        intentSwitches: intentSwitches,
       );
-
-      final s = info.scoreDelta;            // >=0 (cost)
-      final reward = scoreIsReward ? -s : -s; // reward is -cost
-      segRewardAcc += reward;
-      totalCost += s;
-
-      // Segment boundary heuristics in addition to intent change:
-      // 1) Hard cap length
-      // 2) Violated descent envelope badly
-      // 3) Thrust+turn sustained too long (ping-pong pattern)
-      bool boundary = false;
-      segLen += 1;
-
-      final groundY = env.terrain.heightAt(env.lander.pos.x);
-      final height = groundY - env.lander.pos.y;
-      final vy = env.lander.vel.y;
-      final vyMax = _vyMaxForHeight(height);
-      final thrustTurn = u.thrust && (u.left || u.right);
-
-      if (segLen >= segHardMax) boundary = true;
-      if (vy > vyMax + 14.0 && segLen >= segMin) boundary = true;
-      if (thrustTurn && segLen >= segMin && (segLen % 12 == 0)) boundary = true;
-
-      framesLeft -= 1;
-      t += 1;
-
-      if (info.terminal || t > 4000) {
-        segTerminal = true;
-        // Close the final segment reward
-        if (decisionRewards.length < decisionCaches.length) {
-          decisionRewards.add(segRewardAcc);
-          segRewardAcc = 0.0;
-        }
-        break;
-      }
-
-      if (boundary && decisionCaches.isNotEmpty) {
-        decisionRewards.add(segRewardAcc);
-        segRewardAcc = 0.0;
-        segLen = 0;
-
-        // force a new decision next frame
-        framesLeft = 0;
-      }
     }
-
-    // === Update after the whole episode (but with *segment* rewards used) ===
-    if (train && decisionCaches.isNotEmpty) {
-      // Bootstrap if not terminal (rare because we break at terminal, but keep logic)
-      final bool terminal = env.status != et.GameStatus.playing;
-      final bool bootstrap = !terminal;
-      final double bootstrapV = 0.0; // if you want, compute V(s_end) when !terminal
-
-      // Keep supervised assists small during RL
-      final double alignWeight = 0.02;
-      final double actionAlignWeight = 0.0; // off by default; turn on later if desired
-
-      policy.updateFromEpisode(
-        decisionCaches: decisionCaches,
-        intentChoices: intentChoices,
-        decisionRewards: decisionRewards,
-        gamma: gamma,
-        gaeLambda: 0.95,
-        bootstrap: bootstrap,
-        bootstrapV: bootstrapV,
-        alignLabels: heuristicLabels,
-        alignWeight: alignWeight,
-        actionLabels: actionLabels,
-        actionAlignWeight: actionAlignWeight,
-        lr: lr,
-        l2: 1e-6,
-        entropyBeta: intentEntropyBeta,
-        valueBeta: valueBeta,
-        huberDelta: huberDelta,
-      );
-
-      _segmentsFlushed += decisionCaches.length;
-      // (You can print occasionally if you like.)
-      // if ((_segmentsFlushed % 20) == 0) {
-      //   print('seg/upd: total=$_segmentsFlushed  last=${decisionCaches.length}');
-      // }
-    }
-
-    final landed = env.status == et.GameStatus.landed;
-
-    return EpisodeResult(
-      totalCost, t, landed,
-      intentCounts: intentCounts,
-      intentSwitches: intentSwitches,
-    );
   }
 }
