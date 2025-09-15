@@ -258,18 +258,23 @@ bool tryLoadPolicy(
 
 et.EngineConfig makeConfig({
   int seed = 42,
-  bool lockTerrain = false,
-  bool lockSpawn = false,
-  bool randomSpawnX = true,
+  bool lockTerrain = true,
+  bool lockSpawn = true,
+  bool randomSpawnX = false,
   double worldW = 800,
   double worldH = 600,
   double? maxFuel,
+  bool crashOnTilt = false,
 }) {
   final t = et.Tunables(
     gravity: 0.18,
     thrustAccel: 0.42,
     rotSpeed: 1.6,
     maxFuel: maxFuel ?? 1000.0,
+    crashOnTilt: crashOnTilt,
+    landingMaxVx: 28.0,
+    landingMaxVy: 38.0,
+    landingMaxOmega: 3.5,
   );
   return et.EngineConfig(
     worldW: worldW,
@@ -624,6 +629,101 @@ _PretrainIntentStats _pretrainIntentLocal({
   return _PretrainIntentStats(acc, N);
 }
 
+_PretrainIntentStats _mineAndFixDescendSlow({
+  required Trainer trainer,
+  required FeatureExtractor fe,
+  required eng.GameEngine env,
+  required PolicyNetwork policy,
+  int N = 6000,                 // how many mined samples we want
+  int epochs = 2,               // a couple small CE passes
+  double lr = 5e-4,
+  double weight = 3.0,          // upweight loss for this class
+  int seed = 42424,
+}) {
+  final r = math.Random(seed);
+  env.reset(seed: 777);
+  final xs = <List<double>>[];
+  final ys = <int>[]; // all = descendSlow label
+
+  // Mine: states where teacher==descendSlow but policy!=descendSlow
+  while (xs.length < N) {
+    final padCx = env.terrain.padCenter.toDouble();
+
+    // Randomize a *strong* descendSlow state that is unlikely to be brakeUp:
+    env.lander.pos.x = (padCx + (r.nextDouble() * 0.10 - 0.05) * env.cfg.worldW)
+        .clamp(10.0, env.cfg.worldW - 10.0);
+    final gy = env.terrain.heightAt(env.lander.pos.x);
+    final height = 160 + r.nextDouble() * 240;     // >120 to match teacher; well above brakeUp zone
+    env.lander.pos.y = (gy - height).clamp(0.0, env.cfg.worldH - 10.0);
+    env.lander.vel.x = (r.nextDouble() * 18.0) - 9.0;
+    env.lander.vel.y = 22.0 + r.nextDouble() * 20.0; // vy > 20, but not crazy (avoid brakeUp)
+    env.lander.angle = 0.0;
+    env.lander.fuel  = env.cfg.t.maxFuel;
+
+    final yTeacher = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
+    if (yTeacher != 3 /* descendSlow */) continue;
+
+    final x = fe.extract(env);
+
+    // See what policy thinks *before* training
+    final xN = trainer.norm?.normalize(x, update: false) ?? x;
+    final (pred, _p, _c) = policy.actIntentGreedy(xN);
+
+    // Keep hard negatives (pred≠descendSlow) and a bit of easy positives for stability
+    final keep = (pred != 3) || (r.nextDouble() < 0.25);
+    if (!keep) continue;
+
+    xs.add(x);
+    ys.add(3); // label is descendSlow
+  }
+
+  // Warm norm on this distro (safe even if already warm)
+  for (final x in xs) {
+    try { (trainer.norm as dynamic).observe(x); } catch (_) { trainer.norm?.normalize(x, update: true); }
+  }
+
+  // Train a bit on mined batch
+  final idxs = List<int>.generate(xs.length, (i) => i)..shuffle(r);
+  const B = 64;
+  for (int ep = 0; ep < epochs; ep++) {
+    idxs.shuffle(r);
+    for (int off = 0; off < xs.length; off += B) {
+      final end = math.min(off + B, xs.length);
+      final caches = <ForwardCache>[];
+      final labels = <int>[];
+      final returns = <double>[];
+      for (int i = off; i < end; i++) {
+        final xi = trainer.norm?.normalize(xs[idxs[i]], update: false) ?? xs[idxs[i]];
+        final (_pred, _p, cache) = policy.actIntentGreedy(xi);
+        caches.add(cache);
+        labels.add(3);          // descendSlow
+        returns.add(cache.v);
+      }
+      policy.updateFromEpisode(
+        decisionCaches: caches,
+        intentChoices: labels,
+        decisionReturns: returns,
+        alignLabels: labels,
+        alignWeight: weight,    // << upweight this class
+        lr: lr,
+        entropyBeta: 0.0,
+        valueBeta: 0.0,
+        huberDelta: 1.0,
+        intentMode: true,
+      );
+    }
+  }
+
+  // Train-set acc on mined data (sanity)
+  int correct = 0;
+  for (int i = 0; i < xs.length; i++) {
+    final xi = trainer.norm?.normalize(xs[i], update: false) ?? xs[i];
+    final (pred, _p, _c) = policy.actIntentGreedy(xi);
+    if (pred == 3) correct++;
+  }
+  return _PretrainIntentStats(correct / xs.length, xs.length);
+}
+
 /* ------------------------------------ main ------------------------------------ */
 
 void main(List<String> argv) {
@@ -661,6 +761,9 @@ void main(List<String> argv) {
 
   final determinism = args.getFlag('determinism_probe', def: true);
 
+  double bestMeanCost = double.infinity;
+  int bestCostIter = -1;
+
   final cfg = makeConfig(
     seed: seed,
     lockTerrain: lockTerrain,
@@ -693,6 +796,7 @@ void main(List<String> argv) {
   );
 
   // Try to load existing weights (+norm w/ signature guard)
+  /*
   tryLoadPolicy(
     'policy_pretrained.json',
     policy,
@@ -701,6 +805,8 @@ void main(List<String> argv) {
     env: env,
     ignoreLoadedNorm: ignoreLoadedNorm,
   );
+
+   */
 
   if (determinism) {
     env.reset(seed: 1234);
@@ -747,6 +853,35 @@ void main(List<String> argv) {
         seed: seed ^ 0xBEEF,
       );
       print('Intent pretrain → acc=${(st.acc*100).toStringAsFixed(1)}% n=${st.n}');
+
+      final stDescFix = _pretrainDescendSlowTargeted(
+        trainer: trainer,
+        fe: fe,
+        env: env,
+        policy: policy,
+        perBand: 2500,      // try 2500–4000 if needed
+        epochs: 2,
+        lr: pretrainLr,
+        weight: 3.5,
+        seed: seed ^ 0xFACE,
+      );
+      print('DescendSlow targeted fix → acc=${(stDescFix.acc*100).toStringAsFixed(1)}% n=${stDescFix.n}');
+
+      // After _pretrainIntentLocal(...) and any targeted passes:
+      calibrateIntentBiasToTeacher(
+        trainer: trainer, fe: fe, env: env, policy: policy,
+        N: 6000, iters: 50, lr: 0.5, seed: seed ^ 0xCA1,
+      );
+
+      /*
+      final mined = _mineAndFixDescendSlow(
+        trainer: trainer, fe: fe, env: env, policy: policy,
+        N: 6000, epochs: 2, lr: pretrainLr, weight: 3.0, seed: seed ^ 0xC0DE,
+      );
+      print('DescendSlow hard-neg fix → acc=${(mined.acc*100).toStringAsFixed(1)}% n=${mined.n}');
+
+       */
+
       savePolicy('policy_pretrained.json', policy, fe, env, norm: trainer.norm);
     }
 
@@ -796,12 +931,223 @@ void main(List<String> argv) {
     if ((it + 1) % 5 == 0) {
       final ev = evaluate(env: env, trainer: trainer, episodes: 40, seed: seed ^ (0x1111 * (it + 1)));
       print('Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}');
+      if (ev.meanCost < bestMeanCost) {
+        bestMeanCost = ev.meanCost;
+        bestCostIter = it + 1;
+        savePolicy('policy_best_cost.json', policy, fe, env, norm: trainer.norm);
+        print('★ New BEST by cost at iter ${it + 1}: meanCost=${ev.meanCost.toStringAsFixed(3)} → saved policy_best_cost.json');
+      }
       savePolicy('policy_iter_${it + 1}.json', policy, fe, env, norm: trainer.norm);
     }
   }
 
   savePolicy('policy_final.json', policy, fe, env, norm: trainer.norm);
   print('Training done. Saved → policy_final.json');
+}
+
+void calibrateIntentBiasToTeacher({
+  required Trainer trainer,
+  required FeatureExtractor fe,
+  required eng.GameEngine env,
+  required PolicyNetwork policy,
+  int N = 6000,
+  int iters = 40,
+  double lr = 0.35,
+  int seed = 777123,
+}) {
+  final r = math.Random(seed);
+  env.reset(seed: 4242);
+
+  final K = PolicyNetwork.kIntents;
+  final xsRaw = <List<double>>[];
+  final tCounts = List<int>.filled(K, 0);
+
+  // 1) Collect (raw) random snapshots + teacher labels
+  for (int i = 0; i < N; i++) {
+    final padCx = env.terrain.padCenter.toDouble();
+    env.lander.pos.x = (padCx + (r.nextDouble()*400 - 200)).clamp(10.0, env.cfg.worldW - 10.0);
+    final gy = env.terrain.heightAt(env.lander.pos.x);
+    env.lander.pos.y = (gy - (60 + 300*r.nextDouble())).clamp(0.0, env.cfg.worldH - 10.0);
+    env.lander.vel.x = r.nextDouble()*180 - 90;
+    env.lander.vel.y = r.nextDouble()*140 + 10;
+    env.lander.angle = 0.0;
+    env.lander.fuel  = env.cfg.t.maxFuel;
+
+    final y = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
+    tCounts[y] += 1;
+
+    xsRaw.add(fe.extract(env));
+  }
+
+  // 2) Build a *temporary* local norm on xsRaw (don’t touch trainer.norm)
+  final tmpNorm = RunningNorm(fe.inputSize, momentum: 0.995);
+  for (final x in xsRaw) { tmpNorm.normalize(x, update: true); }
+  final xs = xsRaw.map((x) => tmpNorm.normalize(x, update: false)).toList();
+
+  // 3) Teacher marginal
+  final eps = 1e-6;
+  final tMarg = List<double>.generate(K, (k) => (tCounts[k] + eps) / (N + K*eps));
+
+  // 4) Fit intent biases only: b_k += lr * (log(t_k) - log(pMean_k))
+  for (int it = 0; it < iters; it++) {
+    final pSum = List<double>.filled(K, 0.0);
+    for (final x in xs) {
+      final (_pred, p, _cache) = policy.actIntentGreedy(x);
+      for (int k = 0; k < K; k++) pSum[k] += p[k];
+    }
+    final pMean = pSum.map((s) => s / N).toList();
+    for (int k = 0; k < K; k++) {
+      final g = math.log(tMarg[k]) - math.log(pMean[k] + eps);
+      policy.b_intent[k] += lr * g;
+    }
+  }
+
+  print('Calibrated intent biases to teacher marginals on $N snapshots (local norm).');
+}
+
+_PretrainIntentStats _pretrainDescendSlowTargeted({
+  required Trainer trainer,
+  required FeatureExtractor fe,
+  required eng.GameEngine env,
+  required PolicyNetwork policy,
+  int perBand = 2500,          // how many hard examples to mine per band
+  int epochs = 2,
+  double lr = 5e-4,
+  double weight = 3.5,         // upweight this class
+  int seed = 60606,
+}) {
+  final r = math.Random(seed);
+  final xs = <List<double>>[];
+  final ys = <int>[];
+
+  env.reset(seed: 909090);
+
+  int minedBand1 = 0, minedBand2 = 0;
+
+  // helper: push a state if teacher=descendSlow AND model mispredicts as hover/brakeUp
+  bool _tryPush() {
+    final yTeach = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
+    if (yTeach != 3) return false;
+
+    final xRaw = fe.extract(env);
+    final xN = trainer.norm?.normalize(xRaw, update: false) ?? xRaw;
+    final (pred, _p, _c) = policy.actIntentGreedy(xN);
+
+    if (pred == 3) return false; // not hard
+    if (pred != 0 && pred != 4) return false; // keep only hover/brakeUp confusions
+
+    xs.add(xRaw);
+    ys.add(3);
+    return true;
+  }
+
+  // -----------------------------
+  // Band 1: close to pad, modest height, low vy (teacher would say descendSlow, model says hover)
+  // |dx| ∈ [0, 0.08W), height ∈ [130, 220], vy ∈ [20, 32]
+  // -----------------------------
+  while (minedBand1 < perBand) {
+    final padCx = env.terrain.padCenter.toDouble();
+    final W = env.cfg.worldW;
+    final H = env.cfg.worldH;
+
+    final sign = (r.nextBool() ? 1.0 : -1.0);
+    final dx = sign * (0.08 * W * r.nextDouble()); // |dx| < 0.08W
+    final px = (padCx + dx).clamp(10.0, W - 10.0);
+    final gy = env.terrain.heightAt(px);
+
+    final height = 130.0 + r.nextDouble() * 90.0;   // 130..220
+    final vy = 20.0 + r.nextDouble() * 12.0;        // 20..32
+    final vx = (r.nextDouble() * 16.0) - 8.0;
+
+    env.lander
+      ..pos.x = px
+      ..pos.y = (gy - height).clamp(0.0, H - 10.0)
+      ..vel.x = vx
+      ..vel.y = vy
+      ..angle = 0.0
+      ..fuel = env.cfg.t.maxFuel;
+
+    if (_tryPush()) minedBand1++;
+  }
+
+  // -----------------------------
+  // Band 2: close to pad, higher height, higher vy (model flips to brakeUp too early)
+  // |dx| ∈ [0, 0.08W), height ∈ [200, 320], vy ∈ [36, 60]
+  // -----------------------------
+  while (minedBand2 < perBand) {
+    final padCx = env.terrain.padCenter.toDouble();
+    final W = env.cfg.worldW;
+    final H = env.cfg.worldH;
+
+    final sign = (r.nextBool() ? 1.0 : -1.0);
+    final dx = sign * (0.08 * W * r.nextDouble());
+    final px = (padCx + dx).clamp(10.0, W - 10.0);
+    final gy = env.terrain.heightAt(px);
+
+    final height = 200.0 + r.nextDouble() * 120.0;  // 200..320
+    final vy = 36.0 + r.nextDouble() * 24.0;        // 36..60
+    final vx = (r.nextDouble() * 16.0) - 8.0;
+
+    env.lander
+      ..pos.x = px
+      ..pos.y = (gy - height).clamp(0.0, H - 10.0)
+      ..vel.x = vx
+      ..vel.y = vy
+      ..angle = 0.0
+      ..fuel = env.cfg.t.maxFuel;
+
+    if (_tryPush()) minedBand2++;
+  }
+
+  // Warm norm (safe even if already warm)
+  for (final x in xs) {
+    try { (trainer.norm as dynamic).observe(x); } catch (_) { trainer.norm?.normalize(x, update: true); }
+  }
+
+  // Train a couple epochs on the mined set
+  final N = xs.length;
+  final idx = List<int>.generate(N, (i) => i)..shuffle(r);
+  const B = 64;
+  for (int ep = 0; ep < epochs; ep++) {
+    idx.shuffle(r);
+    for (int off = 0; off < N; off += B) {
+      final end = math.min(off + B, N);
+      final caches = <ForwardCache>[];
+      final labels = <int>[];
+      final returns = <double>[];
+
+      for (int i = off; i < end; i++) {
+        final xi = trainer.norm?.normalize(xs[idx[i]], update: false) ?? xs[idx[i]];
+        final (_pred, _p, cache) = policy.actIntentGreedy(xi);
+        caches.add(cache);
+        labels.add(3); // descendSlow
+        returns.add(cache.v);
+      }
+
+      policy.updateFromEpisode(
+        decisionCaches: caches,
+        intentChoices: labels,
+        decisionReturns: returns,
+        alignLabels: labels,
+        alignWeight: weight,
+        lr: lr,
+        entropyBeta: 0.0,
+        valueBeta: 0.0,
+        huberDelta: 1.0,
+        intentMode: true,
+      );
+    }
+  }
+
+  // quick train-set acc
+  int correct = 0;
+  for (int i = 0; i < N; i++) {
+    final xi = trainer.norm?.normalize(xs[i], update: false) ?? xs[i];
+    final (pred, _p, _c) = policy.actIntentGreedy(xi);
+    if (pred == 3) correct++;
+  }
+
+  return _PretrainIntentStats(correct / N, N);
 }
 
 /* ----------------------------------- usage ------------------------------------

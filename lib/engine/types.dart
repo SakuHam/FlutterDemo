@@ -10,11 +10,20 @@ class Tunables {
   double rotSpeed;     // radians per second
   double maxFuel;      // fuel units
 
+  final bool crashOnTilt;           // if false, angle is ignored for touchdown safety
+  final double landingMaxVx;        // px/s horizontal speed allowed at contact
+  final double landingMaxVy;        // px/s downward speed allowed at contact
+  final double landingMaxOmega;     // rad/s allowed at contact (optional, can ignore)
+
   Tunables({
     this.gravity = 0.18,
     this.thrustAccel = 0.42,
     this.rotSpeed = 1.6,
     this.maxFuel = 1000.0,
+    this.crashOnTilt = true,        // old behavior = true
+    this.landingMaxVx = 28.0,
+    this.landingMaxVy = 38.0,
+    this.landingMaxOmega = 2.0,
   });
 
   Tunables copyWith({
@@ -22,12 +31,20 @@ class Tunables {
     double? thrustAccel,
     double? rotSpeed,
     double? maxFuel,
+    bool? crashOnTilt,
+    double? landingMaxVx,
+    double? landingMaxVy,
+    double? landingMaxOmega,
   }) {
     return Tunables(
       gravity: gravity ?? this.gravity,
       thrustAccel: thrustAccel ?? this.thrustAccel,
       rotSpeed: rotSpeed ?? this.rotSpeed,
       maxFuel: maxFuel ?? this.maxFuel,
+      crashOnTilt: crashOnTilt ?? this.crashOnTilt,
+      landingMaxVx: landingMaxVx ?? this.landingMaxVx,
+      landingMaxVy: landingMaxVy ?? this.landingMaxVy,
+      landingMaxOmega: landingMaxOmega ?? this.landingMaxOmega,
     );
   }
 }

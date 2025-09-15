@@ -13,6 +13,62 @@ double _clip(double x, double a, double b) => x < a ? a : (x > b ? b : x);
 
 /* ----------------------------- policy IO (+norm) ----------------------------- */
 
+bool _normLooksDegenerate(ai.RunningNorm norm) {
+  int tinyStd = 0;
+  for (int i = 0; i < norm.dim; i++) {
+    final v = norm.var_[i];
+    if (!v.isFinite || v <= 0) return true;
+    final std = math.sqrt(v);
+    if (std < 0.15) tinyStd++;
+    if (!norm.mean[i].isFinite || norm.mean[i].abs() > 5.0) return true;
+  }
+  // >25% of dims with tiny std? call it degenerate
+  return tinyStd > (norm.dim ~/ 4);
+}
+
+void warmLocalNormIfMissing({
+  required eng.GameEngine env,
+  required ai.FeatureExtractor fe,
+  required ai.RunningNorm norm,
+  int nSamples = 3500,
+  int seed = 424242,
+}) {
+  final r = math.Random(seed);
+  env.reset(seed: 777);
+  int accepted = 0;
+  // reset local norm
+  norm.inited = false;
+  norm.mean = List.filled(norm.dim, 0.0);
+  norm.var_  = List.filled(norm.dim, 1.0);
+
+  while (accepted < nSamples) {
+    final padCx = env.terrain.padCenter.toDouble();
+    env.lander.pos.x = (padCx + (r.nextDouble()*400 - 200)).clamp(10.0, env.cfg.worldW - 10.0);
+    final gy = env.terrain.heightAt(env.lander.pos.x);
+    env.lander.pos.y = (gy - (60 + 300*r.nextDouble())).clamp(0.0, env.cfg.worldH - 10.0);
+    env.lander.vel.x = r.nextDouble()*180 - 90;
+    env.lander.vel.y = r.nextDouble()*140 + 10;
+    env.lander.angle = 0.0;
+    env.lander.fuel  = env.cfg.t.maxFuel;
+
+    final x = fe.extract(env);
+    norm.normalize(x, update: true); // observe
+    accepted++;
+  }
+  print('Local norm warmed on-the-fly ($accepted samples).');
+}
+
+void _printNormSanity(ai.RunningNorm norm) {
+  double maxAbsMean = 0, maxStdErr = 0;
+  for (int i = 0; i < norm.dim; i++) {
+    final std = math.sqrt(math.max(norm.var_[i], 0.0));
+    maxAbsMean = math.max(maxAbsMean, norm.mean[i].abs());
+    maxStdErr = math.max(maxStdErr, (std - 1.0).abs());
+  }
+  print('--- Norm sanity ---');
+  print('max |mean| over dims = ${maxAbsMean.toStringAsFixed(3)}   max |std-1| = ${maxStdErr.toStringAsFixed(3)}');
+}
+
 bool tryLoadPolicyWithNorm(String path, ai.PolicyNetwork p, ai.RunningNorm norm) {
   final f = File(path);
   if (!f.existsSync()) {
@@ -157,54 +213,6 @@ et.EngineConfig makeConfig({
 }
 
 /* ------------------------------- norm utilities ------------------------------ */
-
-void _printNormSanity(ai.RunningNorm norm) {
-  // Max |mean| and Max |std-1|
-  double maxAbsMean = 0.0;
-  double maxStdMinus1 = 0.0;
-  for (int i = 0; i < norm.dim; i++) {
-    final m = norm.mean[i].abs();
-    final s = math.sqrt(math.max(norm.var_[i], 1e-12));
-    maxAbsMean = math.max(maxAbsMean, m);
-    maxStdMinus1 = math.max(maxStdMinus1, (s - 1.0).abs());
-  }
-  print('--- Norm sanity ---');
-  print('max |mean| over dims = ${maxAbsMean.toStringAsFixed(3)}   max |std-1| = ${maxStdMinus1.toStringAsFixed(3)}');
-}
-
-/// Warm the feature norm if nothing valid was loaded from disk.
-/// Uses randomized but plausible states (similar to Probe #1 state generator).
-void warmLocalNormIfMissing({
-  required eng.GameEngine env,
-  required ai.FeatureExtractor fe,
-  required ai.RunningNorm norm,
-  int nSamples = 3500,
-  int seed = 1234,
-}) {
-  if (norm.inited) return;
-  final rnd = math.Random(seed);
-
-  // Keep terrain fixed for stability of ground-derived features
-  env.reset(seed: 777);
-
-  for (int i = 0; i < nSamples; i++) {
-    final padCx = env.terrain.padCenter.toDouble();
-    env.lander.pos.x = _clip(padCx + (rnd.nextDouble() * 400 - 200), 10.0, env.cfg.worldW - 10.0);
-    final gy = env.terrain.heightAt(env.lander.pos.x);
-    env.lander.pos.y = _clip(gy - (60 + 300 * rnd.nextDouble()), 0.0, env.cfg.worldH - 10.0);
-    env.lander.vel.x = rnd.nextDouble() * 180 - 90;
-    env.lander.vel.y = rnd.nextDouble() * 140 + 10; // downward-ish
-    env.lander.angle = 0.0;
-    env.lander.fuel = env.cfg.t.maxFuel;
-
-    var x = fe.extract(env);
-    // update=true warms the statistics
-    norm.normalize(x, update: true);
-  }
-  norm.inited = true;
-  print('Local norm warmed on-the-fly ($nSamples samples).');
-  _printNormSanity(norm);
-}
 
 /* -------------------------------- probe #1 ----------------------------------- */
 /* Intent agreement on randomized snapshots (teacher = predictiveIntentLabelAdaptive)
@@ -475,6 +483,196 @@ void probeCECalibration({
   print('');
 }
 
+/* ------------------------------- probe #4 ----------------------------------- */
+/* DescendSlow failure analysis:
+   - Random snapshots → keep only teacher=descendSlow.
+   - Slice by bins of |dx|, height, vy (matching teacher thresholds).
+   - Show accuracy within each bin and which wrong class dominates.
+*/
+
+class _BinStats {
+  int n = 0, correct = 0;
+  final wrong = List<int>.filled(ai.PolicyNetwork.kIntents, 0);
+  double sumPDesc = 0.0;
+}
+
+void probeDescendSlowAnalysis({
+  required eng.GameEngine env,
+  required ai.FeatureExtractor fe,
+  required ai.PolicyNetwork policy,
+  required ai.RunningNorm norm,
+  int N = 4000,
+  int seed = 42424,
+}) {
+  final r = math.Random(seed);
+  env.reset(seed: 777);
+
+  // bins
+  final dxBins = <String, bool Function(double)>{
+    '<0.05W'   : (u) => u < 0.05,
+    '0.05–0.10W': (u) => u >= 0.05 && u < 0.10,
+    '0.10–0.15W': (u) => u >= 0.10 && u < 0.15,
+  };
+  final hBins = <String, bool Function(double)>{
+    '120–180' : (h) => h >= 120 && h < 180,
+    '180–260' : (h) => h >= 180 && h < 260,
+    '260+'    : (h) => h >= 260,
+  };
+  final vyBins = <String, bool Function(double)>{
+    '20–28' : (v) => v >= 20 && v < 28,
+    '28–36' : (v) => v >= 28 && v < 36,
+    '36+'   : (v) => v >= 36,
+  };
+
+  // 3D map: dxBin → hBin → vyBin → stats
+  final stats = <String, Map<String, Map<String, _BinStats>>>{};
+  for (final dk in dxBins.keys) {
+    stats[dk] = {};
+    for (final hk in hBins.keys) {
+      stats[dk]![hk] = {};
+      for (final vk in vyBins.keys) {
+        stats[dk]![hk]![vk] = _BinStats();
+      }
+    }
+  }
+
+  int kept = 0, drawn = 0;
+
+  while (drawn < N) {
+    drawn++;
+    final padCx = env.terrain.padCenter.toDouble();
+
+    // Randomize plausible snapshot
+    env.lander.pos.x = _clip(padCx + (r.nextDouble()*400 - 200), 10.0, env.cfg.worldW - 10.0);
+    final gy = env.terrain.heightAt(env.lander.pos.x);
+    env.lander.pos.y = _clip(gy - (60 + 300*r.nextDouble()), 0.0, env.cfg.worldH - 10.0);
+    env.lander.vel.x = r.nextDouble()*180 - 90;
+    env.lander.vel.y = r.nextDouble()*140 + 10; // downward-ish
+    env.lander.angle = 0.0;
+    env.lander.fuel  = env.cfg.t.maxFuel;
+
+    final yTeach = ai.predictiveIntentLabelAdaptive(env,
+        baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
+    if (yTeach != ai.intentToIndex(ai.Intent.descendSlow)) continue; // keep only teacher=descendSlow
+
+    // compute features to slice
+    final px = env.lander.pos.x.toDouble();
+    final py = env.lander.pos.y.toDouble();
+    final dxAbs = (px - padCx).abs();
+    final dxU = dxAbs / env.cfg.worldW; // fraction of W
+    final height = env.terrain.heightAt(px) - py;
+    final vy = env.lander.vel.y.toDouble();
+
+    String? dKey, hKey, vKey;
+    dxBins.forEach((k, f) { if (dKey == null && f(dxU)) dKey = k; });
+    hBins.forEach((k, f) { if (hKey == null && f(height)) hKey = k; });
+    vyBins.forEach((k, f) { if (vKey == null && f(vy)) vKey = k; });
+    if (dKey == null || hKey == null || vKey == null) continue;
+
+    // model prediction
+    var x = fe.extract(env);
+    x = norm.normalize(x, update: false);
+    final (pred, p, _c) = policy.actIntentGreedy(x);
+
+    final st = stats[dKey]![hKey]![vKey]!;
+    st.n += 1;
+    if (pred == yTeach) st.correct += 1; else st.wrong[pred] += 1;
+    st.sumPDesc += p[ai.intentToIndex(ai.Intent.descendSlow)];
+    kept++;
+  }
+
+  print('--- Probe #4: DescendSlow failure analysis (teacher=descendSlow only) ---');
+  print('Kept samples: $kept');
+
+  String _topWrong(List<int> wrong) {
+    int best = -1, idx = -1;
+    for (int i = 0; i < wrong.length; i++) {
+      if (wrong[i] > best) { best = wrong[i]; idx = i; }
+    }
+    if (best <= 0) return '-';
+    return '${ai.kIntentNames[idx]}($best)';
+  }
+
+  for (final dk in dxBins.keys) {
+    print('dx bin = $dk');
+    for (final hk in hBins.keys) {
+      final row = <String>[];
+      for (final vk in vyBins.keys) {
+        final st = stats[dk]![hk]![vk]!;
+        if (st.n == 0) { row.add('[n=0]'); continue; }
+        final acc = 100.0 * st.correct / st.n;
+        final pDesc = st.sumPDesc / st.n;
+        final topW = _topWrong(st.wrong);
+        row.add('[n=${st.n} acc=${acc.toStringAsFixed(1)}% pDesc=${pDesc.toStringAsFixed(2)} wrong=$topW]');
+      }
+      print('  h=$hk  |  ${row.join('  ')}');
+    }
+  }
+  print('');
+}
+
+/* ------------------------------- probe #5 ----------------------------------- */
+/* Intent head stats:
+   - Average probabilities per intent (global bias).
+   - Margin histogram: p(teacher) - max(other): how decisive the head is.
+*/
+
+void probeIntentHeadStats({
+  required eng.GameEngine env,
+  required ai.FeatureExtractor fe,
+  required ai.PolicyNetwork policy,
+  required ai.RunningNorm norm,
+  int N = 5000,
+  int seed = 10101,
+}) {
+  final r = math.Random(seed);
+  env.reset(seed: 123);
+
+  final K = ai.PolicyNetwork.kIntents;
+  final probSum = List<double>.filled(K, 0.0);
+  final countTeach = List<int>.filled(K, 0);
+  final margins = <double>[];
+
+  for (int i = 0; i < N; i++) {
+    final padCx = env.terrain.padCenter.toDouble();
+    env.lander.pos.x = _clip(padCx + (r.nextDouble()*400 - 200), 10.0, env.cfg.worldW - 10.0);
+    final gy = env.terrain.heightAt(env.lander.pos.x);
+    env.lander.pos.y = _clip(gy - (60 + 300*r.nextDouble()), 0.0, env.cfg.worldH - 10.0);
+    env.lander.vel.x = r.nextDouble()*180 - 90;
+    env.lander.vel.y = r.nextDouble()*140 + 10;
+    env.lander.angle = 0.0;
+    env.lander.fuel  = env.cfg.t.maxFuel;
+
+    final y = ai.predictiveIntentLabelAdaptive(env,
+        baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
+    countTeach[y]++;
+
+    var x = fe.extract(env);
+    x = norm.normalize(x, update: false);
+    final (_pred, p, _c) = policy.actIntentGreedy(x);
+    for (int k = 0; k < K; k++) probSum[k] += p[k];
+
+    // margin wrt teacher
+    double bestOther = -1e9;
+    for (int k = 0; k < K; k++) if (k != y) bestOther = math.max(bestOther, p[k]);
+    final m = p[y] - bestOther;
+    margins.add(m);
+  }
+
+  final probAvg = probSum.map((s) => s / N).toList();
+  double pct(double lo) => 100.0 * margins.where((m) => m < lo).length / margins.length;
+
+  print('--- Probe #5: Intent head calibration & margins ---');
+  print('Avg probs per intent:');
+  for (int k = 0; k < K; k++) {
+    print('  ${ai.kIntentNames[k].padRight(12)} : ${probAvg[k].toStringAsFixed(3)}   (teacher freq=${(100.0*countTeach[k]/N).toStringAsFixed(1)}%)');
+  }
+  margins.sort();
+  print('Margin pctiles (p(teacher)-max(other)):');
+  print('  <0.00: ${pct(0.00).toStringAsFixed(1)}%   <0.05: ${pct(0.05).toStringAsFixed(1)}%   <0.10: ${pct(0.10).toStringAsFixed(1)}%   <0.20: ${pct(0.20).toStringAsFixed(1)}%');
+  print('');
+}
+
 /* ------------------------------------ main ----------------------------------- */
 
 void main(List<String> argv) {
@@ -503,18 +701,17 @@ void main(List<String> argv) {
     print('No valid policy or norm found at policy_pretrained.json');
   }
 
-  // If the norm isn’t present/valid, warm it locally to keep probes meaningful.
-  if (!norm.inited) {
-    print('⚠️  No valid norm for current signature; warming LOCAL norm on-the-fly (3500 samples).');
-//    warmLocalNormIfMissing(env: env, fe: fe, norm: norm, nSamples: 3500);
-    var x = fe.extract(env);
-    norm.observe(x); // <— instead of norm.normalize(x, update:true)
-  } else {
-    _printNormSanity(norm);
+  if (!norm.inited || _normLooksDegenerate(norm)) {
+    print('⚠️  Loaded norm seems degenerate → warming LOCAL norm (3500 samples).');
+    warmLocalNormIfMissing(env: env, fe: fe, norm: norm, nSamples: 3500, seed: 424242);
   }
+  _printNormSanity(norm);
 
   // Probes
   probeIntentAgreement(env: env, fe: fe, policy: policy, norm: norm, N: 800);
   probeTeacherVsStudent(env: env, fe: fe, policy: policy, norm: norm, maxDecisions: 4000, planHold: 1);
   probeCECalibration(env: env, fe: fe, policy: policy, norm: norm, maxDecisions: 1600, planHold: 1);
+
+  probeDescendSlowAnalysis(env: env, fe: fe, policy: policy, norm: norm, N: 4000);
+  probeIntentHeadStats(env: env, fe: fe, policy: policy, norm: norm, N: 5000);
 }

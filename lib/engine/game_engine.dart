@@ -15,6 +15,17 @@ class GameEngine {
   Terrain? _frozenTerrain;
   double _lastAngle = 0.0;
 
+  // --- Autolevel heuristics (engine-local; no config changes required) ---
+  // Below this height, gently bias angle -> 0.
+  static const double _autoLevelBelow = 140.0;   // px
+  // Smooth pull toward level when under _autoLevelBelow.
+  static const double _autoLevelGain = 3.0;      // 1/sec
+  // Stronger snap right before contact (prevents tilt-induced crashes).
+  static const double _flareBelow = 40.0;        // px
+  static const double _flareGain = 8.0;          // 1/sec
+  // Tiny free-rotation damping when no turn input (stabilizes mid-air attitude).
+  static const double _rotFriction = 0.6;        // rad/sec toward 0
+
   GameEngine(this.cfg) : _rnd = math.Random(cfg.seed) {
     reset(seed: cfg.seed);
   }
@@ -91,8 +102,32 @@ class GameEngine {
     // ----- Controls -> rotation -----
     double angle = lander.angle;
     final rot = t.rotSpeed * 0.5;
+
+    // Player/agent torque
     if (u.left && !u.right) angle -= rot * dt;
     if (u.right && !u.left) angle += rot * dt;
+
+    // Small free-rotation damping if no active turn keys (prevents residual tilt drift)
+    if (!(u.left ^ u.right)) {
+      // pull angle a bit toward 0 each second
+      final pull = (_rotFriction * dt);
+      if (pull > 0.0) angle -= angle * pull.clamp(0.0, 0.5);
+    }
+
+    // ----- Altitude-aware autolevel & flare assist -----
+    // We use *predicted* horizontal position for height sampling after integration (see below),
+    // but an early read using current pos is already helpful to shape the torque now.
+    final gyNow = terrain.heightAt(lander.pos.x);
+    final hNow = (gyNow - lander.pos.y).toDouble();
+
+    if (hNow < _autoLevelBelow) {
+      final k = _autoLevelGain * dt;
+      angle -= angle * k.clamp(0.0, 0.5);
+    }
+    if (hNow < _flareBelow) {
+      final k = _flareGain * dt;
+      angle -= angle * k.clamp(0.0, 0.85); // stronger as we approach ground
+    }
 
     // ----- Acceleration & fuel -----
     Vector2 accel = Vector2(0, t.gravity * 0.05);
@@ -116,6 +151,15 @@ class GameEngine {
       lander.pos.x + vel.x * dt * s,
       lander.pos.y + vel.y * dt * s,
     );
+
+    // Re-evaluate height *after* integration; apply a last-moment flare snap if still above ground
+    final gyPost = terrain.heightAt(pos.x);
+    final hPost = (gyPost - pos.y).toDouble();
+    if (hPost < _flareBelow * 0.6) {
+      // Strong snap to 0 (still continuous to avoid numerical spikes)
+      final k = (_flareGain * 1.35) * dt;
+      angle -= angle * k.clamp(0.0, 0.95);
+    }
 
     // ----- Effort cost (optional: physics knows the power) -----
     double stepCost = 0.0;
