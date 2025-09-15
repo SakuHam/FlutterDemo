@@ -292,6 +292,7 @@ class Vector2 {
 }
 
 class LanderState {
+  final int seed = 12345;
   Vector2 pos;   // center of mass (px)
   Vector2 vel;   // px/s
   double angle;  // radians (0 = up)

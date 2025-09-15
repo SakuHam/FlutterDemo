@@ -42,6 +42,18 @@ String _feSignature({
   return 'gs=$groundSamples;stride=${stridePx.toStringAsFixed(2)};W=${worldW.toInt()};H=${worldH.toInt()}';
 }
 
+/* ------------------------------- norm update helper ----------------------------- */
+
+void _normUpdate(RunningNorm? norm, List<double> x) {
+  if (norm == null) return;
+  try {
+    // Prefer observe(x) if available
+    (norm as dynamic).observe(x);
+  } catch (_) {
+    norm.normalize(x, update: true);
+  }
+}
+
 /* ------------------------------- policy IO (json) ------------------------------ */
 
 Map<String, dynamic> _weightsToJson({
@@ -75,6 +87,7 @@ Map<String, dynamic> _weightsToJson({
     'signature': sig,
   };
 
+  // Save norm in BOTH formats (nested + top-level) for compatibility
   if (norm != null && norm.inited && norm.dim == p.inputSize) {
     m['norm'] = {
       'dim': norm.dim,
@@ -83,6 +96,10 @@ Map<String, dynamic> _weightsToJson({
       'var': norm.var_,
       'signature': sig,
     };
+    m['norm_mean'] = norm.mean;
+    m['norm_var'] = norm.var_;
+    m['norm_momentum'] = norm.momentum;
+    m['norm_signature'] = sig;
   }
   return m;
 }
@@ -176,31 +193,59 @@ bool tryLoadPolicy(
   if (_tryFillMat(p.W_val, 'W_val')) ok++;
   if (_tryFillVec(p.b_val, 'b_val')) ok++;
 
-  // Guarded norm load
+  // Guarded norm load (prefer nested, but accept top-level too)
   if (!ignoreLoadedNorm && norm != null && fe != null && env != null) {
-    final mNorm = (m['norm'] as Map?)?.cast<String, dynamic>();
+    final sigNow = _feSignature(
+      groundSamples: fe.groundSamples,
+      stridePx: fe.stridePx,
+      worldW: env.cfg.worldW,
+      worldH: env.cfg.worldH,
+    );
     final sigTop = m['signature'] as String?;
+
+    bool loadedNorm = false;
+
+    final mNorm = (m['norm'] as Map?)?.cast<String, dynamic>();
     if (mNorm != null) {
       final dim = (mNorm['dim'] as num?)?.toInt() ?? -1;
       final sigFile = (mNorm['signature'] as String?) ?? '';
-      final sigNow = _feSignature(
-        groundSamples: fe.groundSamples,
-        stridePx: fe.stridePx,
-        worldW: env.cfg.worldW,
-        worldH: env.cfg.worldH,
-      );
       if (dim == norm.dim && sigFile == sigNow && sigTop == sigNow) {
         try {
           norm.mean = (mNorm['mean'] as List).map((e) => (e as num).toDouble()).toList();
           norm.var_ = (mNorm['var'] as List).map((e) => (e as num).toDouble()).toList();
+          if (mNorm['momentum'] is num) norm.momentum = (mNorm['momentum'] as num).toDouble();
           norm.inited = true;
-          print('Loaded feature norm (dim=${norm.dim}) from $path (signature match).');
+          print('Loaded feature norm (nested) (dim=${norm.dim}) from $path (signature match).');
+          loadedNorm = true;
         } catch (_) {
-          print('Feature norm present but malformed → ignoring.');
+          print('Feature norm present but malformed (nested) → ignoring.');
         }
-      } else {
-        print('Saved norm signature/dim mismatch → ignoring loaded norm.');
       }
+    }
+
+    if (!loadedNorm) {
+      final nm = m['norm_mean'];
+      final nv = m['norm_var'];
+      final nsig = m['norm_signature'];
+      if (nm is List && nv is List && nsig == sigNow && sigTop == sigNow) {
+        final n = math.min(norm.dim, math.min(nm.length, nv.length));
+        try {
+          norm.mean = List<double>.generate(n, (i) => (nm[i] as num).toDouble())
+            ..length = norm.dim;
+          norm.var_ = List<double>.generate(n, (i) => (nv[i] as num).toDouble())
+            ..length = norm.dim;
+          if (m['norm_momentum'] is num) norm.momentum = (m['norm_momentum'] as num).toDouble();
+          norm.inited = true;
+          print('Loaded feature norm (top-level) (dim=${norm.dim}) from $path (signature match).');
+          loadedNorm = true;
+        } catch (_) {
+          print('Feature norm present but malformed (top-level) → ignoring.');
+        }
+      }
+    }
+
+    if (!loadedNorm) {
+      print('Saved norm signature/dim mismatch or missing → ignoring loaded norm.');
     }
   }
 
@@ -335,17 +380,19 @@ void _warmFeatureNorm({
     double x=padCx, h=180, vx=0, vy=20;
 
     switch (want) {
-      case 1: // goLeft
-        x  = padCx + (0.90 + 0.08*r.nextDouble()) * padHalfW;
-        h  = 140 + 140*r.nextDouble();
-        vx = 40 + 50*r.nextDouble();
-        vy = 25 + 35*r.nextDouble();
+      case 1: // goLeft → need dx < -0.08*W (spawn to LEFT of pad)
+        x  = (padCx - (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
+            .clamp(10.0, env.cfg.worldW - 10.0);
+        h  = 120 + 120*r.nextDouble();
+        vx = (r.nextDouble()*14.0) - 7.0;
+        vy = 28.0 + 10.0*r.nextDouble();
         break;
-      case 2: // goRight
-        x  = padCx - (0.90 + 0.08*r.nextDouble()) * padHalfW;
-        h  = 140 + 140*r.nextDouble();
-        vx = -(40 + 50*r.nextDouble());
-        vy = 25 + 35*r.nextDouble();
+      case 2: // goRight → need dx > +0.08*W (spawn to RIGHT of pad)
+        x  = (padCx + (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
+            .clamp(10.0, env.cfg.worldW - 10.0);
+        h  = 120 + 120*r.nextDouble();
+        vx = (r.nextDouble()*14.0) - 7.0;
+        vy = 28.0 + 10.0*r.nextDouble();
         break;
       case 3: // descendSlow
         x  = padCx + (r.nextDouble()*0.05 - 0.025) * padHalfW;
@@ -379,7 +426,7 @@ void _warmFeatureNorm({
     if (predictiveIntentLabelAdaptive(env) != want) continue;
 
     final feat = fe.extract(env);
-    trainer.norm?.normalize(feat, update: true);
+    _normUpdate(trainer.norm, feat);
     accepted++;
   }
   print('Feature norm warmed with $accepted synthetic samples.');
@@ -431,17 +478,19 @@ _PretrainIntentStats _pretrainIntentLocal({
     double x=padCx, h=180, vx=0, vy=20;
 
     switch (intentIdx) {
-      case 1: // goLeft
-        x  = padCx + (0.90 + 0.08*r.nextDouble()) * padHalfW;
-        h  = 140 + 140*r.nextDouble();
-        vx = 40 + 50*r.nextDouble();
-        vy = 25 + 35*r.nextDouble();
+      case 1: // goLeft → dx < -0.08*W
+        x  = (padCx - (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
+            .clamp(10.0, env.cfg.worldW - 10.0);
+        h  = 120 + 120*r.nextDouble();
+        vx = (r.nextDouble()*14.0) - 7.0;
+        vy = 28.0 + 10.0*r.nextDouble();
         break;
-      case 2: // goRight
-        x  = padCx - (0.90 + 0.08*r.nextDouble()) * padHalfW;
-        h  = 140 + 140*r.nextDouble();
-        vx = -(40 + 50*r.nextDouble());
-        vy = 25 + 35*r.nextDouble();
+      case 2: // goRight → dx > +0.08*W
+        x  = (padCx + (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
+            .clamp(10.0, env.cfg.worldW - 10.0);
+        h  = 120 + 120*r.nextDouble();
+        vx = (r.nextDouble()*14.0) - 7.0;
+        vy = 28.0 + 10.0*r.nextDouble();
         break;
       case 3: // descendSlow
         x  = padCx + (r.nextDouble()*0.05 - 0.025) * padHalfW;
@@ -491,13 +540,26 @@ _PretrainIntentStats _pretrainIntentLocal({
     }
   }
 
+  // Oversample partially-filled classes to hit targetPerClass
+  for (int k = 0; k < K; k++) {
+    if (xsByK[k].isEmpty) continue;
+    final need = targetPerClass - xsByK[k].length;
+    for (int i = 0; i < need; i++) {
+      final src = xsByK[k][rng.nextInt(xsByK[k].length)];
+      xsByK[k].add(List<double>.from(src));
+      ysByK[k].add(k);
+    }
+  }
+
   final xs = <List<double>>[]; final ys = <int>[];
   for (int k = 0; k < K; k++) { xs.addAll(xsByK[k]); ys.addAll(ysByK[k]); }
   final N = xs.length;
   final perm = List<int>.generate(N, (i) => i)..shuffle(rng);
 
   // Warm/freeze norm on this data
-  for (final x in xs) { trainer.norm?.normalize(x, update: true); }
+  for (final x in xs) {
+    _normUpdate(trainer.norm, x);
+  }
 
   // Simple CE training on intent head (uses PolicyNetwork.updateFromEpisode intent path)
   const B = 64;
@@ -505,7 +567,7 @@ _PretrainIntentStats _pretrainIntentLocal({
     perm.shuffle(rng);
     for (int off = 0; off < N; off += B) {
       final end = math.min(off + B, N);
-      final decisionCaches = <ForwardCache>[]; // using agent.dart type
+      final decisionCaches = <ForwardCache>[];
       final intentChoices  = <int>[];
       final decisionReturns= <double>[];
       final alignLabels    = <int>[];
@@ -516,7 +578,7 @@ _PretrainIntentStats _pretrainIntentLocal({
         final (_pred, _p, cache) = policy.actIntentGreedy(xN);
         decisionCaches.add(cache);
         intentChoices.add(ys[idx]);
-        decisionReturns.add(cache.v);   // A=0 trick
+        decisionReturns.add(cache.v);   // A=0 trick (baseline-free)
         alignLabels.add(ys[idx]);
       }
 
@@ -649,7 +711,7 @@ void main(List<String> argv) {
     print('Determinism probe: steps ${a.steps} vs ${b.steps} | cost ${a.cost.toStringAsFixed(6)} vs ${b.cost.toStringAsFixed(6)} => ${ok ? "OK" : "MISMATCH"}');
   }
 
-  // Optionally reset action heads (use local initializer; don't rely on policy.initMatrix)
+  // Optionally reset action heads
   if (resetActionHeads) {
     List<List<double>> _randInit(int rows, int cols, int s) {
       final r = math.Random(s);
@@ -688,7 +750,7 @@ void main(List<String> argv) {
       savePolicy('policy_pretrained.json', policy, fe, env, norm: trainer.norm);
     }
 
-    // Action heads pretrain – SKIPPED (no Trainer.pretrainActions in this agent build)
+    // Action heads pretrain – not implemented in this agent build
     if (pretrainActionsN > 0) {
       print('Note: --pretrain_actions_n=$pretrainActionsN requested, '
           'but this agent build has no Trainer.pretrainActions(). Skipping action pretrain.');

@@ -11,9 +11,6 @@ import 'agent.dart' as ai; // FeatureExtractor, PolicyNetwork, RunningNorm, inte
 
 double _clip(double x, double a, double b) => x < a ? a : (x > b ? b : x);
 
-List<List<double>> _zeros(int m, int n) =>
-    List.generate(m, (_) => List<double>.filled(n, 0.0));
-
 /* ----------------------------- policy IO (+norm) ----------------------------- */
 
 bool tryLoadPolicyWithNorm(String path, ai.PolicyNetwork p, ai.RunningNorm norm) {
@@ -50,11 +47,18 @@ bool tryLoadPolicyWithNorm(String path, ai.PolicyNetwork p, ai.RunningNorm norm)
       }
     }
   }
+
   bool _tryFillMat(List<List<double>> dst, String key) {
     final v = m[key];
     if (v == null) return false;
-    try { _from3(dst, _mat(v)); return true; } catch (_) { return false; }
+    try {
+      _from3(dst, _mat(v));
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
+
   bool _tryFillVec(List<double> dst, String key) {
     final v = m[key];
     if (v == null) return false;
@@ -63,27 +67,49 @@ bool tryLoadPolicyWithNorm(String path, ai.PolicyNetwork p, ai.RunningNorm norm)
       final n = math.min(dst.length, L.length);
       for (int i = 0; i < n; i++) dst[i] = L[i];
       return true;
-    } catch (_) { return false; }
+    } catch (_) {
+      return false;
+    }
   }
 
   int ok = 0, total = 0;
-  total += 2; if (_tryFillMat(p.W1, 'W1')) ok++; if (_tryFillVec(p.b1, 'b1')) ok++;
-  total += 2; if (_tryFillMat(p.W2, 'W2')) ok++; if (_tryFillVec(p.b2, 'b2')) ok++;
-  total += 2; if (_tryFillMat(p.W_thr, 'W_thr')) ok++; if (_tryFillVec(p.b_thr, 'b_thr')) ok++;
-  total += 2; if (_tryFillMat(p.W_turn, 'W_turn')) ok++; if (_tryFillVec(p.b_turn, 'b_turn')) ok++;
-  total += 2; if (_tryFillMat(p.W_intent, 'W_intent')) ok++; if (_tryFillVec(p.b_intent, 'b_intent')) ok++;
-  total += 2; if (_tryFillMat(p.W_val, 'W_val')) ok++; if (_tryFillVec(p.b_val, 'b_val')) ok++;
+  total += 2;
+  if (_tryFillMat(p.W1, 'W1')) ok++;
+  if (_tryFillVec(p.b1, 'b1')) ok++;
+  total += 2;
+  if (_tryFillMat(p.W2, 'W2')) ok++;
+  if (_tryFillVec(p.b2, 'b2')) ok++;
+  total += 2;
+  if (_tryFillMat(p.W_thr, 'W_thr')) ok++;
+  if (_tryFillVec(p.b_thr, 'b_thr')) ok++;
+  total += 2;
+  if (_tryFillMat(p.W_turn, 'W_turn')) ok++;
+  if (_tryFillVec(p.b_turn, 'b_turn')) ok++;
+  total += 2;
+  if (_tryFillMat(p.W_intent, 'W_intent')) ok++;
+  if (_tryFillVec(p.b_intent, 'b_intent')) ok++;
+  total += 2;
+  if (_tryFillMat(p.W_val, 'W_val')) ok++;
+  if (_tryFillVec(p.b_val, 'b_val')) ok++;
 
-  // Normalization (if present)
+  // Normalization (if present). Accept either variance or std.
   final nm = m['norm_mean'];
   final nv = m['norm_var'];
-  if (nm is List && nv is List) {
-    final n = math.min(norm.dim, math.min(nm.length, nv.length));
+  final ns = m['norm_std'];
+  if (nm is List && (nv is List || ns is List)) {
+    final srcVar = (nv ?? (ns as List).map((e) {
+      final s = (e as num).toDouble();
+      return s * s;
+    }).toList()) as List;
+    final n = math.min(norm.dim, math.min(nm.length, srcVar.length));
     for (int i = 0; i < n; i++) {
       norm.mean[i] = (nm[i] as num).toDouble();
-      norm.var_[i] = (nv[i] as num).toDouble();
+      norm.var_[i] = (srcVar[i] as num).toDouble();
     }
     norm.inited = true;
+    if (m['norm_momentum'] is num) {
+      norm.momentum = (m['norm_momentum'] as num).toDouble();
+    }
     print('Loaded feature norm (dim=$n) from $path');
   }
 
@@ -93,6 +119,8 @@ bool tryLoadPolicyWithNorm(String path, ai.PolicyNetwork p, ai.RunningNorm norm)
 
 /* --------------------------------- env config -------------------------------- */
 
+/// Keep these identical to training/runtime to avoid eval drift.
+/// If thrust “feels” too weak/strong in probes, verify these match your engine.
 et.EngineConfig makeConfig({
   int seed = 42,
   bool lockTerrain = false,
@@ -101,11 +129,17 @@ et.EngineConfig makeConfig({
   double worldW = 800,
   double worldH = 600,
   double? maxFuel,
+  // If you change these in runtime/training, change them here too:
+  double gravity = 0.18,
+  double thrustAccel = 0.42,
+  double rotSpeed = 1.6,
+  double stepScale = 60.0,
+  bool hardWalls = true,
 }) {
   final t = et.Tunables(
-    gravity: 0.18,
-    thrustAccel: 0.42,
-    rotSpeed: 1.6,
+    gravity: gravity,
+    thrustAccel: thrustAccel,
+    rotSpeed: rotSpeed,
     maxFuel: maxFuel ?? 1000.0,
   );
   return et.EngineConfig(
@@ -113,18 +147,68 @@ et.EngineConfig makeConfig({
     worldH: worldH,
     t: t,
     seed: seed,
-    stepScale: 60.0,
+    stepScale: stepScale,
     lockTerrain: lockTerrain,
     terrainSeed: 1234567,
     lockSpawn: lockSpawn,
     randomSpawnX: randomSpawnX,
-    hardWalls: true,
+    hardWalls: hardWalls,
   );
+}
+
+/* ------------------------------- norm utilities ------------------------------ */
+
+void _printNormSanity(ai.RunningNorm norm) {
+  // Max |mean| and Max |std-1|
+  double maxAbsMean = 0.0;
+  double maxStdMinus1 = 0.0;
+  for (int i = 0; i < norm.dim; i++) {
+    final m = norm.mean[i].abs();
+    final s = math.sqrt(math.max(norm.var_[i], 1e-12));
+    maxAbsMean = math.max(maxAbsMean, m);
+    maxStdMinus1 = math.max(maxStdMinus1, (s - 1.0).abs());
+  }
+  print('--- Norm sanity ---');
+  print('max |mean| over dims = ${maxAbsMean.toStringAsFixed(3)}   max |std-1| = ${maxStdMinus1.toStringAsFixed(3)}');
+}
+
+/// Warm the feature norm if nothing valid was loaded from disk.
+/// Uses randomized but plausible states (similar to Probe #1 state generator).
+void warmLocalNormIfMissing({
+  required eng.GameEngine env,
+  required ai.FeatureExtractor fe,
+  required ai.RunningNorm norm,
+  int nSamples = 3500,
+  int seed = 1234,
+}) {
+  if (norm.inited) return;
+  final rnd = math.Random(seed);
+
+  // Keep terrain fixed for stability of ground-derived features
+  env.reset(seed: 777);
+
+  for (int i = 0; i < nSamples; i++) {
+    final padCx = env.terrain.padCenter.toDouble();
+    env.lander.pos.x = _clip(padCx + (rnd.nextDouble() * 400 - 200), 10.0, env.cfg.worldW - 10.0);
+    final gy = env.terrain.heightAt(env.lander.pos.x);
+    env.lander.pos.y = _clip(gy - (60 + 300 * rnd.nextDouble()), 0.0, env.cfg.worldH - 10.0);
+    env.lander.vel.x = rnd.nextDouble() * 180 - 90;
+    env.lander.vel.y = rnd.nextDouble() * 140 + 10; // downward-ish
+    env.lander.angle = 0.0;
+    env.lander.fuel = env.cfg.t.maxFuel;
+
+    var x = fe.extract(env);
+    // update=true warms the statistics
+    norm.normalize(x, update: true);
+  }
+  norm.inited = true;
+  print('Local norm warmed on-the-fly ($nSamples samples).');
+  _printNormSanity(norm);
 }
 
 /* -------------------------------- probe #1 ----------------------------------- */
 /* Intent agreement on randomized snapshots (teacher = predictiveIntentLabelAdaptive)
-   Uses EXACT SAME feature normalization as the policy (loaded from file).
+   Uses EXACT SAME feature normalization as the policy (loaded or warmed).
 */
 
 class _Conf {
@@ -161,13 +245,14 @@ void probeIntentAgreement({
   for (int i = 0; i < N; i++) {
     // Randomize a plausible state quickly
     final padCx = env.terrain.padCenter.toDouble();
-    env.lander.pos.x = _clip(padCx + (rnd.nextDouble() * 400 - 200), 10.0, env.cfg.worldW - 10.0);
+    env.lander.pos.x =
+        _clip(padCx + (rnd.nextDouble() * 400 - 200), 10.0, env.cfg.worldW - 10.0);
     final gy = env.terrain.heightAt(env.lander.pos.x);
     env.lander.pos.y = _clip(gy - (60 + 300 * rnd.nextDouble()), 0.0, env.cfg.worldH - 10.0);
     env.lander.vel.x = rnd.nextDouble() * 180 - 90;
     env.lander.vel.y = rnd.nextDouble() * 140 + 10; // downward-ish
     env.lander.angle = 0.0;
-    env.lander.fuel  = env.cfg.t.maxFuel;
+    env.lander.fuel = env.cfg.t.maxFuel;
 
     final y = ai.predictiveIntentLabelAdaptive(env,
         baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
@@ -238,6 +323,12 @@ void probeTeacherVsStudent({
         currentIntentIdx = idx;
       }
 
+      // guard against NaNs
+      final pSum = probs.fold<double>(0.0, (a, b) => a + (b.isFinite ? b : 0.0));
+      if (!pSum.isFinite || pSum <= 0) {
+        // fall back: keep intent histogram sane
+      }
+
       intentHist[currentIntentIdx] += 1;
       framesLeft = planHold;
       decisions++;
@@ -260,15 +351,27 @@ void probeTeacherVsStudent({
     if (uTeacher.thrust == uStudent.thrust) agreeThrust++;
     if (tTurnTeacher == tTurnStudent && uTeacher.thrust == uStudent.thrust) agreeBoth++;
     total++;
-    thrProbSum += probs[0]; // p(thrust)
+
+    // Be conservative about which index in probs is thrust; if missing, infer from action.
+    double pThr;
+    if (probs.isEmpty) {
+      pThr = th ? 1.0 : 0.0;
+    } else {
+      // Most implementations expose p(thrust) in probs[0]. Adjust here if yours differs.
+      pThr = probs[0].isFinite ? probs[0] : (th ? 1.0 : 0.0);
+    }
+    thrProbSum += pThr;
 
     // Step env with teacher control (evaluation-style)
-    final info = env.step(1 / 60.0, et.ControlInput(
-      thrust: uTeacher.thrust,
-      left: uTeacher.left,
-      right: uTeacher.right,
-      intentIdx: currentIntentIdx,
-    ));
+    final info = env.step(
+      1 / 60.0,
+      et.ControlInput(
+        thrust: uTeacher.thrust,
+        left: uTeacher.left,
+        right: uTeacher.right,
+        intentIdx: currentIntentIdx,
+      ),
+    );
     framesLeft -= 1;
     if (info.terminal) {
       env.reset(seed: rnd.nextInt(1 << 30));
@@ -296,7 +399,7 @@ void probeTeacherVsStudent({
 
 class _DecSample {
   final List<double> x; // normalized features
-  final int y;          // teacher label
+  final int y; // teacher label
   _DecSample(this.x, this.y);
 }
 
@@ -324,8 +427,12 @@ void probeCECalibration({
   while (samples.length < maxDecisions) {
     if (framesLeft <= 0) {
       var xPlan = fe.extract(env);
-      final y = ai.predictiveIntentLabelAdaptive(env,
-          baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
+      final y = ai.predictiveIntentLabelAdaptive(
+        env,
+        baseTauSec: 1.0,
+        minTauSec: 0.45,
+        maxTauSec: 1.35,
+      );
       xPlan = norm.normalize(xPlan, update: false);
       samples.add(_DecSample(xPlan, y));
 
@@ -337,9 +444,15 @@ void probeCECalibration({
 
     final intent = ai.indexToIntent(currentIntentIdx);
     final u = ai.controllerForIntent(intent, env);
-    final info = env.step(1 / 60.0, et.ControlInput(
-      thrust: u.thrust, left: u.left, right: u.right, intentIdx: currentIntentIdx,
-    ));
+    final info = env.step(
+      1 / 60.0,
+      et.ControlInput(
+        thrust: u.thrust,
+        left: u.left,
+        right: u.right,
+        intentIdx: currentIntentIdx,
+      ),
+    );
     framesLeft -= 1;
     if (info.terminal) {
       env.reset(seed: rnd.nextInt(1 << 30));
@@ -349,7 +462,7 @@ void probeCECalibration({
 
   double ce = 0.0, meanP = 0.0;
   for (final s in samples) {
-    final (pred, p, _c) = policy.actIntentGreedy(s.x);
+    final (_pred, p, _c) = policy.actIntentGreedy(s.x);
     ce += _ceOneHot(p, s.y);
     meanP += p[s.y];
   }
@@ -357,15 +470,26 @@ void probeCECalibration({
   meanP /= samples.length;
 
   print('--- Probe #3: CE calibration (teacher vs policy, no update) ---');
-  print('Batch size: ${samples.length}  mean CE=${ce.toStringAsFixed(4)}  meanP(teacher)=${meanP.toStringAsFixed(3)}');
+  print(
+      'Batch size: ${samples.length}  mean CE=${ce.toStringAsFixed(4)}  meanP(teacher)=${meanP.toStringAsFixed(3)}');
   print('');
 }
 
 /* ------------------------------------ main ----------------------------------- */
 
 void main(List<String> argv) {
-  // Config similar to training defaults
-  final cfg = makeConfig(seed: 42, maxFuel: 1000.0, lockTerrain: true, randomSpawnX: true);
+  // Make sure these match your training and runtime (see makeConfig defaults).
+  final cfg = makeConfig(
+    seed: 42,
+    maxFuel: 1000.0,
+    lockTerrain: true,
+    randomSpawnX: true,
+    // If you adjusted these in runtime/training, mirror them here:
+    // gravity: 0.18,
+    // thrustAccel: 0.42,
+    // rotSpeed: 1.6,
+    // stepScale: 60.0,
+  );
   final env = eng.GameEngine(cfg);
 
   final fe = ai.FeatureExtractor(groundSamples: 3, stridePx: 48);
@@ -373,7 +497,21 @@ void main(List<String> argv) {
   final norm = ai.RunningNorm(fe.inputSize, momentum: 0.995);
 
   final ok = tryLoadPolicyWithNorm('policy_pretrained.json', policy, norm);
-  if (ok) print('Loaded policy_pretrained.json');
+  if (ok) {
+    print('Loaded policy_pretrained.json');
+  } else {
+    print('No valid policy or norm found at policy_pretrained.json');
+  }
+
+  // If the norm isn’t present/valid, warm it locally to keep probes meaningful.
+  if (!norm.inited) {
+    print('⚠️  No valid norm for current signature; warming LOCAL norm on-the-fly (3500 samples).');
+//    warmLocalNormIfMissing(env: env, fe: fe, norm: norm, nSamples: 3500);
+    var x = fe.extract(env);
+    norm.observe(x); // <— instead of norm.normalize(x, update:true)
+  } else {
+    _printNormSanity(norm);
+  }
 
   // Probes
   probeIntentAgreement(env: env, fe: fe, policy: policy, norm: norm, N: 800);
