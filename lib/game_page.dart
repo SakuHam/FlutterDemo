@@ -43,6 +43,137 @@ class DemoSet {
   String toPrettyJson() => const JsonEncoder.withIndent('  ').convert(toJson());
 }
 
+/// ======= Ray casting types =======
+
+enum RayHitKind { terrain, wall, pad }
+
+class RayHit {
+  final Offset p;
+  final double t; // param along ray (distance in ray units)
+  final RayHitKind kind;
+  const RayHit(this.p, this.t, this.kind);
+}
+
+class RayConfig {
+  final int rayCount;
+  final bool includeFloor;
+  const RayConfig({this.rayCount = 180, this.includeFloor = false});
+
+  RayConfig copyWith({int? rayCount, bool? includeFloor}) =>
+      RayConfig(rayCount: rayCount ?? this.rayCount, includeFloor: includeFloor ?? this.includeFloor);
+}
+
+/// Simple raycaster against terrain polyline and arena bounds.
+class Raycaster {
+  /// Intersects ray O + t*D with segment AB.
+  /// Returns (t,u) where t>=0 on ray, u in [0,1] on segment; null if no hit or parallel.
+  static ({double t, double u})? _raySegment(Offset O, Offset D, Offset A, Offset B) {
+    final vx = D.dx, vy = D.dy;
+    final sx = B.dx - A.dx, sy = B.dy - A.dy;
+
+    // Solve: O + t*D = A + u*(B-A)
+    final det = (-sx * vy + vx * sy);
+    if (det.abs() < 1e-9) return null; // parallel
+
+    final oxax = O.dx - A.dx;
+    final oway = O.dy - A.dy;
+    final t = (-sy * oxax + sx * oway) / det;
+    final u = (-vy * oxax + vx * oway) / det;
+
+    if (t >= 0 && u >= 0 && u <= 1) return (t: t, u: u);
+    return null;
+  }
+
+  /// Cast a single ray; returns closest hit point & kind (terrain or wall).
+  static RayHit _castOne({
+    required Offset origin,
+    required Offset dir, // unit-ish
+    required Terrain terrain,
+    required Size world,
+    required bool includeFloor,
+  }) {
+    double bestT = double.infinity;
+    RayHitKind bestKind = RayHitKind.wall;
+    Offset bestP = origin;
+
+    // Terrain segments
+    final pts = terrain.points;
+    for (int i = 0; i < pts.length - 1; i++) {
+      final A = pts[i];
+      final B = pts[i + 1];
+      final sol = _raySegment(origin, dir, A, B);
+      if (sol != null && sol.t < bestT) {
+        bestT = sol.t;
+        bestP = origin + dir * sol.t;
+        bestKind = terrain.segmentIsPad(A, B) ? RayHitKind.pad : RayHitKind.terrain;
+      }
+    }
+
+    // Arena walls / ceiling / floor
+    final List<(Offset, Offset)> walls = [
+      (const Offset(0, 0), Offset(world.width, 0)), // ceiling
+      (const Offset(0, 0), Offset(0, world.height)), // left wall
+      (Offset(world.width, 0), Offset(world.width, world.height)), // right wall
+      if (includeFloor) (Offset(0, world.height), Offset(world.width, world.height)), // optional floor
+    ];
+
+    for (final (A, B) in walls) {
+      final sol = _raySegment(origin, dir, A, B);
+      if (sol != null && sol.t < bestT) {
+        bestT = sol.t;
+        bestP = origin + dir * sol.t;
+        bestKind = RayHitKind.wall;
+      }
+    }
+
+    // Fallback: if nothing hit (shouldn't happen), clamp to screen bounds
+    if (!bestT.isFinite) {
+      // shoot to far edge in dir and clamp
+      final far = origin + dir * 2000.0;
+      final clamped = Offset(
+        far.dx.clamp(0.0, world.width),
+        far.dy.clamp(0.0, world.height),
+      );
+      return RayHit(clamped, (clamped - origin).distance, RayHitKind.wall);
+    }
+
+    return RayHit(bestP, bestT, bestKind);
+  }
+
+  /// Compute N rays around the origin (0..2π), returns list of hits sorted by angle index.
+  static List<RayHit> castAll({
+    required Offset origin,
+    required Terrain terrain,
+    required Size world,
+    int rayCount = 180,
+    bool includeFloor = false,
+  }) {
+    final hits = List<RayHit>.empty(growable: true);
+    final twoPi = math.pi * 2.0;
+    final maxLen = world.width.hypot(world.height); // for normalization if needed
+
+    for (int i = 0; i < rayCount; i++) {
+      final th = twoPi * (i / rayCount);
+      final dir = Offset(math.cos(th), math.sin(th));
+      final hit = _castOne(
+        origin: origin,
+        dir: dir,
+        terrain: terrain,
+        world: world,
+        includeFloor: includeFloor,
+      );
+      // normalize t to pixels (already is, since dir is unit)
+      hits.add(hit);
+    }
+    return hits;
+  }
+}
+
+extension on double {
+  double hypot(double other) => math.sqrt(this * this + other * other);
+}
+extension on double Function(double) {}
+
 /// ======= Game types =======
 
 class GamePage extends StatefulWidget {
@@ -145,6 +276,11 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   // Timing/frame
   int _frame = 0;
 
+  // ===== Ray casting UI/state =====
+  bool _showRays = true;
+  RayConfig _rayCfg = const RayConfig(rayCount: 180, includeFloor: false);
+  List<RayHit> _rays = const []; // computed each frame (cheap)
+
   @override
   void initState() {
     super.initState();
@@ -223,6 +359,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _frame = 0;
       _intentNow = '—';
       _intentProbs = null;
+      _rays = const [];
     });
 
     _policy?.resetPlanner();
@@ -344,6 +481,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
       // --- Hard walls (no wrap) ---
       final w = _worldSize?.width ?? 360.0;
+      final h = _worldSize?.height ?? 640.0;
       if (pos.dx < 0) {
         pos = Offset(0, pos.dy);
         vel = Offset(0, vel.dy);
@@ -351,6 +489,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       if (pos.dx > w) {
         pos = Offset(w, pos.dy);
         vel = Offset(0, vel.dy);
+      }
+      if (_rayCfg.includeFloor && pos.dy > h) {
+        pos = Offset(pos.dx, h);
+        if (vel.dy > 0) vel = Offset(vel.dx, 0);
       }
 
       // --- Particle exhaust ---
@@ -428,6 +570,19 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       // --- Commit state ---
       lander = lander.copyWith(position: pos, velocity: vel, angle: angle, fuel: fuel);
       _frame++;
+
+      // --- Recompute rays (cheap): origin at lander nose or center? Use center for now ---
+      if (_worldSize != null && _terrain != null && _showRays) {
+        _rays = Raycaster.castAll(
+          origin: lander.position,
+          terrain: _terrain!,
+          world: _worldSize!,
+          rayCount: _rayCfg.rayCount,
+          includeFloor: _rayCfg.includeFloor,
+        );
+      } else {
+        _rays = const [];
+      }
     });
   }
 
@@ -539,6 +694,42 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     );
   }
 
+  Widget _rayControls() {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        FilterChip(
+          label: const Text('Rays'),
+          selected: _showRays,
+          onSelected: (v) => setState(() => _showRays = v),
+        ),
+        FilterChip(
+          label: const Text('Floor as wall'),
+          selected: _rayCfg.includeFloor,
+          onSelected: (v) => setState(() => _rayCfg = _rayCfg.copyWith(includeFloor: v)),
+        ),
+        const Text('Count:', style: TextStyle(fontSize: 12, color: Colors.white70)),
+        ChoiceChip(
+          label: const Text('90'),
+          selected: _rayCfg.rayCount == 90,
+          onSelected: (_) => setState(() => _rayCfg = _rayCfg.copyWith(rayCount: 90)),
+        ),
+        ChoiceChip(
+          label: const Text('180'),
+          selected: _rayCfg.rayCount == 180,
+          onSelected: (_) => setState(() => _rayCfg = _rayCfg.copyWith(rayCount: 180)),
+        ),
+        ChoiceChip(
+          label: const Text('360'),
+          selected: _rayCfg.rayCount == 360,
+          onSelected: (_) => setState(() => _rayCfg = _rayCfg.copyWith(rayCount: 360)),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -561,6 +752,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                     thrusting: thrust && lander.fuel > 0 && status == GameStatus.playing,
                     status: status,
                     particles: _particles,
+                    rays: _showRays ? _rays : const [],
+                    includeFloor: _rayCfg.includeFloor,
                   ),
                 ),
               ),
@@ -584,18 +777,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           _hudBox(title: 'Fuel', value: lander.fuel.toStringAsFixed(0)),
-                          /*
-                          _hudBox(
-                            title: 'Vx/Vy',
-                            value:
-                            '${lander.velocity.dx.toStringAsFixed(1)} / ${lander.velocity.dy.toStringAsFixed(1)}',
-                          ),
-                          _hudBox(
-                            title: 'Angle',
-                            value: '${(lander.angle * 180 / math.pi).toStringAsFixed(0)}°',
-                          ),
-                          
-                           */
                           _intentChip(_intentNow, _intentProbs),
                           _aiToggleIcon(),
                         ],
@@ -603,7 +784,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
                       const SizedBox(height: 8),
 
-                      // Recording + terrain + reset
+                      // Recording + terrain + reset + ray controls
+                      _rayControls(),
+                      const SizedBox(height: 8),
                       Wrap(
                         spacing: 8,
                         runSpacing: 8,
@@ -836,6 +1019,12 @@ class Terrain {
 
   Terrain({required this.points, required this.padX1, required this.padX2, required this.padY});
 
+  bool segmentIsPad(Offset a, Offset b) {
+    const eps = 1e-6;
+    bool xIn(Offset p) => p.dx >= padX1 - eps && p.dx <= padX2 + eps;
+    return xIn(a) && xIn(b) && (a.dy - padY).abs() < 1e-6 && (b.dy - padY).abs() < 1e-6;
+  }
+
   static Terrain generate(Size size, {int? seed}) {
     final rnd = math.Random(seed ?? DateTime.now().microsecondsSinceEpoch);
     final width = size.width;
@@ -896,12 +1085,18 @@ class GamePainter extends CustomPainter {
   final GameStatus status;
   final List<Particle> particles;
 
+  // Rays
+  final List<RayHit> rays;
+  final bool includeFloor;
+
   GamePainter({
     required this.lander,
     required this.terrain,
     required this.thrusting,
     required this.status,
     required this.particles,
+    required this.rays,
+    required this.includeFloor,
   });
 
   @override
@@ -909,6 +1104,7 @@ class GamePainter extends CustomPainter {
     _paintStars(canvas, size);
     _paintTerrain(canvas, size);
     _paintPad(canvas);
+    _paintRays(canvas, size);
     _paintParticles(canvas);
     _paintLander(canvas);
   }
@@ -949,6 +1145,21 @@ class GamePainter extends CustomPainter {
       ridge.lineTo(terrain.points[i].dx, terrain.points[i].dy);
     }
     canvas.drawPath(ridge, outline);
+
+    // Boundaries (for reference when rays hit them)
+    final boundPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = Colors.white12;
+    // ceiling
+    canvas.drawLine(const Offset(0, 0), Offset(size.width, 0), boundPaint);
+    // left/right
+    canvas.drawLine(const Offset(0, 0), Offset(0, size.height), boundPaint);
+    canvas.drawLine(Offset(size.width, 0), Offset(size.width, size.height), boundPaint);
+    // optional floor
+    if (includeFloor) {
+      canvas.drawLine(Offset(0, size.height), Offset(size.width, size.height), boundPaint);
+    }
   }
 
   void _paintPad(Canvas canvas) {
@@ -960,6 +1171,38 @@ class GamePainter extends CustomPainter {
     );
     final paint = Paint()..color = status == GameStatus.crashed ? Colors.red : Colors.greenAccent;
     canvas.drawRRect(RRect.fromRectAndRadius(padRect, const Radius.circular(4)), paint);
+  }
+
+  void _paintRays(Canvas canvas, Size size) {
+    if (rays.isEmpty) return;
+
+    final pTerrain = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = Colors.cyanAccent.withOpacity(0.65);
+
+    final pWall = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = Colors.pinkAccent.withOpacity(0.55);
+
+    final pPad = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2   // a touch bolder for pad
+      ..color = Colors.limeAccent.withOpacity(0.9);
+
+    for (final hit in rays) {
+      final paint = switch (hit.kind) {
+        RayHitKind.pad => pPad,
+        RayHitKind.terrain => pTerrain,
+        RayHitKind.wall => pWall,
+      };
+      canvas.drawLine(lander.position, hit.p, paint);
+
+      // tiny dot at hit
+      final dot = Paint()..color = paint.color.withOpacity(0.95);
+      canvas.drawCircle(hit.p, 1.8, dot);
+    }
   }
 
   void _paintParticles(Canvas canvas) {
@@ -1034,6 +1277,8 @@ class GamePainter extends CustomPainter {
         old.terrain != terrain ||
         old.thrusting != thrusting ||
         old.status != status ||
-        old.particles != particles;
+        old.particles != particles ||
+        old.rays != rays ||
+        old.includeFloor != includeFloor;
   }
 }
