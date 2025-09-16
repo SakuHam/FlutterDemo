@@ -149,14 +149,13 @@ class TerrainCarver {
 
         if (exitHit != null) {
           if (outerIsCCW) {
-            _appendArcCCW(out, C, r, exitHit.p, enterHit.p, arcMaxErrPx);
+            // outer is CCW → arc must be CCW from ENTER to EXIT
+            _appendArcCW(out, C, r, enterHit.p, exitHit.p, arcMaxErrPx);
           } else {
-            _appendArcCW(out, C, r, exitHit.p, enterHit.p, arcMaxErrPx);
+            // outer is CW → arc must be CW from ENTER to EXIT
+            _appendArcCCW(out, C, r, enterHit.p, exitHit.p, arcMaxErrPx);
           }
-          // Also place the EXIT point to reconnect with the outer contour
-          _pushDedup(out, exitHit.p, eps: dedupEps);
 
-          // Jump i to the exit hit, continue from there
           i = verts.indexOf(exitHit);
         } else {
           // Pathological: give up this run safely (keep current)
