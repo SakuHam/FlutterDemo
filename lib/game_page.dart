@@ -13,6 +13,8 @@ import '../engine/types.dart' as eng;
 import 'package:flutter_application_1/ai/intent_bus.dart';
 import 'package:flutter_application_1/ai/runtime_policy.dart';
 
+import 'engine/raycast.dart';
+
 /// ---------------------------------------------------------------------------
 /// Shims so RuntimeTwoStagePolicy can keep using (Lander, Terrain) signatures.
 /// They are just read-only adapters around engine state.
@@ -508,7 +510,7 @@ class _GamePainter extends CustomPainter {
   final eng.LanderState lander;
   final eng.Terrain terrain;
   final eng.GameStatus status;
-  final List<eng.RayHit> rays;
+  final List<RayHit> rays;
 
   _GamePainter({
     required this.world,
@@ -609,9 +611,9 @@ class _GamePainter extends CustomPainter {
     for (final h in rays) {
       final hit = Offset(h.p.x, h.p.y);
       final paint = switch (h.kind) {
-        eng.RayHitKind.pad => pPad,
-        eng.RayHitKind.terrain => pTerrain,
-        eng.RayHitKind.wall => pWall,
+        RayHitKind.pad => pPad,
+        RayHitKind.terrain => pTerrain,
+        RayHitKind.wall => pWall,
       };
       canvas.drawLine(origin, hit, paint);
       final dot = Paint()..color = paint.color.withOpacity(0.95);
