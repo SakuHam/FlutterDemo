@@ -556,7 +556,7 @@ class Terrain {
     // 6) Build polygon with pad edges *tagged* (the flat segment we spliced).
     final poly = PolyShape.fromRings(
       outer: outer,
-      holes: holes,
+      holes: const [],
       padX1: padX1,
       padX2: padX2,
       padY: padY,

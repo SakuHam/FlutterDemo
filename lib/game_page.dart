@@ -7,6 +7,7 @@ import 'package:flutter/scheduler.dart' show Ticker;
 import 'engine/types.dart';
 import 'engine/game_engine.dart';
 import 'engine/raycast.dart';
+import 'engine/polygon_carver.dart';
 
 /// Simple UI particle for exhaust/smoke
 class Particle {
@@ -41,6 +42,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   bool _showRays = true;
   bool _aiPlay = false;
 
+  // Carver (brush)
+  double _brushRadius = 28.0;
+  bool _carveMode = true;
+
   @override
   void initState() {
     super.initState();
@@ -59,7 +64,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         _engine == null) {
       _worldSize = size;
 
-      // Defaults via constructor
       final cfg = EngineConfig(
         worldW: size.width,
         worldH: size.height,
@@ -86,10 +90,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   void _toggleAI() {
     setState(() {
       _aiPlay = !_aiPlay;
-      if (_aiPlay) {
-        // clear manual inputs when AI takes over
-        _thrust = _left = _right = false;
-      }
+      if (_aiPlay) _thrust = _left = _right = false;
     });
     _toast(_aiPlay ? 'AI: ON' : 'AI: OFF');
   }
@@ -107,6 +108,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     );
   }
 
+  // ------------ TICK ------------
   void _onTick(Duration elapsed) {
     if (!mounted) return;
 
@@ -119,7 +121,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     if (engine == null) return;
     if (engine.status != GameStatus.playing) return;
 
-    // If AI is on, compute controls here (override manual).
+    // If AI is on, compute controls (override manual)
     if (_aiPlay) {
       final u = _aiHeuristic(engine);
       _thrust = u.thrust;
@@ -127,13 +129,12 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _right = u.right;
     }
 
-    // Step engine with current controls
     final info = engine.step(
       dt,
       ControlInput(thrust: _thrust, left: _left, right: _right),
     );
 
-    // Simple exhaust particles
+    // Exhaust particles
     final lander = engine.lander;
     if (_thrust && lander.fuel > 0) {
       final c = math.cos(lander.angle);
@@ -154,74 +155,103 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     for (int i = _particles.length - 1; i >= 0; i--) {
       final p = _particles[i];
       p.life -= dt * 1.8;
-      p.vel += const Offset(0, 0.18 * 0.05 * 0.2); // tiny gravity on smoke
+      p.vel += const Offset(0, 0.18 * 0.05 * 0.2);
       p.pos += p.vel * dt;
       if (p.life <= 0) _particles.removeAt(i);
     }
 
     if (info.terminal) {
-      // no-op; engine already set status
+      // engine already set status
     }
 
     setState(() {});
   }
 
-  /// Lightweight heuristic autopilot:
-  /// - Align toward pad center with a PD rule.
-  /// - Manage descent: keep vy within target band depending on altitude.
+  /// Lightweight heuristic autopilot
   ControlInput _aiHeuristic(GameEngine engine) {
     final s = engine.lander;
     final terrain = engine.terrain;
 
     final padX = terrain.padCenter;
-    final dx = (padX - s.pos.x);            // + -> pad to the right
+    final dx = (padX - s.pos.x);
     final vx = s.vel.x;
-    final vy = s.vel.y;                      // + down
+    final vy = s.vel.y;  // + down
     final angle = s.angle;
 
-    // Altitude from polygon roof above lander.x
-    final groundY = terrain.heightAt(s.pos.x, worldH: engine.cfg.worldH);
+    final groundY = terrain.heightAt(s.pos.x);
     final alt = groundY.isFinite ? (groundY - s.pos.y) : 9999.0;
 
-    // PD target angle: lean into the pad direction and opposing current vx.
-    // Clamp to safe tilt range.
-    final kx = 0.0009;    // position gain
-    final kv = 0.020;     // velocity gain
+    final kx = 0.0009;
+    final kv = 0.020;
     double targetAng = (kx * dx + kv * vx).clamp(-0.6, 0.6);
-
-    // Near the ground, flare toward level
     if (alt < 80) targetAng *= (alt / 80).clamp(0.0, 1.0);
 
-    // Turn decision with deadband
     const dead = 0.03;
     bool left = false, right = false;
-    if (angle < targetAng - dead) {
-      right = true; // rotate CW (angle increases)
-    } else if (angle > targetAng + dead) {
-      left = true;  // rotate CCW (angle decreases)
-    }
+    if (angle < targetAng - dead) right = true;
+    else if (angle > targetAng + dead) left = true;
 
-    // Descent profile (target vy+). Faster up high, gentle near ground.
-    double targetVy = 60.0;      // px/s down allowed far away
+    double targetVy = 60.0;
     if (alt < 200) targetVy = 45.0;
     if (alt < 120) targetVy = 32.0;
     if (alt < 60)  targetVy = 22.0;
     if (alt < 30)  targetVy = 14.0;
 
-    // If falling faster than targetVy, burn.
     bool thrust = (vy > targetVy);
-
-    // Also burn if we are tilted heavily and close to ground, to regain control
     if (alt < 50 && angle.abs() > 0.35) thrust = true;
-
-    // Small hover assist when almost over pad
-    final closeToCenter = dx.abs() < (engine.cfg.worldW * 0.03);
-    if (closeToCenter && alt < 26 && vy > 8.0) thrust = true;
-
-    // Out of fuel => nothing we can do
+    if ((dx).abs() < (engine.cfg.worldW * 0.03) && alt < 26 && vy > 8.0) thrust = true;
     if (s.fuel <= 0.0) thrust = false;
 
     return ControlInput(thrust: thrust, left: left, right: right);
+  }
+
+  // ------------ Carving ------------
+  void _carveAt(Offset p) {
+    if (!_carveMode) return;
+    final e = _engine;
+    if (e == null) return;
+    final carved = TerrainCarver.carveCircle(
+      terrain: e.terrain,
+      cx: p.dx,
+      cy: p.dy,
+      r: _brushRadius,
+      arcSegments: 18,
+    );
+    e.terrain = carved; // engine caches rays on step; UI repaints now
+    setState(() {});
+  }
+
+  Future<void> _showBrushDialog() async {
+    double temp = _brushRadius;
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Brush size'),
+        content: StatefulBuilder(
+          builder: (_, setLocal) => SizedBox(
+            width: 280,
+            child: Slider(
+              value: temp,
+              min: 12,
+              max: 80,
+              divisions: 17,
+              label: temp.toStringAsFixed(0),
+              onChanged: (v) => setLocal(() => temp = v),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () {
+              setState(() => _brushRadius = temp);
+              Navigator.pop(ctx);
+            },
+            child: const Text('Apply'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -235,27 +265,34 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
           return Stack(
             children: [
-              // Game canvas
+              // Game canvas + tap/drag carving
               Positioned.fill(
-                child: CustomPaint(
-                  painter: GamePainter(
-                    lander: engine.lander,
-                    terrain: engine.terrain,
-                    thrusting: _thrust && engine.lander.fuel > 0 && status == GameStatus.playing,
-                    status: status,
-                    particles: _particles,
-                    rays: _showRays ? engine.rays : const [],
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (d) => _carveAt(d.localPosition),
+                  onPanStart: (d) => _carveAt(d.localPosition),
+                  onPanUpdate: (d) => _carveAt(d.localPosition),
+                  child: CustomPaint(
+                    painter: GamePainter(
+                      lander: engine.lander,
+                      terrain: engine.terrain,
+                      thrusting: _thrust && engine.lander.fuel > 0 && status == GameStatus.playing,
+                      status: status,
+                      particles: _particles,
+                      rays: _showRays ? engine.rays : const [],
+                    ),
                   ),
                 ),
               ),
 
-              // HUD + AI toggle
+              // HUD
               SafeArea(
                 child: Padding(
                   padding: const EdgeInsets.all(12.0),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
+                      // Top row compact for phones
                       Row(
                         children: [
                           ElevatedButton.icon(
@@ -270,7 +307,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             ),
                           ),
                           const Spacer(),
-                          // AI toggle button (nice chip-like icon)
                           _aiToggleIcon(),
                           const SizedBox(width: 8),
                           FilterChip(
@@ -287,21 +323,52 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                         ],
                       ),
                       const SizedBox(height: 10),
+
+                      // Fuel row + tiny icon-only Brush button (right side)
                       Row(
                         children: [
                           _hudBox(title: 'Fuel', value: engine.lander.fuel.toStringAsFixed(0)),
                           const SizedBox(width: 10),
                           _hudBox(
                             title: 'Vx/Vy',
-                            value: '${engine.lander.vel.x.toStringAsFixed(1)} / ${engine.lander.vel.y.toStringAsFixed(1)}',
+                            value:
+                            '${engine.lander.vel.x.toStringAsFixed(1)} / ${engine.lander.vel.y.toStringAsFixed(1)}',
                           ),
                           const SizedBox(width: 10),
                           _hudBox(
                             title: 'Angle',
                             value: '${(engine.lander.angle * 180 / math.pi).toStringAsFixed(0)}°',
                           ),
+                          const Spacer(),
+
+                          // --- Icon-only Brush button ---
+                          Tooltip(
+                            message: _carveMode
+                                ? 'Brush ON — tap to disable; long-press to resize'
+                                : 'Brush OFF — tap to enable; long-press to resize',
+                            child: GestureDetector(
+                              onTap: () => setState(() => _carveMode = !_carveMode),
+                              onLongPress: _showBrushDialog,
+                              child: Container(
+                                width: 36,
+                                height: 36,
+                                decoration: BoxDecoration(
+                                  color: _carveMode
+                                      ? Colors.green.withOpacity(0.20)
+                                      : Colors.white10,
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(
+                                    color: _carveMode ? Colors.greenAccent : Colors.white30,
+                                  ),
+                                ),
+                                alignment: Alignment.center,
+                                child: const Icon(Icons.brush, size: 18, color: Colors.white),
+                              ),
+                            ),
+                          ),
                         ],
                       ),
+
                       const SizedBox(height: 8),
                       if (status != GameStatus.playing)
                         Center(
@@ -424,13 +491,13 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   }
 }
 
-/// Painter that draws polygon terrain (with holes), edges (pad highlighted),
-/// 360° rays from engine, particles, and the lander triangle.
+/// Painter that draws polygon terrain (light gray), pad-highlighted edges,
+/// 360° rays, particles, and the lander triangle.
 class GamePainter extends CustomPainter {
-  final LanderState lander;     // engine type
-  final Terrain terrain;        // engine type (has .poly)
+  final LanderState lander;
+  final Terrain terrain;
   final bool thrusting;
-  final GameStatus status;      // engine enum
+  final GameStatus status;
   final List<Particle> particles;
   final List<RayHit> rays;
 
@@ -453,7 +520,6 @@ class GamePainter extends CustomPainter {
     _paintLander(canvas);
   }
 
-  // ---------- Background ----------
   void _paintStars(Canvas canvas, Size size) {
     final paint = Paint()..color = Colors.white.withOpacity(0.8);
     final rnd = math.Random(1);
@@ -464,13 +530,10 @@ class GamePainter extends CustomPainter {
     }
   }
 
-  // ---------- Terrain (polygon fill with holes) ----------
   void _paintTerrainPoly(Canvas canvas, Size size) {
     final poly = terrain.poly;
-
     final path = Path()..fillType = PathFillType.evenOdd;
 
-    // Outer ring
     if (poly.outer.isNotEmpty) {
       final a0 = poly.outer.first;
       path.moveTo(a0.x, a0.y);
@@ -480,8 +543,6 @@ class GamePainter extends CustomPainter {
       }
       path.close();
     }
-
-    // Holes
     for (final hole in poly.holes) {
       if (hole.isEmpty) continue;
       final h0 = hole.first;
@@ -493,24 +554,17 @@ class GamePainter extends CustomPainter {
       path.close();
     }
 
-    final ground = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-        colors: [Color(0xFF1C2330), Color(0xFF0E141B)],
-      ).createShader(Offset.zero & size);
-
+    final ground = Paint()..color = const Color(0xFFD8D8D8); // light gray
     canvas.drawPath(path, ground);
   }
 
-  // ---------- Edge overlay (pad edges highlighted) ----------
   void _paintEdgesOverlay(Canvas canvas) {
     final edges = terrain.poly.edges;
 
     final Paint ridgePaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2
-      ..color = Colors.white10;
+      ..color = Colors.black26;
 
     final Paint padPaint = Paint()
       ..style = PaintingStyle.stroke
@@ -528,7 +582,6 @@ class GamePainter extends CustomPainter {
     }
   }
 
-  // ---------- Rays (engine-provided) ----------
   void _paintRays(Canvas canvas) {
     if (rays.isEmpty) return;
     final origin = Offset(lander.pos.x, lander.pos.y);
@@ -536,17 +589,18 @@ class GamePainter extends CustomPainter {
     final wallPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
-      ..color = Colors.blueAccent.withOpacity(0.45);
+      ..color = Colors.blueAccent.withOpacity(0.55);
 
+    // >>> Terrain rays now RED for visibility <<<
     final terrPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1
-      ..color = Colors.white.withOpacity(0.35);
+      ..strokeWidth = 1.2
+      ..color = Colors.red.withOpacity(0.8);
 
     final padPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.5
-      ..color = Colors.greenAccent.withOpacity(0.9);
+      ..strokeWidth = 1.6
+      ..color = Colors.greenAccent.withOpacity(0.95);
 
     for (final h in rays) {
       final end = Offset(h.p.x, h.p.y);
@@ -561,14 +615,14 @@ class GamePainter extends CustomPainter {
           canvas.drawLine(origin, end, padPaint);
           break;
       }
-      final dotPaint = Paint()..color = (h.kind == RayHitKind.pad)
-          ? Colors.greenAccent
-          : (h.kind == RayHitKind.wall ? Colors.blueAccent : Colors.white70);
-      canvas.drawCircle(end, 1.5, dotPaint);
+      final dotPaint = Paint()
+        ..color = (h.kind == RayHitKind.pad)
+            ? Colors.greenAccent
+            : (h.kind == RayHitKind.wall ? Colors.blueAccent : Colors.red);
+      canvas.drawCircle(end, 1.7, dotPaint);
     }
   }
 
-  // ---------- Particles ----------
   void _paintParticles(Canvas canvas) {
     for (final p in particles) {
       final alpha = (p.life.clamp(0.0, 1.0) * 200).toInt();
@@ -577,9 +631,7 @@ class GamePainter extends CustomPainter {
     }
   }
 
-  // ---------- Lander ----------
   void _paintLander(Canvas canvas) {
-    // Match engine hull (14 x 18 triangle)
     const halfW = 14.0;
     const halfH = 18.0;
 
