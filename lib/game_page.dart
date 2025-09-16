@@ -1,305 +1,119 @@
 // lib/ui/game_page.dart
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
-import 'package:path_provider/path_provider.dart';
-import 'package:flutter/services.dart' show rootBundle;
 
+// ===== Adjust these paths to your project structure =====
+import '../engine/game_engine.dart' as eng;
+import '../engine/types.dart' as eng;
+
+// Optional — if you’re using the policy & intent bus
 import 'package:flutter_application_1/ai/intent_bus.dart';
 import 'package:flutter_application_1/ai/runtime_policy.dart';
 
-/// ======= Demo DTOs (same as in pretrain) =======
+/// ---------------------------------------------------------------------------
+/// Shims so RuntimeTwoStagePolicy can keep using (Lander, Terrain) signatures.
+/// They are just read-only adapters around engine state.
+/// ---------------------------------------------------------------------------
+class Lander {
+  final Offset position;
+  final Offset velocity;
+  final double angle;
+  final double fuel;
 
-class DemoStep {
-  final List<double> x; // feature vector
-  final int thr;        // 0/1
-  final int turn;       // 0:none,1:left,2:right
-  DemoStep(this.x, this.thr, this.turn);
-
-  Map<String, dynamic> toJson() => {'x': x, 'thr': thr, 'turn': turn};
+  Lander.fromEngine(eng.LanderState s)
+      : position = Offset(s.pos.x, s.pos.y),
+        velocity = Offset(s.vel.x, s.vel.y),
+        angle = s.angle,
+        fuel = s.fuel;
 }
 
-class DemoEpisode {
-  final List<DemoStep> steps;
-  final bool landed;
-  DemoEpisode(this.steps, {this.landed = false});
+class Terrain {
+  final eng.Terrain _t;
+  Terrain(this._t);
 
-  Map<String, dynamic> toJson() =>
-      {'landed': landed, 'steps': steps.map((s) => s.toJson()).toList()};
+  double heightAt(double x) => _t.heightAt(x);
+  double get padX1 => _t.padX1;
+  double get padX2 => _t.padX2;
+  double get padY  => _t.padY;
 }
 
-class DemoSet {
-  final int inputSize;
-  final List<DemoEpisode> episodes;
-  DemoSet({required this.inputSize, required this.episodes});
-
-  Map<String, dynamic> toJson() =>
-      {'inputSize': inputSize, 'episodes': episodes.map((e) => e.toJson()).toList()};
-
-  String toPrettyJson() => const JsonEncoder.withIndent('  ').convert(toJson());
-}
-
-/// ======= Ray casting types =======
-
-enum RayHitKind { terrain, wall, pad }
-
-class RayHit {
-  final Offset p;
-  final double t; // param along ray (distance in ray units)
-  final RayHitKind kind;
-  const RayHit(this.p, this.t, this.kind);
-}
-
-class RayConfig {
-  final int rayCount;
-  final bool includeFloor;
-  const RayConfig({this.rayCount = 180, this.includeFloor = false});
-
-  RayConfig copyWith({int? rayCount, bool? includeFloor}) =>
-      RayConfig(rayCount: rayCount ?? this.rayCount, includeFloor: includeFloor ?? this.includeFloor);
-}
-
-/// Simple raycaster against terrain polyline and arena bounds.
-class Raycaster {
-  /// Intersects ray O + t*D with segment AB.
-  /// Returns (t,u) where t>=0 on ray, u in [0,1] on segment; null if no hit or parallel.
-  static ({double t, double u})? _raySegment(Offset O, Offset D, Offset A, Offset B) {
-    final vx = D.dx, vy = D.dy;
-    final sx = B.dx - A.dx, sy = B.dy - A.dy;
-
-    // Solve: O + t*D = A + u*(B-A)
-    final det = (-sx * vy + vx * sy);
-    if (det.abs() < 1e-9) return null; // parallel
-
-    final oxax = O.dx - A.dx;
-    final oway = O.dy - A.dy;
-    final t = (-sy * oxax + sx * oway) / det;
-    final u = (-vy * oxax + vx * oway) / det;
-
-    if (t >= 0 && u >= 0 && u <= 1) return (t: t, u: u);
-    return null;
-  }
-
-  /// Cast a single ray; returns closest hit point & kind (terrain or wall).
-  static RayHit _castOne({
-    required Offset origin,
-    required Offset dir, // unit-ish
-    required Terrain terrain,
-    required Size world,
-    required bool includeFloor,
-  }) {
-    double bestT = double.infinity;
-    RayHitKind bestKind = RayHitKind.wall;
-    Offset bestP = origin;
-
-    // Terrain segments
-    final pts = terrain.points;
-    for (int i = 0; i < pts.length - 1; i++) {
-      final A = pts[i];
-      final B = pts[i + 1];
-      final sol = _raySegment(origin, dir, A, B);
-      if (sol != null && sol.t < bestT) {
-        bestT = sol.t;
-        bestP = origin + dir * sol.t;
-        bestKind = terrain.segmentIsPad(A, B) ? RayHitKind.pad : RayHitKind.terrain;
-      }
-    }
-
-    // Arena walls / ceiling / floor
-    final List<(Offset, Offset)> walls = [
-      (const Offset(0, 0), Offset(world.width, 0)), // ceiling
-      (const Offset(0, 0), Offset(0, world.height)), // left wall
-      (Offset(world.width, 0), Offset(world.width, world.height)), // right wall
-      if (includeFloor) (Offset(0, world.height), Offset(world.width, world.height)), // optional floor
-    ];
-
-    for (final (A, B) in walls) {
-      final sol = _raySegment(origin, dir, A, B);
-      if (sol != null && sol.t < bestT) {
-        bestT = sol.t;
-        bestP = origin + dir * sol.t;
-        bestKind = RayHitKind.wall;
-      }
-    }
-
-    // Fallback: if nothing hit (shouldn't happen), clamp to screen bounds
-    if (!bestT.isFinite) {
-      // shoot to far edge in dir and clamp
-      final far = origin + dir * 2000.0;
-      final clamped = Offset(
-        far.dx.clamp(0.0, world.width),
-        far.dy.clamp(0.0, world.height),
-      );
-      return RayHit(clamped, (clamped - origin).distance, RayHitKind.wall);
-    }
-
-    return RayHit(bestP, bestT, bestKind);
-  }
-
-  /// Compute N rays around the origin (0..2π), returns list of hits sorted by angle index.
-  static List<RayHit> castAll({
-    required Offset origin,
-    required Terrain terrain,
-    required Size world,
-    int rayCount = 180,
-    bool includeFloor = false,
-  }) {
-    final hits = List<RayHit>.empty(growable: true);
-    final twoPi = math.pi * 2.0;
-    final maxLen = world.width.hypot(world.height); // for normalization if needed
-
-    for (int i = 0; i < rayCount; i++) {
-      final th = twoPi * (i / rayCount);
-      final dir = Offset(math.cos(th), math.sin(th));
-      final hit = _castOne(
-        origin: origin,
-        dir: dir,
-        terrain: terrain,
-        world: world,
-        includeFloor: includeFloor,
-      );
-      // normalize t to pixels (already is, since dir is unit)
-      hits.add(hit);
-    }
-    return hits;
-  }
-}
-
-extension on double {
-  double hypot(double other) => math.sqrt(this * this + other * other);
-}
-extension on double Function(double) {}
-
-/// ======= Game types =======
-
+/// ---------------------------------------------------------------------------
+/// GamePage — UI is now a thin shell over the engine. No ray math here.
+/// ---------------------------------------------------------------------------
 class GamePage extends StatefulWidget {
-  const GamePage({super.key});
+  const GamePage({super.key, this.config});
+
+  /// Optionally pass a ready EngineConfig. If null, we create one from the
+  /// screen size via the EngineConfig constructor defaults.
+  final eng.EngineConfig? config;
+
   @override
   State<GamePage> createState() => _GamePageState();
-}
-
-enum GameStatus { playing, landed, crashed }
-
-class Tunables {
-  double gravity; // base gravity strength
-  double thrustAccel; // engine acceleration
-  double rotSpeed; // radians per second
-  double maxFuel; // fuel units
-  Tunables({
-    this.gravity = 0.18,
-    this.thrustAccel = 0.42,
-    this.rotSpeed = 1.6,
-    this.maxFuel = 1000.0,
-  });
-
-  Tunables copyWith({
-    double? gravity,
-    double? thrustAccel,
-    double? rotSpeed,
-    double? maxFuel,
-  }) =>
-      Tunables(
-        gravity: gravity ?? this.gravity,
-        thrustAccel: thrustAccel ?? this.thrustAccel,
-        rotSpeed: rotSpeed ?? this.rotSpeed,
-        maxFuel: maxFuel ?? this.maxFuel,
-      );
-}
-
-class Particle {
-  Offset pos;
-  Offset vel;
-  double life; // 0..1
-  Particle({required this.pos, required this.vel, required this.life});
 }
 
 class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin {
   late final Ticker _ticker;
 
-  static const double kLandingSpeedMax = 5.0;
-  static const double kLandingAngleMaxRad = 8 * math.pi / 180;
+  // Engine + config
+  eng.GameEngine? _engine;
+  eng.EngineConfig? _cfg;
 
-  Duration _lastElapsed = Duration.zero;
-
-  // Tunables
-  Tunables t = Tunables();
-
-  // World & entities
-  Size? _worldSize; // set in LayoutBuilder
-  Terrain? _terrain; // generated once per size
-  Lander lander = const Lander(
-    position: Offset(160, 120),
-    velocity: Offset.zero,
-    angle: 0,
-    fuel: 100,
-  );
-  final List<Particle> _particles = [];
-
-  // Input (manual)
+  // Manual input (ignored when AI is on)
   bool thrust = false;
   bool left = false;
   bool right = false;
 
-  // AI (two-stage runtime policy)
+  // AI (optional)
   bool aiPlay = false;
   RuntimeTwoStagePolicy? _policy;
   String _policyInfo = 'No policy loaded';
-
-  // Fast intent HUD state
-  String _intentNow = '—';
+  String _intentLabel = '—';
   List<double>? _intentProbs;
 
-  // IntentBus subscriptions
+  // Intent bus (optional)
   StreamSubscription<IntentEvent>? _intentSub;
   StreamSubscription<ControlEvent>? _controlSub;
-  String? _lastIntent;
 
-  // Demo recording
-  bool recordDemos = false;
-  final List<DemoEpisode> _demoEpisodes = [];
-  final List<DemoStep> _currentSteps = [];
-  int _feGroundSamples = 3; // will be overwritten by policy.fe if present
-  double _feStridePx = 48;
-
-  // Game state
-  GameStatus status = GameStatus.playing;
-
-  // Randomness for UI terrain/spawn
-  final math.Random _uiRnd = math.Random();
-  int _terrainSeed = DateTime.now().microsecondsSinceEpoch;
-  bool _useFixedSeed = false; // set true to freeze terrain for debugging
-
-  // Timing/frame
-  int _frame = 0;
-
-  // ===== Ray casting UI/state =====
+  // Ray UI toggles (we just mirror these into engine.rayCfg)
   bool _showRays = true;
-  RayConfig _rayCfg = const RayConfig(rayCount: 180, includeFloor: false);
-  List<RayHit> _rays = const []; // computed each frame (cheap)
+  int _rayCountUi = 180;
+  bool _rayIncludeFloor = false;
+
+  // Timing
+  Duration _lastElapsed = Duration.zero;
+  int _frame = 0;
 
   @override
   void initState() {
     super.initState();
     _ticker = createTicker(_onTick)..start();
 
-    // Subscribe to the global singleton bus (debug prints only; HUD uses direct return)
+    // Optional debug bus hooks
     _intentSub = IntentBus.instance.intentsWithReplay().listen((e) {
-      _lastIntent = e.intent;
-      // no SnackBar here — it introduces lag
       debugPrint('[BUS/UI] intent=${e.intent} probs=${e.probs}');
     });
     _controlSub = IntentBus.instance.controlsWithReplay().listen((c) {
       debugPrint('[BUS/UI] control: T=${c.thrust} L=${c.left} R=${c.right} meta=${c.meta}');
     });
 
-    // Auto-load policy on startup
+    // Optional: load policy from assets
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      await _loadPolicy();         // load default policy.json
-      _reset();                    // start a fresh episode after loading
+      try {
+        final pol = await RuntimeTwoStagePolicy.loadFromAsset(
+          'assets/ai/policy.json',
+          planHold: 1,
+        );
+        setState(() {
+          _policy = pol;
+          _policyInfo =
+          'Loaded policy: h1=${pol.h1}, h2=${pol.h2}, fe(gs=${pol.fe.groundSamples}, stride=${pol.fe.stridePx}), planHold=12';
+        });
+      } catch (e) {
+        debugPrint('Policy load failed (ok if not using AI): $e');
+      }
     });
   }
 
@@ -311,341 +125,229 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     super.dispose();
   }
 
+  // Build a default EngineConfig using its constructor defaults
+  eng.EngineConfig _makeEngineConfig(Size world) {
+    return eng.EngineConfig(
+      worldW: world.width,
+      worldH: world.height,
+      t: eng.Tunables(
+        gravity: 0.18,
+        thrustAccel: 0.42,
+        rotSpeed: 1.6,
+        maxFuel: 1000.0,
+        crashOnTilt: true,
+        landingMaxVx: 28.0,
+        landingMaxVy: 38.0,
+        landingMaxOmega: 2.0,
+      ),
+      // Everything else keeps EngineConfig’s default values.
+    );
+  }
+
+  void _ensureEngine(Size world) {
+    if (_engine != null) return;
+    _cfg = widget.config ?? _makeEngineConfig(world);
+    _engine = eng.GameEngine(_cfg!);
+    // Mirror ray UI -> engine
+    _engine!.rayCfg = _engine!.rayCfg.copyWith(
+      rayCount: _rayCountUi,
+      includeFloor: _rayIncludeFloor,
+      forwardAligned: true,
+    );
+  }
+
   void _toggleAI() {
-    setState(() {
-      aiPlay = !aiPlay;
-      if (aiPlay) {
-        recordDemos = false;
-        thrust = left = right = false;
-        _lastIntent = null;
-      } else {
-        _policy?.resetPlanner();
-      }
-    });
-    _showToast(aiPlay ? 'AI: ON' : 'AI: OFF');
+    setState(() => aiPlay = !aiPlay);
+    _toast(aiPlay ? 'AI: ON' : 'AI: OFF');
   }
 
   void _reset() {
-    final size = _worldSize ?? const Size(360, 640);
-
-    // Close any ongoing recording episode
-    if (recordDemos && _currentSteps.isNotEmpty) {
-      _demoEpisodes.add(DemoEpisode(List.of(_currentSteps), landed: status == GameStatus.landed));
-      _currentSteps.clear();
-    }
-
-    // Randomize terrain (unless fixed)
-    if (!_useFixedSeed) {
-      _terrainSeed = DateTime.now().microsecondsSinceEpoch ^ _uiRnd.nextInt(1 << 30);
-      _terrain = Terrain.generate(size, seed: _terrainSeed);
-    } else {
-      _terrain ??= Terrain.generate(size, seed: 12345);
-    }
-
+    _engine?.reset();
     setState(() {
-      status = GameStatus.playing;
-      _particles.clear();
-
-      // Randomize spawn X in [0.2, 0.8] of screen width
-      final fracX = 0.20 + _uiRnd.nextDouble() * 0.60;
-      lander = Lander(
-        position: Offset(size.width * fracX, 120),
-        velocity: Offset.zero,
-        angle: 0,
-        fuel: t.maxFuel,
-      );
-
-      thrust = left = right = false;
-      _frame = 0;
-      _intentNow = '—';
+      _intentLabel = '—';
       _intentProbs = null;
-      _rays = const [];
+      _frame = 0;
     });
-
-    _policy?.resetPlanner();
-
-    debugPrint('[GamePage.reset] W=${size.width.toStringAsFixed(1)} '
-        'H=${size.height.toStringAsFixed(1)} seed=$_terrainSeed '
-        'spawnX=${lander.position.dx.toStringAsFixed(1)}');
-  }
-
-  Future<void> _saveDemos() async {
-    if (recordDemos && _currentSteps.isNotEmpty) {
-      _demoEpisodes.add(DemoEpisode(List.of(_currentSteps), landed: false));
-      _currentSteps.clear();
-    }
-    // IMPORTANT: match training (10 + groundSamples), angle not sin/cos
-    final inputSize = 10 + _feGroundSamples;
-    final ds = DemoSet(inputSize: inputSize, episodes: _demoEpisodes);
-
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final file = File('${dir.path}/demos.json');
-      await file.writeAsString(ds.toPrettyJson());
-      if (!mounted) return;
-      _showToast('Saved ${_demoEpisodes.length} demos → ${file.path}');
-    } catch (e) {
-      if (!mounted) return;
-      _showToast('Save failed: $e');
-    }
-  }
-
-  Future<void> _loadPolicy() async {
-    try {
-      String jsonText;
-      RuntimeTwoStagePolicy pol;
-
-      // 1) Try Documents/policy.json (trainer output)
-      final dir = await getApplicationDocumentsDirectory();
-      final file = File('${dir.path}/policy.json');
-      if (await file.exists()) {
-        jsonText = await file.readAsString();
-        pol = RuntimeTwoStagePolicy.fromJson(
-          jsonText,
-          planHold: 1,
-        );
-      } else {
-        // 2) Fallback: bundled asset
-        pol = await RuntimeTwoStagePolicy.loadFromAsset(
-          'assets/ai/policy.json',
-          planHold: 1,
-        );
-      }
-
-      setState(() {
-        _policy = pol;
-        _policyInfo =
-        'Loaded policy: h1=${pol.h1}, h2=${pol.h2}, fe(gs=${pol.fe.groundSamples}, stride=${pol.fe.stridePx}), planHold=12';
-        _feGroundSamples = pol.fe.groundSamples;
-        _feStridePx = pol.fe.stridePx;
-      });
-
-      if (!mounted) return;
-      _showToast(_policyInfo);
-    } catch (e) {
-      if (!mounted) return;
-      _showToast('Load policy failed: $e');
-    }
   }
 
   void _onTick(Duration elapsed) {
+    final engine = _engine;
+    if (engine == null) return;
+
     double dt = (elapsed - _lastElapsed).inMicroseconds / 1e6;
     _lastElapsed = elapsed;
-
     if (dt <= 0) dt = 1 / 60.0;
     dt = dt.clamp(0, 1 / 20.0);
 
-    if (!mounted || status != GameStatus.playing || _terrain == null) return;
+    if (engine.status != eng.GameStatus.playing) return;
 
-    setState(() {
-      // --- If AI is active, compute controls here (override manual) ---
-      if (aiPlay && _policy != null && _worldSize != null) {
-        final (thr, lf, rt, idx, probs) = _policy!.actWithIntent(
-          lander: lander,
-          terrain: _terrain!,
-          worldW: _worldSize!.width,
-          worldH: _worldSize!.height,
-          step: _frame,
-        );
-        thrust = thr;
-        left = lf;
-        right = rt;
-        _intentNow = kIntentNames[idx];
-        _intentProbs = probs;
-      }
-
-      // --- Controls & rotation (apply scale 0.5) ---
-      double angle = lander.angle;
-      final rot = t.rotSpeed * 0.5;
-      if (left && !right) angle -= rot * dt;
-      if (right && !left) angle += rot * dt;
-
-      // --- Acceleration (apply 0.05 scalers to gravity and thrust) ---
-      Offset accel = Offset(0, t.gravity * 0.05);
-      double fuel = lander.fuel;
-      final thrustingNow = thrust && fuel > 0;
-      if (thrustingNow) {
-        accel += Offset(math.sin(angle), -math.cos(angle)) * (t.thrustAccel * 0.05);
-        fuel = (fuel - 20 * dt).clamp(0, t.maxFuel);
-      }
-
-      // --- Integrate (semi-implicit Euler) ---
-      Offset vel = lander.velocity + accel * dt * 60; // tuned time scale
-      Offset pos = lander.position + vel * dt * 60;
-
-      // --- Hard ceiling (prevent boosting out) ---
-      if (pos.dy < 0) {
-        pos = Offset(pos.dx, 0);
-        if (vel.dy < 0) vel = Offset(vel.dx, 0);
-      }
-
-      // --- Hard walls (no wrap) ---
-      final w = _worldSize?.width ?? 360.0;
-      final h = _worldSize?.height ?? 640.0;
-      if (pos.dx < 0) {
-        pos = Offset(0, pos.dy);
-        vel = Offset(0, vel.dy);
-      }
-      if (pos.dx > w) {
-        pos = Offset(w, pos.dy);
-        vel = Offset(0, vel.dy);
-      }
-      if (_rayCfg.includeFloor && pos.dy > h) {
-        pos = Offset(pos.dx, h);
-        if (vel.dy > 0) vel = Offset(vel.dx, 0);
-      }
-
-      // --- Particle exhaust ---
-      if (thrustingNow) {
-        final c = math.cos(angle);
-        final s = math.sin(angle);
-        final axis = Offset(-s, c); // down in ship frame
-        final flameBase = pos + axis * Lander.halfHeight;
-        final rnd = math.Random();
-        for (int i = 0; i < 6; i++) {
-          final perp = Offset(-c, -s);
-          final spread = (rnd.nextDouble() - 0.5) * 0.35;
-          final dir = (axis + perp * spread);
-          final speed = 60 + rnd.nextDouble() * 60;
-          _particles.add(Particle(pos: flameBase, vel: dir * speed, life: 1.0));
-        }
-      }
-
-      // --- Update particles ---
-      for (int i = _particles.length - 1; i >= 0; i--) {
-        final p = _particles[i];
-        p.life -= dt * 1.8;
-        p.vel += Offset(0, t.gravity * 0.05 * 0.2); // tiny gravity on smoke
-        p.pos += p.vel * dt;
-        if (p.life <= 0) _particles.removeAt(i);
-      }
-
-      // --- Collision with terrain ---
-      final feet = lander.footPoints(pos, angle);
-      final groundYLeft = _terrain!.heightAt(feet.left.dx);
-      final groundYRight = _terrain!.heightAt(feet.right.dx);
-      final groundYCenter = _terrain!.heightAt(pos.dx);
-
-      final collided = feet.left.dy >= groundYLeft ||
-          feet.right.dy >= groundYRight ||
-          pos.dy >= groundYCenter - 2;
-
-      if (collided) {
-        final onPad = _terrain!.isOnPad(pos.dx);
-        final speed = vel.distance;
-        final gentle = speed <= kLandingSpeedMax && angle.abs() <= kLandingAngleMaxRad;
-        if (onPad && gentle) {
-          status = GameStatus.landed;
-          pos = Offset(pos.dx, _terrain!.padY - Lander.halfHeight);
-          vel = Offset.zero;
-        } else {
-          status = GameStatus.crashed;
-        }
-
-        // Close demo episode on terminal
-        if (recordDemos && _currentSteps.isNotEmpty) {
-          _demoEpisodes.add(DemoEpisode(List.of(_currentSteps), landed: status == GameStatus.landed));
-          _currentSteps.clear();
-        }
-      }
-
-      // --- RECORDING: store a demo sample for human play only ---
-      if (recordDemos && !aiPlay && _terrain != null && _worldSize != null) {
-        final features = _extractFeatures(
-          position: pos,
-          velocity: vel,
-          angle: angle,
-          fuel: fuel,
-          terrain: _terrain!,
-          worldW: _worldSize!.width,
-          worldH: _worldSize!.height,
-          groundSamples: _feGroundSamples,
-          stridePx: _feStridePx,
-        );
-        final thrI = thrust ? 1 : 0;
-        final turnI = left ? 1 : (right ? 2 : 0);
-        _currentSteps.add(DemoStep(features, thrI, turnI));
-      }
-
-      // --- Commit state ---
-      lander = lander.copyWith(position: pos, velocity: vel, angle: angle, fuel: fuel);
-      _frame++;
-
-      // --- Recompute rays (cheap): origin at lander nose or center? Use center for now ---
-      if (_worldSize != null && _terrain != null && _showRays) {
-        _rays = Raycaster.castAll(
-          origin: lander.position,
-          terrain: _terrain!,
-          world: _worldSize!,
-          rayCount: _rayCfg.rayCount,
-          includeFloor: _rayCfg.includeFloor,
-        );
-      } else {
-        _rays = const [];
-      }
-    });
-  }
-
-  /// Matches training/runtime feature layout:
-  /// [px, py, vx, vy, ang, fuel, padCenter, dxCenter, dGround, slope, samples...]
-  List<double> _extractFeatures({
-    required Offset position,
-    required Offset velocity,
-    required double angle,
-    required double fuel,
-    required Terrain terrain,
-    required double worldW,
-    required double worldH,
-    required int groundSamples,
-    required double stridePx,
-  }) {
-    final px = position.dx / worldW;
-    final py = position.dy / worldH;
-    final vx = (velocity.dx / 200.0).clamp(-2.0, 2.0);
-    final vy = (velocity.dy / 200.0).clamp(-2.0, 2.0);
-    final ang = (angle / math.pi).clamp(-1.5, 1.5); // IMPORTANT: use angle (not sin/cos)
-    final fuelN = (fuel / t.maxFuel).clamp(0.0, 1.0);
-
-    final padCenter = ((_terrain!.padX1 + _terrain!.padX2) * 0.5) / worldW;
-    final dxCenter =
-    ((position.dx - (_terrain!.padX1 + _terrain!.padX2) * 0.5) / worldW).clamp(-1.0, 1.0);
-
-    final gY = terrain.heightAt(position.dx);
-    final dGround = ((gY - position.dy) / worldH).clamp(-1.0, 1.0);
-    final gyL = terrain.heightAt((position.dx - 20).clamp(0.0, worldW));
-    final gyR = terrain.heightAt((position.dx + 20).clamp(0.0, worldW));
-    final slope = (((gyR - gyL) / 40.0) / 0.5).clamp(-2.0, 2.0);
-
-    final n = groundSamples;
-    final samples = <double>[];
-    final center = (n - 1) / 2.0;
-    for (int k = 0; k < n; k++) {
-      final relIndex = k - center;
-      final sx = (position.dx + relIndex * stridePx).clamp(0.0, worldW);
-      final sy = terrain.heightAt(sx);
-      final rel = ((sy - position.dy) / worldH).clamp(-1.0, 1.0);
-      samples.add(rel);
+    // Controls: AI overrides manual
+    bool T = thrust, L = left, R = right;
+    if (aiPlay && _policy != null) {
+      final (thrB, leftB, rightB, idx, probs) = _policy!.actWithIntent(
+        lander: Lander.fromEngine(engine.lander),
+        terrain: Terrain(engine.terrain),
+        worldW: engine.cfg.worldW.toDouble(),
+        worldH: engine.cfg.worldH.toDouble(),
+        step: _frame,
+      );
+      T = thrB; L = leftB; R = rightB;
+      _intentLabel = 'Intent #$idx';
+      _intentProbs = probs;
     }
 
-    return [
-      px, py, vx, vy, ang, fuelN,
-      padCenter, dxCenter, dGround, slope,
-      ...samples,
-    ];
+    engine.step(dt, eng.ControlInput(thrust: T, left: L, right: R, intentIdx: null));
+    _frame++;
+    setState(() {}); // just repaint; no heavy work here
   }
 
-  void _showToast(String text) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).hideCurrentSnackBar();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(text),
-        behavior: SnackBarBehavior.floating,
-        margin: const EdgeInsets.only(left: 12, right: 12, bottom: 18),
-        duration: const Duration(milliseconds: 900),
-      ),
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: LayoutBuilder(builder: (ctx, c) {
+        final size = Size(c.maxWidth, c.maxHeight);
+        _ensureEngine(size);
+        final engine = _engine!;
+        final lander = engine.lander;
+        final terrain = engine.terrain;
+        final status = engine.status;
+
+        // Keep engine ray settings in sync with UI chips
+        if (engine.rayCfg.rayCount != _rayCountUi ||
+            engine.rayCfg.includeFloor != _rayIncludeFloor) {
+          engine.rayCfg = engine.rayCfg.copyWith(
+            rayCount: _rayCountUi,
+            includeFloor: _rayIncludeFloor,
+          );
+        }
+
+        return Stack(
+          children: [
+            // Canvas
+            Positioned.fill(
+              child: CustomPaint(
+                painter: _GamePainter(
+                  world: size,
+                  lander: lander,
+                  terrain: terrain,
+                  status: status,
+                  rays: _showRays ? engine.rays : const [],
+                ),
+              ),
+            ),
+
+            // HUD
+            SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(12.0),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        _menuButton(),
+                        const SizedBox(width: 8),
+                        ElevatedButton.icon(
+                          onPressed: _reset,
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('Reset'),
+                        ),
+                        const Spacer(),
+                        _aiToggleIcon(),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        _hudBox('Fuel', engine.lander.fuel.toStringAsFixed(0)),
+                        _intentChip(_intentLabel, _intentProbs),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    // Ray controls
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        FilterChip(
+                          label: const Text('Rays'),
+                          selected: _showRays,
+                          onSelected: (v) => setState(() => _showRays = v),
+                        ),
+                        FilterChip(
+                          label: const Text('Floor as wall'),
+                          selected: _rayIncludeFloor,
+                          onSelected: (v) => setState(() => _rayIncludeFloor = v),
+                        ),
+                        const Text('Count:', style: TextStyle(fontSize: 12, color: Colors.white70)),
+                        ChoiceChip(
+                          label: const Text('90'),
+                          selected: _rayCountUi == 90,
+                          onSelected: (_) => setState(() => _rayCountUi = 90),
+                        ),
+                        ChoiceChip(
+                          label: const Text('180'),
+                          selected: _rayCountUi == 180,
+                          onSelected: (_) => setState(() => _rayCountUi = 180),
+                        ),
+                        ChoiceChip(
+                          label: const Text('360'),
+                          selected: _rayCountUi == 360,
+                          onSelected: (_) => setState(() => _rayCountUi = 360),
+                        ),
+                      ],
+                    ),
+                    if (_policy != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Text(_policyInfo,
+                            style: const TextStyle(fontSize: 12, color: Colors.white70)),
+                      ),
+
+                    if (status != eng.GameStatus.playing)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8.0),
+                        child: Center(
+                          child: ElevatedButton.icon(
+                            onPressed: _reset,
+                            icon: const Icon(Icons.replay),
+                            label: const Text('Play again'),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+
+            // Manual controls
+            _buildControls(),
+
+            // Status banner
+            if (status == eng.GameStatus.landed || status == eng.GameStatus.crashed)
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.6),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  child: Text(
+                    status == eng.GameStatus.landed ? 'Touchdown! 🟢' : 'Crashed 💥',
+                    style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+          ],
+        );
+      }),
     );
   }
+
+  // ===== UI helpers =====
 
   Widget _aiToggleIcon() {
     final active = aiPlay;
@@ -667,219 +369,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
             size: 22,
           ),
         ),
-      ),
-    );
-  }
-
-  Widget _intentChip(String label, List<double>? probs) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: Colors.white12,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white24),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('Intent', style: TextStyle(fontSize: 12, color: Colors.white70)),
-          Text(label, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-          if (probs != null && probs.isNotEmpty)
-            Text('p:${probs.map((p)=>p.toStringAsFixed(2)).join("/")}',
-              style: const TextStyle(fontSize: 10, color: Colors.white54),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _rayControls() {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: [
-        FilterChip(
-          label: const Text('Rays'),
-          selected: _showRays,
-          onSelected: (v) => setState(() => _showRays = v),
-        ),
-        FilterChip(
-          label: const Text('Floor as wall'),
-          selected: _rayCfg.includeFloor,
-          onSelected: (v) => setState(() => _rayCfg = _rayCfg.copyWith(includeFloor: v)),
-        ),
-        const Text('Count:', style: TextStyle(fontSize: 12, color: Colors.white70)),
-        ChoiceChip(
-          label: const Text('90'),
-          selected: _rayCfg.rayCount == 90,
-          onSelected: (_) => setState(() => _rayCfg = _rayCfg.copyWith(rayCount: 90)),
-        ),
-        ChoiceChip(
-          label: const Text('180'),
-          selected: _rayCfg.rayCount == 180,
-          onSelected: (_) => setState(() => _rayCfg = _rayCfg.copyWith(rayCount: 180)),
-        ),
-        ChoiceChip(
-          label: const Text('360'),
-          selected: _rayCfg.rayCount == 360,
-          onSelected: (_) => setState(() => _rayCfg = _rayCfg.copyWith(rayCount: 360)),
-        ),
-      ],
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          _worldSize = Size(constraints.maxWidth, constraints.maxHeight);
-          _terrain ??= Terrain.generate(
-            _worldSize!,
-            seed: _useFixedSeed ? 12345 : _terrainSeed,
-          );
-
-          return Stack(
-            children: [
-              // Game canvas
-              Positioned.fill(
-                child: CustomPaint(
-                  painter: GamePainter(
-                    lander: lander,
-                    terrain: _terrain!,
-                    thrusting: thrust && lander.fuel > 0 && status == GameStatus.playing,
-                    status: status,
-                    particles: _particles,
-                    rays: _showRays ? _rays : const [],
-                    includeFloor: _rayCfg.includeFloor,
-                  ),
-                ),
-              ),
-
-              // HUD
-              SafeArea(
-                child: Padding(
-                  padding: const EdgeInsets.all(12.0),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      // Top row: back/menu
-                      Padding(
-                        padding: const EdgeInsets.all(12.0),
-                        child: _menuButton(),
-                      ),
-
-                      // Stats + AI toggle + fast intent chip
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          _hudBox(title: 'Fuel', value: lander.fuel.toStringAsFixed(0)),
-                          _intentChip(_intentNow, _intentProbs),
-                          _aiToggleIcon(),
-                        ],
-                      ),
-
-                      const SizedBox(height: 8),
-
-                      // Recording + terrain + reset + ray controls
-                      _rayControls(),
-                      const SizedBox(height: 8),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        crossAxisAlignment: WrapCrossAlignment.center,
-                        children: [
-                          FilterChip(
-                            label: const Text('AI Play'),
-                            selected: aiPlay,
-                            onSelected: (_) => _toggleAI(),
-                          ),
-                          const SizedBox(width: 8),
-                          FilterChip(
-                            label: const Text('Record'),
-                            selected: recordDemos,
-                            onSelected: (v) {
-                              if (aiPlay && v) {
-                                _showToast('Disable AI Play to record demos');
-                                return;
-                              }
-                              setState(() => recordDemos = v);
-                            },
-                          ),
-                          ElevatedButton.icon(
-                            onPressed: _saveDemos,
-                            icon: const Icon(Icons.save),
-                            label: const Text('Save demos'),
-                          ),
-                          const SizedBox(width: 12),
-                          FilterChip(
-                            label: const Text('Fixed terrain'),
-                            selected: _useFixedSeed,
-                            onSelected: (v) {
-                              setState(() {
-                                _useFixedSeed = v;
-                                _terrain = null; // regenerate next build
-                              });
-                              _reset();
-                            },
-                          ),
-                          ElevatedButton.icon(
-                            onPressed: _reset,
-                            icon: const Icon(Icons.refresh),
-                            label: const Text('Reset'),
-                          ),
-                        ],
-                      ),
-
-                      Padding(
-                        padding: const EdgeInsets.only(top: 6),
-                        child: Text(
-                          _policyInfo,
-                          style: const TextStyle(fontSize: 12, color: Colors.white70),
-                        ),
-                      ),
-
-                      if (status != GameStatus.playing)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 8.0),
-                          child: Center(
-                            child: ElevatedButton.icon(
-                              onPressed: _reset,
-                              icon: const Icon(Icons.replay),
-                              label: const Text('Play again'),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-
-              // Manual controls (visible always; ignored when AI is on)
-              _buildControls(),
-
-              // Status banner
-              if (status == GameStatus.landed || status == GameStatus.crashed)
-                Center(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.6),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.white24),
-                    ),
-                    child: Text(
-                      status == GameStatus.landed ? 'Touchdown! 🟢' : 'Crashed 💥',
-                      style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-                    ),
-                  ),
-                ),
-            ],
-          );
-        },
       ),
     );
   }
@@ -911,29 +400,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     );
   }
 
-  Widget _buildControls() {
-    return IgnorePointer(
-      ignoring: status != GameStatus.playing,
-      child: Align(
-        alignment: Alignment.bottomCenter,
-        child: Padding(
-          padding: const EdgeInsets.only(bottom: 24.0),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              _holdButton(icon: Icons.rotate_left, onChanged: (v) => setState(() => left = v)),
-              _holdButton(
-                  icon: Icons.local_fire_department,
-                  onChanged: (v) => setState(() => thrust = v),
-                  big: true),
-              _holdButton(icon: Icons.rotate_right, onChanged: (v) => setState(() => right = v)),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
   Widget _holdButton({
     required IconData icon,
     required ValueChanged<bool> onChanged,
@@ -957,7 +423,27 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     );
   }
 
-  Widget _hudBox({required String title, required String value}) {
+  Widget _buildControls() {
+    return Align(
+      alignment: Alignment.bottomCenter,
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 24.0),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: [
+            _holdButton(icon: Icons.rotate_left, onChanged: (v) => setState(() => left = v)),
+            _holdButton(
+                icon: Icons.local_fire_department,
+                onChanged: (v) => setState(() => thrust = v),
+                big: true),
+            _holdButton(icon: Icons.rotate_right, onChanged: (v) => setState(() => right = v)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _hudBox(String title, String value) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
@@ -975,128 +461,61 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       ),
     );
   }
-}
 
-class Lander {
-  final Offset position; // center of mass
-  final Offset velocity;
-  final double angle; // radians, 0 = up
-  final double fuel;
+  Widget _intentChip(String label, List<double>? probs) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.white12,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Intent', style: TextStyle(fontSize: 12, color: Colors.white70)),
+          Text(label, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          if (probs != null && probs.isNotEmpty)
+            Text(
+              'p:${probs.map((p) => p.toStringAsFixed(2)).join("/")}',
+              style: const TextStyle(fontSize: 10, color: Colors.white54),
+            ),
+        ],
+      ),
+    );
+  }
 
-  static const double halfWidth = 14; // px
-  static const double halfHeight = 18; // px
-
-  const Lander({
-    required this.position,
-    required this.velocity,
-    required this.angle,
-    required this.fuel,
-  });
-
-  Lander copyWith({Offset? position, Offset? velocity, double? angle, double? fuel}) => Lander(
-    position: position ?? this.position,
-    velocity: velocity ?? this.velocity,
-    angle: angle ?? this.angle,
-    fuel: fuel ?? this.fuel,
-  );
-
-  ({Offset left, Offset right}) footPoints(Offset pos, double ang) {
-    final c = math.cos(ang);
-    final s = math.sin(ang);
-    final bottomCenter = pos + const Offset(0, halfHeight);
-    const leftLocal = Offset(-halfWidth, 0);
-    const rightLocal = Offset(halfWidth, 0);
-    Offset rot(Offset v) => Offset(c * v.dx - s * v.dy, s * v.dx + c * v.dy);
-    return (left: bottomCenter + rot(leftLocal), right: bottomCenter + rot(rightLocal));
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.only(left: 12, right: 12, bottom: 18),
+        duration: const Duration(milliseconds: 900),
+      ),
+    );
   }
 }
 
-class Terrain {
-  final List<Offset> points; // polyline ridge
-  final double padX1;
-  final double padX2;
-  final double padY;
+/// ---------------------------------------------------------------------------
+/// Painter — reads engine state and paints; NO physics, NO ray casting here.
+/// ---------------------------------------------------------------------------
+class _GamePainter extends CustomPainter {
+  final Size world;
+  final eng.LanderState lander;
+  final eng.Terrain terrain;
+  final eng.GameStatus status;
+  final List<eng.RayHit> rays;
 
-  Terrain({required this.points, required this.padX1, required this.padX2, required this.padY});
-
-  bool segmentIsPad(Offset a, Offset b) {
-    const eps = 1e-6;
-    bool xIn(Offset p) => p.dx >= padX1 - eps && p.dx <= padX2 + eps;
-    return xIn(a) && xIn(b) && (a.dy - padY).abs() < 1e-6 && (b.dy - padY).abs() < 1e-6;
-  }
-
-  static Terrain generate(Size size, {int? seed}) {
-    final rnd = math.Random(seed ?? DateTime.now().microsecondsSinceEpoch);
-    final width = size.width;
-    final height = size.height;
-
-    // Ridge
-    final List<Offset> pts = [];
-    const int segments = 24;
-    for (int i = 0; i <= segments; i++) {
-      final x = width * i / segments;
-      final base = height * 0.78;
-      final noise = (math.sin(i * 0.8) + rnd.nextDouble() * 0.5) * 24.0;
-      pts.add(Offset(x, base + noise));
-    }
-
-    // Landing pad
-    final padWidth = width * 0.16;
-    final padCenterX = width * (0.35 + rnd.nextDouble() * 0.3);
-    final padX1 = (padCenterX - padWidth / 2).clamp(10.0, width - padWidth - 10.0);
-    final padX2 = padX1 + padWidth;
-    final padY = height * 0.76;
-
-    for (int i = 0; i < pts.length; i++) {
-      if (pts[i].dx >= padX1 && pts[i].dx <= padX2) {
-        pts[i] = Offset(pts[i].dx, padY);
-      }
-    }
-
-    // Ends lower for valley look
-    pts[0] = Offset(0, height * 0.92);
-    pts[pts.length - 1] = Offset(width, height * 0.92);
-
-    return Terrain(points: pts, padX1: padX1, padX2: padX2, padY: padY);
-  }
-
-  double get padCenter => (padX1 + padX2) * 0.5;
-
-  double heightAt(double x) {
-    final pts = points;
-    for (int i = 0; i < pts.length - 1; i++) {
-      final a = pts[i];
-      final b = pts[i + 1];
-      if ((x >= a.dx && x <= b.dx) || (x >= b.dx && x <= a.dx)) {
-        final t = (x - a.dx) / (b.dx - a.dx);
-        return a.dy + (b.dy - a.dy) * t;
-      }
-    }
-    return points.last.dy;
-  }
-
-  bool isOnPad(double x) => x >= padX1 && x <= padX2;
-}
-
-class GamePainter extends CustomPainter {
-  final Lander lander;
-  final Terrain terrain;
-  final bool thrusting;
-  final GameStatus status;
-  final List<Particle> particles;
-
-  // Rays
-  final List<RayHit> rays;
-  final bool includeFloor;
-
-  GamePainter({
+  _GamePainter({
+    required this.world,
     required this.lander,
     required this.terrain,
-    required this.thrusting,
     required this.status,
-    required this.particles,
     required this.rays,
-    required this.includeFloor,
   });
 
   @override
@@ -1104,8 +523,7 @@ class GamePainter extends CustomPainter {
     _paintStars(canvas, size);
     _paintTerrain(canvas, size);
     _paintPad(canvas);
-    _paintRays(canvas, size);
-    _paintParticles(canvas);
+    _paintRays(canvas);
     _paintLander(canvas);
   }
 
@@ -1120,9 +538,12 @@ class GamePainter extends CustomPainter {
   }
 
   void _paintTerrain(Canvas canvas, Size size) {
-    final path = Path()..moveTo(terrain.points.first.dx, terrain.points.first.dy);
-    for (int i = 1; i < terrain.points.length; i++) {
-      path.lineTo(terrain.points[i].dx, terrain.points[i].dy);
+    final pts = terrain.ridge;
+    if (pts.isEmpty) return;
+
+    final path = Path()..moveTo(pts.first.x, pts.first.y);
+    for (int i = 1; i < pts.length; i++) {
+      path.lineTo(pts[i].x, pts[i].y);
     }
     path.lineTo(size.width, size.height);
     path.lineTo(0, size.height);
@@ -1140,26 +561,20 @@ class GamePainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2
       ..color = Colors.white10;
-    final ridge = Path()..moveTo(terrain.points.first.dx, terrain.points.first.dy);
-    for (int i = 1; i < terrain.points.length; i++) {
-      ridge.lineTo(terrain.points[i].dx, terrain.points[i].dy);
+    final ridge = Path()..moveTo(pts.first.x, pts.first.y);
+    for (int i = 1; i < pts.length; i++) {
+      ridge.lineTo(pts[i].x, pts[i].y);
     }
     canvas.drawPath(ridge, outline);
 
-    // Boundaries (for reference when rays hit them)
+    // Visualize world bounds (for context of wall hits)
     final boundPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
       ..color = Colors.white12;
-    // ceiling
-    canvas.drawLine(const Offset(0, 0), Offset(size.width, 0), boundPaint);
-    // left/right
-    canvas.drawLine(const Offset(0, 0), Offset(0, size.height), boundPaint);
-    canvas.drawLine(Offset(size.width, 0), Offset(size.width, size.height), boundPaint);
-    // optional floor
-    if (includeFloor) {
-      canvas.drawLine(Offset(0, size.height), Offset(size.width, size.height), boundPaint);
-    }
+    canvas.drawLine(const Offset(0, 0), Offset(size.width, 0), boundPaint); // ceiling
+    canvas.drawLine(const Offset(0, 0), Offset(0, size.height), boundPaint); // left
+    canvas.drawLine(Offset(size.width, 0), Offset(size.width, size.height), boundPaint); // right
   }
 
   void _paintPad(Canvas canvas) {
@@ -1169,47 +584,38 @@ class GamePainter extends CustomPainter {
       (terrain.padX2 - terrain.padX1),
       8,
     );
-    final paint = Paint()..color = status == GameStatus.crashed ? Colors.red : Colors.greenAccent;
+    final paint = Paint()..color = status == eng.GameStatus.crashed ? Colors.red : Colors.greenAccent;
     canvas.drawRRect(RRect.fromRectAndRadius(padRect, const Radius.circular(4)), paint);
   }
 
-  void _paintRays(Canvas canvas, Size size) {
+  void _paintRays(Canvas canvas) {
     if (rays.isEmpty) return;
 
     final pTerrain = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
       ..color = Colors.cyanAccent.withOpacity(0.65);
-
     final pWall = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
       ..color = Colors.pinkAccent.withOpacity(0.55);
-
     final pPad = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2   // a touch bolder for pad
+      ..strokeWidth = 2
       ..color = Colors.limeAccent.withOpacity(0.9);
 
-    for (final hit in rays) {
-      final paint = switch (hit.kind) {
-        RayHitKind.pad => pPad,
-        RayHitKind.terrain => pTerrain,
-        RayHitKind.wall => pWall,
+    final origin = Offset(lander.pos.x, lander.pos.y);
+
+    for (final h in rays) {
+      final hit = Offset(h.p.x, h.p.y);
+      final paint = switch (h.kind) {
+        eng.RayHitKind.pad => pPad,
+        eng.RayHitKind.terrain => pTerrain,
+        eng.RayHitKind.wall => pWall,
       };
-      canvas.drawLine(lander.position, hit.p, paint);
-
-      // tiny dot at hit
+      canvas.drawLine(origin, hit, paint);
       final dot = Paint()..color = paint.color.withOpacity(0.95);
-      canvas.drawCircle(hit.p, 1.8, dot);
-    }
-  }
-
-  void _paintParticles(Canvas canvas) {
-    for (final p in particles) {
-      final alpha = (p.life.clamp(0.0, 1.0) * 200).toInt();
-      final paint = Paint()..color = Colors.orange.withAlpha(alpha);
-      canvas.drawCircle(p.pos, 2.0 + (1 - p.life) * 1.5, paint);
+      canvas.drawCircle(hit, 1.8, dot);
     }
   }
 
@@ -1217,35 +623,25 @@ class GamePainter extends CustomPainter {
     final c = math.cos(lander.angle);
     final s = math.sin(lander.angle);
 
+    const halfWidth = 14.0;
+    const halfHeight = 18.0;
+
     final body = [
-      const Offset(0, -Lander.halfHeight),
-      const Offset(-Lander.halfWidth, Lander.halfHeight),
-      const Offset(Lander.halfWidth, Lander.halfHeight),
+      const Offset(0, -halfHeight),
+      const Offset(-halfWidth, halfHeight),
+      const Offset(halfWidth, halfHeight),
     ];
     Offset rot(Offset v) => Offset(c * v.dx - s * v.dy, s * v.dx + c * v.dy);
 
+    final pos = Offset(lander.pos.x, lander.pos.y);
     final path = Path();
-    final p0 = lander.position + rot(body[0]);
-    final p1 = lander.position + rot(body[1]);
-    final p2 = lander.position + rot(body[2]);
+    final p0 = pos + rot(body[0]);
+    final p1 = pos + rot(body[1]);
+    final p2 = pos + rot(body[2]);
     path.moveTo(p0.dx, p0.dy);
     path.lineTo(p1.dx, p1.dy);
     path.lineTo(p2.dx, p2.dy);
     path.close();
-
-    if (thrusting && lander.fuel > 0) {
-      final flameBase = lander.position + rot(const Offset(0, Lander.halfHeight));
-      final flameTip = lander.position + rot(const Offset(0, Lander.halfHeight + 22));
-      final flamePaint = Paint()
-        ..shader = const RadialGradient(colors: [Colors.yellow, Colors.deepOrange]).createShader(
-          Rect.fromCircle(center: flameBase, radius: 24),
-        );
-      final flamePath = Path()
-        ..moveTo(flameBase.dx - 6, flameBase.dy)
-        ..quadraticBezierTo(flameBase.dx, flameTip.dy, flameBase.dx + 6, flameBase.dy)
-        ..close();
-      canvas.drawPath(flamePath, flamePaint);
-    }
 
     final shipPaint = Paint()
       ..style = PaintingStyle.fill
@@ -1253,32 +649,30 @@ class GamePainter extends CustomPainter {
     canvas.drawPath(path, shipPaint);
 
     final cockpit = Paint()..color = Colors.lightBlueAccent.withOpacity(0.9);
-    canvas.drawCircle(lander.position + rot(const Offset(0, -Lander.halfHeight + 6)), 4, cockpit);
+    canvas.drawCircle(pos + rot(const Offset(0, -halfHeight + 6)), 4, cockpit);
 
     final legs = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2
       ..color = Colors.white70;
     canvas.drawLine(
-      lander.position + rot(const Offset(-Lander.halfWidth * 0.6, Lander.halfHeight * 0.6)),
-      lander.position + rot(const Offset(-Lander.halfWidth, Lander.halfHeight)),
+      pos + rot(const Offset(-halfWidth * 0.6, halfHeight * 0.6)),
+      pos + rot(const Offset(-halfWidth, halfHeight)),
       legs,
     );
     canvas.drawLine(
-      lander.position + rot(const Offset(Lander.halfWidth * 0.6, Lander.halfHeight * 0.6)),
-      lander.position + rot(const Offset(Lander.halfWidth, Lander.halfHeight)),
+      pos + rot(const Offset(halfWidth * 0.6, halfHeight * 0.6)),
+      pos + rot(const Offset(halfWidth, halfHeight)),
       legs,
     );
   }
 
   @override
-  bool shouldRepaint(covariant GamePainter old) {
-    return old.lander != lander ||
+  bool shouldRepaint(covariant _GamePainter old) {
+    return old.world != world ||
+        old.lander != lander ||
         old.terrain != terrain ||
-        old.thrusting != thrusting ||
         old.status != status ||
-        old.particles != particles ||
-        old.rays != rays ||
-        old.includeFloor != includeFloor;
+        old.rays != rays;
   }
 }
