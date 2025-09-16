@@ -215,9 +215,12 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       cx: p.dx,
       cy: p.dy,
       r: _brushRadius,
-      arcSegments: 18,
+      maxArcErrorPx: 1.25,   // tweak for more/less arc points
+      projectEpsPx: 0.75,    // helps avoid residue at boundary
+      simplifyEpsPx: 0.65,
+      rdpTolerancePx: 0.9,
     );
-    e.terrain = carved; // engine caches rays on step; UI repaints now
+    e.terrain = carved;
     setState(() {});
   }
 
