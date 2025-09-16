@@ -1,45 +1,184 @@
-// lib/engine/polygon_carver.dart
 import 'dart:math' as math;
 import 'types.dart';
 
-/// Index-preserving circle carver that *removes material* from the single OUTER ring.
-/// No holes are created; if the brush circle has no intersections with the outline,
-/// the operation is a no-op by design (since holes are disallowed).
+/// Bomb-proof circle carver for a single OUTER ring (no holes).
+/// Algorithm:
+/// 1) Build an indexed vertex list [(idx, p, isHit?, inside?)] from the ring.
+/// 2) For every original edge, compute circle intersections and INSERT them
+///    after the edge start, keeping indices consistent.
+/// 3) Rotate so we start from an OUTSIDE vertex/hit.
+/// 4) Walk once:
+///    - On outside→inside transition: mark ENTER hit.
+///    - Skip all points strictly inside the circle until the next HIT (EXIT).
+///    - Splice a CW arc along the circle from EXIT -> ENTER.
+/// 5) Ensure CCW orientation and return a clean ring.
+///
+/// No RDP or aggressive simplifiers are needed; we only dedup tiny neighbors.
+/// Arc tessellation uses a chord-error bound to avoid zig-zags (“residue”).
 class TerrainCarver {
   static Terrain carveCircle({
     required Terrain terrain,
     required double cx,
     required double cy,
     required double r,
-    double maxArcErrorPx = 1.0,   // arc tessellation error (smaller = more points)
-    double projectEpsPx = 0.75,   // snap near-boundary points to circle
-    double simplifyEpsPx = 0.6,   // dedup & tiny-collinear epsilon
-    double rdpTolerancePx = 0.9,  // Douglas–Peucker tolerance
+    double arcMaxErrPx = 1.0, // arc tessellation chord error
+    double nearCircleSnapPx = 0.75, // snap near-boundary ring verts to the circle
+    double dedupEps = 1e-6,   // neighbor dedup epsilon
   }) {
-    final outer = terrain.poly.outer;
-    if (outer.length < 3) return terrain;
+    final ring0 = terrain.poly.outer;
+    if (ring0.length < 3) return terrain;
 
-    final carved = _carveIndexed(
-      outer,
-      Vector2(cx, cy),
-      r,
-      maxArcErrorPx,
-      projectEpsPx,
-    );
+// Detect orientation of the input outer ring
+    final bool outerIsCCW = _signedArea(ring0) >= 0;
 
-    if (carved.length < 3) {
-      // Fully eaten or numerically unstable -> keep original to remain healthy
+    final C = Vector2(cx, cy);
+    final ring = List<Vector2>.from(ring0);
+    final n0 = ring.length;
+
+    // ==== 1) Build indexed vertex list
+    final verts = <_Vtx>[];
+    for (int i = 0; i < n0; i++) {
+      final p = ring[i];
+      final d = _dist(p, C);
+      bool inside = d < r - 1e-9;
+      // Snap near-boundary original vertices to circle
+      if (!inside && (d - r).abs() <= nearCircleSnapPx) {
+        final s = r / (d <= 1e-12 ? r : d);
+        final sp = Vector2(C.x + (p.x - C.x) * s, C.y + (p.y - C.y) * s);
+        verts.add(_Vtx(i, sp, isHit: true, inside: false));
+      } else {
+        verts.add(_Vtx(i, p, isHit: false, inside: inside));
+      }
+    }
+
+    // Helper to locate current position of original vertex index in verts
+    int _findCurrentPos(int originalIdx) {
+      for (int k = 0; k < verts.length; k++) {
+        if (verts[k].origIdx == originalIdx && !verts[k].insertedAfterEdge)
+          return k;
+      }
+      // For indices of intersection insertions we set insertedAfterEdge=true,
+      // so originalIdx still identifies only the true pre-existing vertex.
+      // If not found (shouldn’t happen), fallback to 0.
+      return 0;
+    }
+
+    // ==== 2) For each edge, INSERT intersections in order of t
+    for (int i = 0; i < n0; i++) {
+      final aIdx = i;
+      final bIdx = (i + 1) % n0;
+      final A = ring[aIdx];
+      final B = ring[bIdx];
+
+      final hits = _segmentCircleIntersections(A, B, C, r);
+      if (hits.isEmpty) continue;
+
+      hits.sort((l, r2) => l.$1.compareTo(r2.$1));
+
+      // Where to insert? Immediately AFTER the current A in the *current* verts list.
+      int posA = _findCurrentPos(aIdx);
+      int insertPos = posA + 1;
+
+      for (final (t, phit) in hits) {
+        final v = _Vtx(
+          aIdx, // associate with edge start for ordering
+          phit,
+          isHit: true,
+          inside: false,
+          insertedAfterEdge: true,
+          tOnEdge: t,
+        );
+        verts.insert(insertPos, v);
+        insertPos++; // subsequent hits go after the previous insertion
+      }
+    }
+
+    if (verts.where((v) => !v.inside).isEmpty) {
+      // Whole ring is (numerically) inside the circle — we are not allowed to create holes
       return terrain;
     }
 
-    // Light clean-up and enforce CCW
-    final simp1 = _dedup(carved, simplifyEpsPx);
-    final simp2 = _removeTinyCollinears(simp1, simplifyEpsPx);
-    final simp3 = _rdp(simp2, rdpTolerancePx);
-    final healthy = _ensureCCW(simp3);
+    // ==== 3) Rotate to start at an OUTSIDE vertex/hit
+    int start = 0;
+    for (int i = 0; i < verts.length; i++) {
+      if (!verts[i].inside) { start = i; break; }
+    }
+    if (start != 0) {
+      final ro = <_Vtx>[];
+      for (int k = 0; k < verts.length; k++) {
+        ro.add(verts[(start + k) % verts.length]);
+      }
+      verts
+        ..clear()
+        ..addAll(ro);
+    }
 
+    // ==== 4) Single pass: build the new ring
+    final out = <Vector2>[];
+    int i = 0;
+    while (i < verts.length) {
+      final cur = verts[i];
+      final nxt = verts[(i + 1) % verts.length];
+
+      // Always keep current if it's outside or a boundary hit
+      if (!cur.inside || cur.isHit) {
+        _pushDedup(out, cur.p, eps: dedupEps);
+      }
+
+      // Detect outside -> inside transition right after a HIT (ENTER).
+      final entering = cur.isHit && nxt.inside;
+
+      if (entering) {
+        final enterHit = cur;
+
+        // Advance until EXIT hit
+        int j = (i + 1) % verts.length;
+        _Vtx? exitHit;
+        while (true) {
+          final v = verts[j];
+          if (v.isHit && !v.inside) {
+            exitHit = v;
+            break;
+          }
+          j = (j + 1) % verts.length;
+          if (j == i) {
+            // Safety: no exit found (shouldn’t happen with a simple circle)
+            break;
+          }
+        }
+
+        if (exitHit != null) {
+          if (outerIsCCW) {
+            _appendArcCCW(out, C, r, exitHit.p, enterHit.p, arcMaxErrPx);
+          } else {
+            _appendArcCW(out, C, r, exitHit.p, enterHit.p, arcMaxErrPx);
+          }
+          // Also place the EXIT point to reconnect with the outer contour
+          _pushDedup(out, exitHit.p, eps: dedupEps);
+
+          // Jump i to the exit hit, continue from there
+          i = verts.indexOf(exitHit);
+        } else {
+          // Pathological: give up this run safely (keep current)
+        }
+      }
+
+      i++;
+    }
+
+    // Clean close (avoid duplicate first==last)
+    if (out.length >= 2 &&
+        (out.first.x - out.last.x).abs() <= dedupEps &&
+        (out.first.y - out.last.y).abs() <= dedupEps) {
+      out.removeLast();
+    }
+
+    // Ensure CCW orientation
+    final ccw = _signedArea(out) >= 0 ? out : List<Vector2>.from(out.reversed);
+
+    // Rebuild terrain (pad tagging recalculated in PolyShape)
     final poly = PolyShape.fromRings(
-      outer: healthy,
+      outer: ccw,
       holes: const [],
       padX1: terrain.padX1,
       padX2: terrain.padX2,
@@ -48,151 +187,99 @@ class TerrainCarver {
 
     return Terrain(
       poly: poly,
-      ridge: healthy,
+      ridge: ccw,
       padX1: terrain.padX1,
       padX2: terrain.padX2,
       padY: terrain.padY,
     );
   }
 
-  // ---------- Core: index-preserving splicer ----------
-  static List<Vector2> _carveIndexed(
-      List<Vector2> ringIn,
-      Vector2 C,
-      double r,
-      double maxArcErr,
-      double projectEps,
-      ) {
-    const eps = 1e-9;
+  static double _twoPi = math.pi * 2.0;
 
-    // Helpers
-    double dist(Vector2 p) {
-      final dx = p.x - C.x, dy = p.y - C.y;
-      return math.sqrt(dx * dx + dy * dy);
-    }
-    bool outside(Vector2 p) => dist(p) > r + 1e-9;
-    Vector2 snapToCircle(Vector2 p) {
-      final dx = p.x - C.x, dy = p.y - C.y;
-      final L = math.sqrt(dx * dx + dy * dy);
-      if (L < 1e-12) return Vector2(C.x + r, C.y);
-      final s = r / L;
-      return Vector2(C.x + dx * s, C.y + dy * s);
-    }
-    double ang(Vector2 p) => math.atan2(p.y - C.y, p.x - C.x);
-    bool samePt(Vector2 a, Vector2 b) =>
-        (a.x - b.x).abs() <= eps && (a.y - b.y).abs() <= eps;
-
-    // ---- Rotate ring so we start at the first OUTSIDE vertex (stable state) ----
-    final ring = List<Vector2>.from(ringIn);
-    int start = -1;
-    for (int i = 0; i < ring.length; i++) {
-      if (outside(ring[i])) { start = i; break; }
-    }
-    if (start == -1) {
-      // Entire ring is inside the brush (would create a hole). Do nothing.
-      return List<Vector2>.from(ringIn);
-    }
-    if (start != 0) {
-      final rotated = <Vector2>[];
-      for (int i = 0; i < ring.length; i++) {
-        rotated.add(ring[(start + i) % ring.length]);
-      }
-      ring
-        ..clear()
-        ..addAll(rotated);
-    }
-
-    // Snap near-boundary endpoints
-    for (int i = 0; i < ring.length; i++) {
-      final p = ring[i];
-      if (!outside(p) && (r - dist(p)).abs() <= projectEps) {
-        ring[i] = snapToCircle(p);
-      }
-    }
-
-    final out = <Vector2>[];
-
-    // Seed with first vertex (guaranteed outside after rotation)
-    Vector2 A = ring[0];
-    bool aOut = outside(A);
-    out.add(A);
-
-    // --- Walk edges (A->B) in order, including wrap at the end ---
-    for (int i = 0; i < ring.length; i++) {
-      final Vector2 B = ring[(i + 1) % ring.length];
-      final bool bOut = outside(B);
-
-      // Find intersections, sort by t
-      final hits = List<(double, Vector2)>.from(
-        _segmentCircleIntersections(A, B, C, r),
-      );
-      if (hits.length > 1) {
-        hits.sort((l, r2) => l.$1.compareTo(r2.$1));
-      }
-
-      // Tangent case: one hit and both endpoints outside -> don't flip state
-      if (hits.length == 1 && aOut && bOut) {
-        if (out.isEmpty || !samePt(out.last, B)) out.add(B);
-        A = B; aOut = bOut;
-        continue;
-      }
-
-      // Emit piecewise, flipping state on proper hits
-      double tPrev = 0.0;
-      bool stateOut = aOut;
-      Vector2? enterP;
-
-      void addPoint(Vector2 p) {
-        if (out.isEmpty || !samePt(out.last, p)) out.add(p);
-      }
-
-      void emitUntil(double t1) {
-        // endpoint point
-        final Vector2 p1 = (t1 >= 1.0 - eps) ? B : _lerp(A, B, t1);
-        if (stateOut) addPoint(p1);
-      }
-
-      for (int h = 0; h <= hits.length; h++) {
-        final double t1 = (h < hits.length) ? hits[h].$1 : 1.0;
-        final Vector2 pHit = (h < hits.length) ? hits[h].$2 : B;
-
-        emitUntil(t1);
-
-        if (h < hits.length) {
-          if (stateOut) {
-            // outside -> inside: remember enter point
-            enterP = pHit;
-          } else {
-            // inside -> outside: add CW arc (exit -> enter)
-            final exitP = pHit;
-            if (enterP != null) {
-              _appendArcCWAdaptive(out, C.x, C.y, r, ang(exitP), ang(enterP!), maxArcErr);
-              addPoint(exitP);
-              enterP = null;
-            }
-          }
-          stateOut = !stateOut;
-          // replace last with exact hit (avoid spike)
-          if (out.isNotEmpty) out[out.length - 1] = pHit;
-        }
-        tPrev = t1;
-      }
-
-      A = B; aOut = bOut;
-    }
-
-    // Close ring cleanly (avoid duplicate last==first)
-    if (out.length >= 2 && samePt(out.first, out.last)) {
-      out.removeLast();
-    }
-    return out;
+  /// normalize to [0, 2π)
+  static double _norm2pi(double a) {
+    a = a % _twoPi;
+    if (a < 0) a += _twoPi;
+    return a;
   }
 
-  // ---------- Geometry bits ----------
-  static Vector2 _lerp(Vector2 a, Vector2 b, double t) =>
-      Vector2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+  /// angle of point relative to center
+  static double _ang(Vector2 p, Vector2 C) => math.atan2(p.y - C.y, p.x - C.x);
 
-  /// Edge-circle intersections on AB: returns (t, point) with 0<t<1.
+  /// Append CW arc from exitP -> enterP with max chord error (shortest CW sweep).
+  static void _appendArcCW(
+      List<Vector2> out,
+      Vector2 C,
+      double r,
+      Vector2 exitP,
+      Vector2 enterP,
+      double maxErr,
+      ) {
+    final s = _norm2pi(_ang(exitP, C));
+    final e = _norm2pi(_ang(enterP, C));
+
+    // CW sweep size in [0, 2π)
+    final delta = _norm2pi(s - e);
+    if (delta <= 1e-12) return; // no arc
+
+    // chord-error -> angular step
+    final maxDelta = (maxErr <= 0 || maxErr >= r)
+        ? (math.pi / 4)
+        : 2 * math.acos(math.max(-1.0, math.min(1.0, 1 - maxErr / r)));
+    final segs = math.max(2, (delta / maxDelta).ceil());
+
+    for (int i = 1; i <= segs; i++) {
+      final t = i / segs;
+      final th = s - t * delta;                  // CW = decreasing angle
+      final p = Vector2(C.x + r * math.cos(th),  // sample on circle
+          C.y + r * math.sin(th));
+      _pushDedup(out, p, eps: 1e-9);
+    }
+  }
+
+  /// Append CCW arc from exitP -> enterP with max chord error (shortest CCW sweep).
+  static void _appendArcCCW(
+      List<Vector2> out,
+      Vector2 C,
+      double r,
+      Vector2 exitP,
+      Vector2 enterP,
+      double maxErr,
+      ) {
+    final s = _norm2pi(_ang(exitP, C));
+    final e = _norm2pi(_ang(enterP, C));
+
+    // CCW sweep size in [0, 2π)
+    final delta = _norm2pi(e - s);
+    if (delta <= 1e-12) return; // no arc
+
+    final maxDelta = (maxErr <= 0 || maxErr >= r)
+        ? (math.pi / 4)
+        : 2 * math.acos(math.max(-1.0, math.min(1.0, 1 - maxErr / r)));
+    final segs = math.max(2, (delta / maxDelta).ceil());
+
+    for (int i = 1; i <= segs; i++) {
+      final t = i / segs;
+      final th = s + t * delta;                  // CCW = increasing angle
+      final p = Vector2(C.x + r * math.cos(th),
+          C.y + r * math.sin(th));
+      _pushDedup(out, p, eps: 1e-9);
+    }
+  }
+
+  // ----------- helpers -----------
+
+  static double _dist(Vector2 a, Vector2 b) {
+    final dx = a.x - b.x, dy = a.y - b.y;
+    return math.sqrt(dx*dx + dy*dy);
+  }
+
+  static void _pushDedup(List<Vector2> out, Vector2 p, {double eps = 1e-9}) {
+    if (out.isEmpty) { out.add(p); return; }
+    final q = out.last;
+    if ((p.x - q.x).abs() > eps || (p.y - q.y).abs() > eps) out.add(p);
+  }
+
   static List<(double, Vector2)> _segmentCircleIntersections(
       Vector2 A, Vector2 B, Vector2 C, double r,
       ) {
@@ -204,7 +291,7 @@ class TerrainCarver {
     final c = (f.x * f.x + f.y * f.y) - r * r;
 
     final disc = b * b - 4 * a * c;
-    if (disc <= 0) return const []; // <= 0: no real, or tangent w/ t outside (we ignore)
+    if (disc < 0) return const [];
 
     final sDisc = math.sqrt(disc);
     final t1 = (-b - sDisc) / (2 * a);
@@ -212,123 +299,12 @@ class TerrainCarver {
 
     final out = <(double, Vector2)>[];
     if (t1 > 0.0 && t1 < 1.0) out.add((t1, _lerp(A, B, t1)));
-    if (t2 > 0.0 && t2 < 1.0 && (t2 - t1).abs() > 1e-9) out.add((t2, _lerp(A, B, t2)));
+    if (t2 > 0.0 && t2 < 1.0 && (t2 - t1).abs() > 1e-12) out.add((t2, _lerp(A, B, t2)));
     return out;
   }
 
-  /// Append a CW arc from thStart -> thEnd approximated by minimal points
-  /// s.t. chord error <= maxErr.
-  static void _appendArcCWAdaptive(
-      List<Vector2> out, double cx, double cy, double r,
-      double thStart, double thEnd, double maxErr,
-      ) {
-    double norm(double a) {
-      while (a <= -math.pi) a += 2 * math.pi;
-      while (a >  math.pi) a -= 2 * math.pi;
-      return a;
-    }
-    double s = norm(thStart), e = norm(thEnd);
-    if (e > s) e -= 2 * math.pi; // enforce CW (decreasing angle)
-
-    final sweep = (s - e).abs();
-    final maxDelta = (maxErr <= 0 || maxErr >= r)
-        ? (math.pi / 4)
-        : 2 * math.acos(math.max(-1.0, math.min(1.0, 1 - maxErr / r)));
-    final segs = math.max(2, (sweep / maxDelta).ceil());
-
-    for (int i = 1; i <= segs; i++) {
-      final t = i / segs;
-      final th = s + (e - s) * t;
-      final p = Vector2(cx + r * math.cos(th), cy + r * math.sin(th));
-      if (out.isEmpty ||
-          (out.last.x - p.x).abs() > 1e-9 ||
-          (out.last.y - p.y).abs() > 1e-9) {
-        out.add(p);
-      }
-    }
-  }
-
-  // ---------- Simplifiers & orientation ----------
-  static List<Vector2> _dedup(List<Vector2> pts, double eps) {
-    if (pts.isEmpty) return pts;
-    final out = <Vector2>[pts.first];
-    for (int i = 1; i < pts.length; i++) {
-      final a = out.last, b = pts[i];
-      if ((a.x - b.x).abs() > eps || (a.y - b.y).abs() > eps) out.add(b);
-    }
-    return out;
-  }
-
-  static List<Vector2> _removeTinyCollinears(List<Vector2> pts, double eps) {
-    if (pts.length < 3) return pts;
-    final out = <Vector2>[];
-    for (int i = 0; i < pts.length; i++) {
-      final p0 = pts[(i - 1 + pts.length) % pts.length];
-      final p1 = pts[i];
-      final p2 = pts[(i + 1) % pts.length];
-      final cross = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
-      // drop p1 if nearly collinear and very close to either neighbor
-      if (cross.abs() < eps) {
-        final d10 = (p1.x - p0.x).abs() + (p1.y - p0.y).abs();
-        final d12 = (p1.x - p2.x).abs() + (p1.y - p2.y).abs();
-        if (d10 < eps || d12 < eps) continue;
-      }
-      out.add(p1);
-    }
-    return out;
-  }
-
-  static List<Vector2> _rdp(List<Vector2> pts, double tol) {
-    if (pts.length < 4) return pts;
-    final open = List<Vector2>.from(pts)..add(pts.first);
-    final keep = List<bool>.filled(open.length, false);
-    _rdpRecurse(open, 0, open.length - 1, tol, keep);
-    final out = <Vector2>[];
-    for (int i = 0; i < open.length - 1; i++) {
-      if (keep[i] || i == 0) out.add(open[i]);
-    }
-    return out;
-  }
-
-  static void _rdpRecurse(List<Vector2> pts, int i0, int i1, double tol, List<bool> keep) {
-    if (i1 <= i0 + 1) { keep[i0] = true; keep[i1] = true; return; }
-    final a = pts[i0], b = pts[i1];
-    int idx = -1; double maxD = -1;
-    for (int i = i0 + 1; i < i1; i++) {
-      final d = _pointSegmentDistance(pts[i], a, b);
-      if (d > maxD) { maxD = d; idx = i; }
-    }
-    if (maxD > tol) {
-      _rdpRecurse(pts, i0, idx, tol, keep);
-      _rdpRecurse(pts, idx, i1, tol, keep);
-    } else {
-      keep[i0] = true; keep[i1] = true;
-    }
-  }
-
-  static double _pointSegmentDistance(Vector2 p, Vector2 a, Vector2 b) {
-    final vx = b.x - a.x, vy = b.y - a.y;
-    final wx = p.x - a.x, wy = p.y - a.y;
-    final c1 = vx * wx + vy * wy;
-    if (c1 <= 0) return math.sqrt(wx * wx + wy * wy);
-    final c2 = vx * vx + vy * vy;
-    if (c2 <= c1) {
-      final dx = p.x - b.x, dy = p.y - b.y;
-      return math.sqrt(dx * dx + dy * dy);
-    }
-    final t = c1 / c2;
-    final px = a.x + t * vx, py = a.y + t * vy;
-    final dx = p.x - px, dy = p.y - py;
-    return math.sqrt(dx * dx + dy * dy);
-  }
-
-  static List<Vector2> _ensureCCW(List<Vector2> ring) {
-    if (ring.length < 3) return ring;
-    if (_signedArea(ring) < 0) {
-      return List<Vector2>.from(ring.reversed);
-    }
-    return ring;
-  }
+  static Vector2 _lerp(Vector2 a, Vector2 b, double t) =>
+      Vector2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
 
   static double _signedArea(List<Vector2> ring) {
     double a = 0;
@@ -339,4 +315,23 @@ class TerrainCarver {
     }
     return 0.5 * a;
   }
+}
+
+/// Indexed vertex record
+class _Vtx {
+  final int origIdx;           // original vertex index (for ordering/association)
+  final Vector2 p;
+  final bool isHit;            // true if exactly on the circle (intersection or snapped)
+  final bool inside;           // strictly inside the circle
+  final bool insertedAfterEdge;// true for intersection insertions
+  final double? tOnEdge;       // param along the source edge for sorting (0..1)
+
+  _Vtx(
+      this.origIdx,
+      this.p, {
+        required this.isHit,
+        required this.inside,
+        this.insertedAfterEdge = false,
+        this.tOnEdge,
+      });
 }
