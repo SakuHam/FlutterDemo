@@ -195,10 +195,12 @@ class GameEngine {
     }
 
     // ----- Effort cost + Scoring -----
+// ----- Effort cost + Scoring (cost-only; engine owns collisions) -----
     double stepCost = 0.0;
     if (power > 0) stepCost += cfg.effortCost * power * dt;
 
-    final out = Scoring.apply(
+// Call scoring to get shaping cost, but DO NOT accept its collisions/pos edits.
+    final score = Scoring.apply(
       cfg: cfg,
       terrain: terrain,
       pos: pos,
@@ -210,16 +212,17 @@ class GameEngine {
       intentIdx: u.intentIdx,
     );
 
-    stepCost += out.cost;
+// Only add cost; ignore score.pos/score.vel/score.terminal/score.landed
+    stepCost += score.cost;
 
-    // Commit
-    lander = LanderState(pos: out.pos, vel: out.vel, angle: angle, fuel: fuel);
+// Commit the state from our physics (not from Scoring)
+    lander = LanderState(pos: pos, vel: vel, angle: angle, fuel: fuel);
     _lastAngle = angle;
-    if (out.terminal) {
-      status = out.landed ? GameStatus.landed : GameStatus.crashed;
-    }
 
-    // Sensors update
+// DO NOT let Scoring flip terminal states — engine already handled it above
+// (status remains GameStatus.playing unless earlier contact set terminal)
+
+// Sensors update
     _rays = _sensors.castAll(
       terrain: terrain,
       engineCfg: cfg,
@@ -229,9 +232,9 @@ class GameEngine {
 
     return StepInfo(
       costDelta: stepCost,
-      terminal: out.terminal,
-      landed: out.landed,
-      onPad: out.onPad,
+      terminal: false,     // still playing; contact code above is the only place that ends the episode
+      landed: false,
+      onPad: false,
     );
   }
 

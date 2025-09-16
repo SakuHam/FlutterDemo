@@ -1,3 +1,4 @@
+// lib/engine/types.dart
 import 'dart:math' as math;
 
 /// =======================
@@ -10,10 +11,11 @@ class Tunables {
   double rotSpeed;     // radians per second
   double maxFuel;      // fuel units
 
+  // Touchdown tolerances / assists
   final bool crashOnTilt;           // if false, angle is ignored for touchdown safety
   final double landingMaxVx;        // px/s horizontal speed allowed at contact
   final double landingMaxVy;        // px/s downward speed allowed at contact
-  final double landingMaxOmega;     // rad/s allowed at contact (optional, can ignore)
+  final double landingMaxOmega;     // rad/s allowed at contact (optional)
 
   Tunables({
     this.gravity = 0.18,
@@ -275,14 +277,10 @@ class EngineConfig {
       loiterAltFrac: loiterAltFrac ?? this.loiterAltFrac,
       padTurnDeadzoneFrac: padTurnDeadzoneFrac ?? this.padTurnDeadzoneFrac,
       padFarFrac: padFarFrac ?? this.padFarFrac,
-      padDirTurnPenaltyPerSec:
-      padDirTurnPenaltyPerSec ?? this.padDirTurnPenaltyPerSec,
-      padIdleTurnPenaltyPerSec:
-      padIdleTurnPenaltyPerSec ?? this.padIdleTurnPenaltyPerSec,
-      padVelAwayPenaltyPerVel:
-      padVelAwayPenaltyPerVel ?? this.padVelAwayPenaltyPerVel,
-      padAngleAwayPenaltyPerRad:
-      padAngleAwayPenaltyPerRad ?? this.padAngleAwayPenaltyPerRad,
+      padDirTurnPenaltyPerSec: padDirTurnPenaltyPerSec ?? this.padDirTurnPenaltyPerSec,
+      padIdleTurnPenaltyPerSec: padIdleTurnPenaltyPerSec ?? this.padIdleTurnPenaltyPerSec,
+      padVelAwayPenaltyPerVel: padVelAwayPenaltyPerVel ?? this.padVelAwayPenaltyPerVel,
+      padAngleAwayPenaltyPerRad: padAngleAwayPenaltyPerRad ?? this.padAngleAwayPenaltyPerRad,
     );
   }
 }
@@ -295,7 +293,12 @@ class ControlInput {
   final bool right;
   final int? intentIdx;
 
-  const ControlInput({required this.thrust, required this.left, required this.right, this.intentIdx,});
+  const ControlInput({
+    required this.thrust,
+    required this.left,
+    required this.right,
+    this.intentIdx,
+  });
 }
 
 class Vector2 {
@@ -308,6 +311,7 @@ class Vector2 {
   double get length => math.sqrt(x * x + y * y);
 }
 
+/// Lander state
 class LanderState {
   final int seed = 12345;
   Vector2 pos;   // center of mass (px)
@@ -330,13 +334,155 @@ class LanderState {
   );
 }
 
+/// =======================
+/// Polygon terrain support
+/// =======================
+
+/// Tag polygon edges so sensors and contact can differentiate pad vs terrain.
+enum PolyEdgeKind { terrain, pad }
+
+class PolyEdge {
+  final Vector2 a;
+  final Vector2 b;
+  final PolyEdgeKind kind;
+  const PolyEdge(this.a, this.b, this.kind);
+}
+
+/// A polygon with an outer ring and optional hole rings (for caverns).
+/// Rings should be simple (non-self-intersecting). We normalize winding:
+/// outer CCW, holes CW (convention; only consistency matters).
+class PolyShape {
+  final List<Vector2> outer;         // CCW
+  final List<List<Vector2>> holes;   // CW
+  final List<PolyEdge> edges;        // derived (outer + holes)
+
+  PolyShape._(this.outer, this.holes, this.edges);
+
+  factory PolyShape.fromRings({
+    required List<Vector2> outer,
+    List<List<Vector2>> holes = const [],
+    double? padX1,
+    double? padX2,
+    double? padY,
+  }) {
+    final out = _ensureWinding(outer, ccw: true);
+    final hol = [for (final h in holes) _ensureWinding(h, ccw: false)];
+
+    final edges = <PolyEdge>[];
+    void addRing(List<Vector2> r) {
+      final n = r.length;
+      for (int i = 0; i < n; i++) {
+        final a = r[i];
+        final b = r[(i + 1) % n];
+        final tagAsPad = (padX1 != null && padX2 != null && padY != null) &&
+            _segmentIsPad(a, b, padX1, padX2, padY);
+        edges.add(PolyEdge(a, b, tagAsPad ? PolyEdgeKind.pad : PolyEdgeKind.terrain));
+      }
+    }
+
+    addRing(out);
+    for (final h in hol) addRing(h);
+
+    return PolyShape._(out, hol, edges);
+  }
+
+  /// Vertical query: smallest y >= 0 where x hits the polygon boundary.
+  /// Returns +∞ if no hit in [0, worldH].
+  double verticalHitY({required double x, required double worldH}) {
+    double bestY = double.infinity;
+    for (final e in edges) {
+      final y = _xRayHitY(e.a, e.b, x);
+      if (y != null && y >= 0.0 && y < bestY) bestY = y;
+    }
+    if (!bestY.isFinite) return double.infinity;
+    return math.min(bestY, worldH);
+  }
+
+  /// Raycast against all edges; returns nearest hit (t, p, kind) or null.
+  (double t, Vector2 p, PolyEdgeKind kind)? raycast({
+    required Vector2 origin,
+    required Vector2 dir,
+  }) {
+    double bestT = double.infinity;
+    Vector2? bestP;
+    PolyEdgeKind bestK = PolyEdgeKind.terrain;
+
+    for (final e in edges) {
+      final sol = _raySegment(origin, dir, e.a, e.b);
+      if (sol != null && sol.$1 >= 0.0 && sol.$1 < bestT) {
+        bestT = sol.$1;
+        bestP = Vector2(origin.x + dir.x * bestT, origin.y + dir.y * bestT);
+        bestK = e.kind;
+      }
+    }
+    if (!bestT.isFinite || bestP == null) return null;
+    return (bestT, bestP, bestK);
+  }
+
+  // ---- helpers ----
+
+  static List<Vector2> _ensureWinding(List<Vector2> ring, {required bool ccw}) {
+    double area = 0.0;
+    for (int i = 0; i < ring.length; i++) {
+      final a = ring[i];
+      final b = ring[(i + 1) % ring.length];
+      area += (a.x * b.y - b.x * a.y);
+    }
+    final isCCW = area > 0;
+    if (isCCW == ccw) return ring;
+    return List<Vector2>.from(ring.reversed);
+  }
+
+  static bool _segmentIsPad(Vector2 a, Vector2 b, double x1, double x2, double y) {
+    const eps = 1e-3;
+    final minX = math.min(a.x, b.x), maxX = math.max(a.x, b.x);
+    final flatY = (a.y - y).abs() < eps && (b.y - y).abs() < eps;
+    final overlap = !(maxX < x1 || minX > x2);
+    return flatY && overlap;
+  }
+
+  // Intersection of vertical line x = X with segment AB → Y or null.
+  static double? _xRayHitY(Vector2 a, Vector2 b, double X) {
+    if ((X < math.min(a.x, b.x)) || (X > math.max(a.x, b.x))) return null;
+    final dx = (b.x - a.x);
+    if (dx.abs() < 1e-9) return math.min(a.y, b.y); // vertical seg → top endpoint
+    final t = (X - a.x) / dx; // 0..1 along AB by x
+    if (t < 0.0 || t > 1.0) return null;
+    return a.y + (b.y - a.y) * t;
+  }
+
+  // Parametric ray/segment intersection. Returns (t,u) or null.
+  static (double, double)? _raySegment(Vector2 o, Vector2 d, Vector2 a, Vector2 b) {
+    final vx = d.x, vy = d.y;
+    final sx = b.x - a.x, sy = b.y - a.y;
+    final det = (-sx * vy + vx * sy);
+    if (det.abs() < 1e-9) return null; // parallel
+
+    final oxax = o.x - a.x;
+    final oway = o.y - a.y;
+    final t = (-sy * oxax + sx * oway) / det;
+    final u = (-vy * oxax + vx * oway) / det;
+    if (u < 0.0 || u > 1.0) return null;
+    return (t, u);
+  }
+}
+
+/// =======================
+/// Terrain (back-compat wrapper)
+/// =======================
+/// Terrain now owns a polygon (outer + holes) but keeps the legacy fields
+/// so existing code continues to work.
 class Terrain {
-  final List<Vector2> ridge; // piecewise linear ridge
+  final PolyShape poly;
+
+  // Legacy fields (preserved)
+  final List<Vector2> ridge; // kept for compatibility (approx “roof” polyline)
   final double padX1;
   final double padX2;
   final double padY;
 
   Terrain({
+    required this.poly,
     required this.ridge,
     required this.padX1,
     required this.padX2,
@@ -345,54 +491,183 @@ class Terrain {
 
   double get padCenter => (padX1 + padX2) * 0.5;
 
-  double heightAt(double x) {
-    final pts = ridge;
-    for (int i = 0; i < pts.length - 1; i++) {
-      final a = pts[i];
-      final b = pts[i + 1];
-      if ((x >= a.x && x <= b.x) || (x >= b.x && x <= a.x)) {
-        final t = (x - a.x) / (b.x - a.x);
-        return a.y + (b.y - a.y) * t;
-      }
-    }
-    return pts.last.y;
+  /// Back-compat: returns the first boundary y above (>=0) at x, clamped to worldH.
+  /// For overhangs/caverns, this is the *nearest* boundary above the top of the screen,
+  /// which is what you want for landing/autolevel checks.
+  double heightAt(double x, {double worldH = 100000.0}) {
+    return poly.verticalHitY(x: x, worldH: worldH);
   }
 
   bool isOnPad(double x) => x >= padX1 && x <= padX2;
 
+  /// Generate a polygonal terrain with the landing pad spliced into the roof.
   static Terrain generate(double w, double h, int seed, double padWidthFactor) {
     final rnd = math.Random(seed);
-    final List<Vector2> pts = [];
-    const int segments = 24;
+
+    // 1) Build the *roof* polyline (left→right), independent from bottom closure.
+    final roof = <Vector2>[];
+    const int segments = 28;
     for (int i = 0; i <= segments; i++) {
       final x = w * i / segments;
       final base = h * 0.78;
       final noise = (math.sin(i * 0.8) + rnd.nextDouble() * 0.5) * 24.0;
-      pts.add(Vector2(x, base + noise));
+      roof.add(Vector2(x, base + noise));
     }
 
-    // Landing pad
+    // 2) Choose pad span on roof.
     final rawPadWidth = w * 0.16 * padWidthFactor;
     final padWidth = rawPadWidth.clamp(36.0, w * 0.6);
     final padCenterX = w * (0.35 + rnd.nextDouble() * 0.3);
     final padX1 = math.max(10.0, math.min(padCenterX - padWidth / 2, w - padWidth - 10.0));
     final padX2 = padX1 + padWidth;
-    final padY = h * 0.76;
 
-    for (int i = 0; i < pts.length; i++) {
-      if (pts[i].x >= padX1 && pts[i].x <= padX2) {
-        pts[i] = Vector2(pts[i].x, padY);
-      }
+    // Interpolate roof Y at pad endpoints (and mid) and pick a stable padY on/under roof.
+    double interpRoofY(double x) => _interpYOnPolyline(roof, x);
+    final y1 = interpRoofY(padX1);
+    final y2 = interpRoofY(padX2);
+    final ym = interpRoofY((padX1 + padX2) * 0.5);
+    final padY = math.min(y1, math.min(y2, ym)); // keep pad "embedded" in roof
+
+    // 3) Splice a *flat* pad edge into the roof between [padX1, padX2].
+    final roofWithPad = _insertPadIntoRoof(roof, padX1, padX2, padY);
+
+    // 4) Build an *outer* polygon by closing roof to the bottom corners.
+    final outer = <Vector2>[
+      Vector2(0, h),       // bottom-left
+      ...roofWithPad,      // roof (now includes flat pad edge)
+      Vector2(w, h),       // bottom-right
+    ];
+
+    // 5) Optional cavern hole (unchanged behavior).
+    final holes = <List<Vector2>>[];
+    if (rnd.nextBool()) {
+      final cx = w * (0.30 + rnd.nextDouble() * 0.4);
+      final cy = h * 0.70;
+      final rx = w * 0.10;
+      final ry = h * 0.06;
+      const k = 24;
+      final ring = List<Vector2>.generate(k, (i) {
+        final th = 2 * math.pi * i / k;
+        return Vector2(cx + rx * math.cos(th), cy + ry * math.sin(th));
+      });
+      holes.add(ring);
     }
 
-    // Valley look
-    pts[0] = Vector2(0, h * 0.92);
-    pts[pts.length - 1] = Vector2(w, h * 0.92);
+    // 6) Build polygon with pad edges *tagged* (the flat segment we spliced).
+    final poly = PolyShape.fromRings(
+      outer: outer,
+      holes: holes,
+      padX1: padX1,
+      padX2: padX2,
+      padY: padY,
+    );
 
-    return Terrain(ridge: pts, padX1: padX1, padX2: padX2, padY: padY);
+    // 7) Legacy ridge for old UIs (use roofWithPad so the painter can draw a flat pad).
+    final ridge = roofWithPad;
+
+    return Terrain(
+      poly: poly,
+      ridge: ridge,
+      padX1: padX1,
+      padX2: padX2,
+      padY: padY,
+    );
   }
 }
 
+/// Interpolate y on a monotone-by-x polyline (assumes points are ordered by x).
+double _interpYOnPolyline(List<Vector2> line, double x) {
+  for (int i = 0; i < line.length - 1; i++) {
+    final a = line[i];
+    final b = line[i + 1];
+    if ((x >= a.x && x <= b.x) || (x >= b.x && x <= a.x)) {
+      final t = (x - a.x) / (b.x - a.x);
+      return a.y + (b.y - a.y) * t;
+    }
+  }
+  // Out of range: clamp to nearest endpoint
+  if (x < line.first.x) return line.first.y;
+  return line.last.y;
+}
+
+/// Splice a flat segment [padX1..padX2] at y=padY into the roof polyline.
+/// Removes original roof points inside the span and inserts intersection points
+/// at the span ends + flat pad vertices.
+List<Vector2> _insertPadIntoRoof(
+    List<Vector2> roof,
+    double padX1,
+    double padX2,
+    double padY,
+    ) {
+  assert(padX2 > padX1);
+  final out = <Vector2>[];
+  bool inside = false;
+
+  double lerpAt(Vector2 a, Vector2 b, double x) {
+    final t = (x - a.x) / (b.x - a.x);
+    return a.y + (b.y - a.y) * t;
+  }
+
+  for (int i = 0; i < roof.length - 1; i++) {
+    final a = roof[i];
+    final b = roof[i + 1];
+
+    // push first point once
+    if (out.isEmpty) out.add(a);
+
+    bool crosses(double x) =>
+        (x >= math.min(a.x, b.x)) && (x <= math.max(a.x, b.x)) && (a.x != b.x);
+
+    // Enter pad span
+    if (!inside && crosses(padX1)) {
+      final yEnter = lerpAt(a, b, padX1);
+      out.add(Vector2(padX1, yEnter));      // intersection on roof
+      out.add(Vector2(padX1, padY));        // drop/raise to flat pad
+      inside = true;
+    }
+
+    // Exit pad span
+    if (inside && crosses(padX2)) {
+      final yExit = lerpAt(a, b, padX2);
+      out.add(Vector2(padX2, padY));        // end of flat pad
+      out.add(Vector2(padX2, yExit));       // connect back to roof
+      inside = false;
+      // After reconnecting, continue with normal path from B
+      out.add(b);
+      continue;
+    }
+
+    // While inside pad span, skip original roof points (we already inserted flat pad).
+    if (!inside) {
+      out.add(b);
+    }
+  }
+
+  // Edge-case: if span extended beyond last segment (unlikely), close it.
+  if (inside) {
+    final last = roof.last;
+    out.add(Vector2(padX2, padY));
+    out.add(Vector2(padX2, last.y));
+    out.add(last);
+  }
+
+  // Merge tiny duplicates that can be created by numeric ties
+  const eps = 1e-6;
+  final compact = <Vector2>[];
+  for (final p in out) {
+    if (compact.isEmpty) {
+      compact.add(p);
+    } else {
+      final q = compact.last;
+      if ((p.x - q.x).abs() > eps || (p.y - q.y).abs() > eps) {
+        compact.add(p);
+      }
+    }
+  }
+  return compact;
+}
+
+/// Step outcome
 class StepInfo {
   final double costDelta;   // >= 0 ; lower is better
   final double scoreDelta;  // alias for compatibility

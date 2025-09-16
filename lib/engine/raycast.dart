@@ -52,7 +52,6 @@ class RayCaster {
     // Bin 0 points to ship forward (-Y) -> angle - pi/2 in screen coords.
     final base = cfg.forwardAligned ? (angle - math.pi / 2.0) : 0.0;
     final twoPi = math.pi * 2.0;
-    final ridge = terrain.ridge;
 
     for (int i = 0; i < n; i++) {
       final th = base + twoPi * (i / n);
@@ -62,7 +61,6 @@ class RayCaster {
         engineCfg: engineCfg,
         o: origin,
         d: dir,
-        ridge: ridge,
       );
     }
     return hits;
@@ -73,25 +71,22 @@ class RayCaster {
     required EngineConfig engineCfg,
     required Vector2 o,
     required Vector2 d,
-    required List<Vector2> ridge,
   }) {
     double bestT = double.infinity;
     RayHitKind bestKind = RayHitKind.wall;
     Vector2 bestP = o;
 
-    // Terrain segments
-    for (int i = 0; i < ridge.length - 1; i++) {
-      final A = ridge[i];
-      final B = ridge[i + 1];
-      final sol = _raySegment(o, d, A, B);
-      if (sol != null && sol.$1 < bestT) {
+    // ---- Polygon edges (outer + holes), pad-tagged ----
+    for (final e in terrain.poly.edges) {
+      final sol = _raySegment(o, d, e.a, e.b);
+      if (sol != null && sol.$1 >= 0.0 && sol.$1 < bestT) {
         bestT = sol.$1;
         bestP = Vector2(o.x + d.x * bestT, o.y + d.y * bestT);
-        bestKind = _segmentIsPad(terrain, A, B) ? RayHitKind.pad : RayHitKind.terrain;
+        bestKind = (e.kind == PolyEdgeKind.pad) ? RayHitKind.pad : RayHitKind.terrain;
       }
     }
 
-    // Arena bounds
+    // ---- Arena bounds (ceiling/left/right[/floor]) ----
     final W = engineCfg.worldW.toDouble();
     final H = engineCfg.worldH.toDouble();
 
@@ -127,9 +122,8 @@ class RayCaster {
     final oway = o.y - a.y;
     final t = (-sy * oxax + sx * oway) / det;
     final u = (-vy * oxax + vx * oway) / det;
-
-    if (t >= 0 && u >= 0 && u <= 1) return (t, u);
-    return null;
+    if (u < 0.0 || u > 1.0) return null;
+    return (t, u);
   }
 
   void _hitLine(
@@ -148,14 +142,6 @@ class RayCaster {
         accept(t, p, kind);
       }
     }
-  }
-
-  bool _segmentIsPad(Terrain terrain, Vector2 a, Vector2 b) {
-    const eps = 1e-6;
-    bool xIn(Vector2 p) => p.x >= terrain.padX1 - eps && p.x <= terrain.padX2 + eps;
-    return xIn(a) && xIn(b) &&
-        (a.y - terrain.padY).abs() < 1e-6 &&
-        (b.y - terrain.padY).abs() < 1e-6;
   }
 
   /// === NN helpers ===
