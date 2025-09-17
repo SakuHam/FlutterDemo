@@ -324,6 +324,28 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             ),
                           ),
                           const Spacer(),
+                          const SizedBox(width: 8),
+                          _aiToggleIcon(),
+                          const SizedBox(width: 8),
+                          FilterChip(
+                            label: const Text('Show rays'),
+                            selected: _showRays,
+                            onSelected: (v) => setState(() => _showRays = v),
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton.icon(
+                            onPressed: _reset,
+                            icon: const Icon(Icons.refresh),
+                            label: const Text(''),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+
+                      // Fuel row + tiny icon-only Brush button (right side)
+                      Row(
+                        children: [
+                          _hudBox(title: 'Fuel', value: engine.lander.fuel.toStringAsFixed(0)),
                           if (_aiReady)
                             Tooltip(
                               message: _lastIntentIdx == null
@@ -350,39 +372,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                                 ),
                               ),
                             ),
-                          const SizedBox(width: 8),
-                          _aiToggleIcon(),
-                          const SizedBox(width: 8),
-                          FilterChip(
-                            label: const Text('Show rays'),
-                            selected: _showRays,
-                            onSelected: (v) => setState(() => _showRays = v),
-                          ),
-                          const SizedBox(width: 8),
-                          ElevatedButton.icon(
-                            onPressed: _reset,
-                            icon: const Icon(Icons.refresh),
-                            label: const Text('Reset'),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-
-                      // Fuel row + tiny icon-only Brush button (right side)
-                      Row(
-                        children: [
-                          _hudBox(title: 'Fuel', value: engine.lander.fuel.toStringAsFixed(0)),
-                          const SizedBox(width: 10),
-                          _hudBox(
-                            title: 'Vx/Vy',
-                            value:
-                            '${engine.lander.vel.x.toStringAsFixed(1)} / ${engine.lander.vel.y.toStringAsFixed(1)}',
-                          ),
-                          const SizedBox(width: 10),
-                          _hudBox(
-                            title: 'Angle',
-                            value: '${(engine.lander.angle * 180 / math.pi).toStringAsFixed(0)}°',
-                          ),
                           const Spacer(),
 
                           // --- Icon-only Brush button ---
