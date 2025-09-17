@@ -6,7 +6,7 @@ import 'dart:math' as math;
 import '../engine/types.dart' as et;
 import '../engine/game_engine.dart' as eng;
 
-import 'agent.dart';
+import 'agent.dart'; // uses nn_helper.dart internally
 
 /* ------------------------------- tiny arg parser ------------------------------- */
 
@@ -54,6 +54,27 @@ void _normUpdate(RunningNorm? norm, List<double> x) {
   }
 }
 
+/* ------------------------------- matrix helpers -------------------------------- */
+
+List<List<double>> _deepCopyMat(List<List<double>> W) =>
+    List.generate(W.length, (i) => List<double>.from(W[i]));
+
+void _assignMat(List<List<double>> dst, List src) {
+  for (int i = 0; i < dst.length; i++) {
+    final ri = dst[i];
+    final si = (src[i] as List);
+    for (int j = 0; j < ri.length; j++) {
+      ri[j] = (si[j] as num).toDouble();
+    }
+  }
+}
+
+List<List<double>> _xavier(int out, int inp, int seed) {
+  final r = math.Random(seed);
+  final limit = math.sqrt(6.0 / (out + inp));
+  return List.generate(out, (_) => List<double>.generate(inp, (_) => (r.nextDouble() * 2 - 1) * limit));
+}
+
 /* ------------------------------- policy IO (json) ------------------------------ */
 
 Map<String, dynamic> _weightsToJson({
@@ -62,32 +83,46 @@ Map<String, dynamic> _weightsToJson({
   required eng.GameEngine env,
   RunningNorm? norm,
 }) {
-  List<List<double>> to3(List<List<double>> W) =>
-      W.map((r) => r.map((v) => v.toDouble()).toList()).toList();
-
-  final sig = _feSignature(
+  String sig = _feSignature(
     groundSamples: fe.groundSamples,
     stridePx: fe.stridePx,
     worldW: env.cfg.worldW,
     worldH: env.cfg.worldH,
   );
 
+  // trunk layers -> [{W,b}, ...]
+  final trunkJson = <Map<String, dynamic>>[];
+  for (final layer in p.trunk.layers) {
+    trunkJson.add({
+      'W': _deepCopyMat(layer.W),
+      'b': List<double>.from(layer.b),
+    });
+  }
+
+  Map<String, dynamic> headJson(layer) => {
+    'W': _deepCopyMat(layer.W),
+    'b': List<double>.from(layer.b),
+  };
+
   final m = <String, dynamic>{
-    'h1': p.h1,
-    'h2': p.h2,
-    'W1': to3(p.W1), 'b1': p.b1,
-    'W2': to3(p.W2), 'b2': p.b2,
-    'W_thr': to3(p.W_thr), 'b_thr': p.b_thr,
-    'W_turn': to3(p.W_turn), 'b_turn': p.b_turn,
-    'W_intent': to3(p.W_intent), 'b_intent': p.b_intent,
-    'W_val': to3(p.W_val), 'b_val': p.b_val,
-    'arch': {'input': p.inputSize, 'h1': p.h1, 'h2': p.h2, 'kIntents': PolicyNetwork.kIntents},
+    'arch': {
+      'input': p.inputSize,
+      'hidden': p.hidden,
+      'kIntents': PolicyNetwork.kIntents,
+    },
+    'trunk': trunkJson,
+    'heads': {
+      'intent': headJson(p.heads.intent),
+      'turn': headJson(p.heads.turn),
+      'thr': headJson(p.heads.thr),
+      'val': headJson(p.heads.val),
+    },
     'feature_extractor': {'groundSamples': fe.groundSamples, 'stridePx': fe.stridePx},
     'env_hint': {'worldW': env.cfg.worldW, 'worldH': env.cfg.worldH},
     'signature': sig,
+    'format': 'v2', // mark new format
   };
 
-  // Save norm in BOTH formats (nested + top-level) for compatibility
   if (norm != null && norm.inited && norm.dim == p.inputSize) {
     m['norm'] = {
       'dim': norm.dim,
@@ -96,6 +131,7 @@ Map<String, dynamic> _weightsToJson({
       'var': norm.var_,
       'signature': sig,
     };
+    // legacy mirror (optional)
     m['norm_mean'] = norm.mean;
     m['norm_var'] = norm.var_;
     m['norm_momentum'] = norm.momentum;
@@ -109,16 +145,6 @@ void savePolicy(String path, PolicyNetwork p, FeatureExtractor fe, eng.GameEngin
   final jsonMap = _weightsToJson(p: p, fe: fe, env: env, norm: norm);
   f.writeAsStringSync(const JsonEncoder.withIndent('  ').convert(jsonMap));
   print('Saved policy → $path');
-}
-
-void _from3(List<List<double>> dst, List src) {
-  for (int i = 0; i < dst.length; i++) {
-    final ri = dst[i];
-    final si = (src[i] as List);
-    for (int j = 0; j < ri.length; j++) {
-      ri[j] = (si[j] as num).toDouble();
-    }
-  }
 }
 
 bool tryLoadPolicy(
@@ -145,55 +171,73 @@ bool tryLoadPolicy(
   }
   final m = raw;
 
-  // Helper: accept either a raw List<List<num>> OR an object with {data: List<List<num>>}
-  List _mat(dynamic v) {
-    if (v is List) return v;
-    if (v is Map && v['data'] is List) return v['data'] as List;
-    throw StateError('matrix field is not a List or {data: List}');
-  }
-
-  bool _tryFillMat(List<List<double>> dst, String key) {
-    final v = m[key];
-    if (v == null) return false;
-    try { _from3(dst, _mat(v)); return true; } catch (_) { return false; }
-  }
-  bool _tryFillVec(List<double> dst, String key) {
-    final v = m[key];
-    if (v == null) return false;
-    try {
-      final L = (v as List).map((e) => (e as num).toDouble()).toList();
-      final n = math.min(dst.length, L.length);
-      for (int i = 0; i < n; i++) dst[i] = L[i];
-      return true;
-    } catch (_) { return false; }
-  }
-
   int ok = 0, total = 0;
 
-  total += 2;
-  if (_tryFillMat(p.W1, 'W1')) ok++;
-  if (_tryFillVec(p.b1, 'b1')) ok++;
-  total += 2;
-  if (_tryFillMat(p.W2, 'W2')) ok++;
-  if (_tryFillVec(p.b2, 'b2')) ok++;
+  // Prefer new v2 format
+  final arch = (m['arch'] as Map?)?.cast<String, dynamic>();
+  final trunkJ = (m['trunk'] as List?)?.cast<dynamic>();
+  final headsJ = (m['heads'] as Map?)?.cast<String, dynamic>();
 
-  total += 2;
-  if (_tryFillMat(p.W_thr, 'W_thr')) ok++;
-  if (_tryFillVec(p.b_thr, 'b_thr')) ok++;
+  if (arch != null && trunkJ != null && headsJ != null) {
+    final hiddenFile = (arch['hidden'] as List?)?.map((e) => (e as num).toInt()).toList() ?? <int>[];
+    final hiddenNow = p.hidden;
 
-  total += 2;
-  if (_tryFillMat(p.W_turn, 'W_turn')) ok++;
-  if (_tryFillVec(p.b_turn, 'b_turn')) ok++;
+    if (hiddenFile.length != hiddenNow.length ||
+        hiddenFile.asMap().entries.any((e) => e.value != hiddenNow[e.key])) {
+      print(
+          'Warning: Saved hidden sizes ${hiddenFile} don\'t match current ${hiddenNow}. Attempting best-effort load (shape-mismatch tensors skipped).');
+    }
 
-  total += 2;
-  if (_tryFillMat(p.W_intent, 'W_intent')) ok++;
-  if (_tryFillVec(p.b_intent, 'b_intent')) ok++;
+    // Trunk layers
+    for (int li = 0; li < p.trunk.layers.length; li++) {
+      if (li >= trunkJ.length) break;
+      final layerObj = (trunkJ[li] as Map).cast<String, dynamic>();
+      final Wj = layerObj['W'];
+      final bj = layerObj['b'];
+      final L = p.trunk.layers[li];
 
-  total += 2;
-  if (_tryFillMat(p.W_val, 'W_val')) ok++;
-  if (_tryFillVec(p.b_val, 'b_val')) ok++;
+      // Shape guard
+      if (Wj is List && Wj.isNotEmpty && (Wj[0] as List).length == L.W[0].length && Wj.length == L.W.length) {
+        _assignMat(L.W, Wj);
+        ok++;
+      }
+      if (bj is List && bj.length == L.b.length) {
+        for (int i = 0; i < L.b.length; i++) L.b[i] = (bj[i] as num).toDouble();
+        ok++;
+      }
+      total += 2;
+    }
 
-  // Guarded norm load (prefer nested, but accept top-level too)
+    // Heads
+    bool _loadHead(Map<String, dynamic>? hj, List<List<double>> W, List<double> b) {
+      if (hj == null) return false;
+      bool any = false;
+      final Wj = hj['W'];
+      final bj = hj['b'];
+      if (Wj is List && Wj.isNotEmpty && (Wj[0] as List).length == W[0].length && Wj.length == W.length) {
+        _assignMat(W, Wj);
+        ok++;
+        any = true;
+      }
+      if (bj is List && bj.length == b.length) {
+        for (int i = 0; i < b.length; i++) b[i] = (bj[i] as num).toDouble();
+        ok++;
+        any = true;
+      }
+      total += 2;
+      return any;
+    }
+
+    _loadHead((headsJ['intent'] as Map?)?.cast<String, dynamic>(), p.heads.intent.W, p.heads.intent.b);
+    _loadHead((headsJ['turn'] as Map?)?.cast<String, dynamic>(), p.heads.turn.W, p.heads.turn.b);
+    _loadHead((headsJ['thr'] as Map?)?.cast<String, dynamic>(), p.heads.thr.W, p.heads.thr.b);
+    _loadHead((headsJ['val'] as Map?)?.cast<String, dynamic>(), p.heads.val.W, p.heads.val.b);
+  } else {
+    // Legacy fields not supported for deep MLP (W1/W2...)—skip with message
+    print('Note: $path doesn\'t look like v2 format (trunk/heads). Skipping weight load.');
+  }
+
+  // Norm (guarded by signature)
   if (!ignoreLoadedNorm && norm != null && fe != null && env != null) {
     final sigNow = _feSignature(
       groundSamples: fe.groundSamples,
@@ -249,7 +293,7 @@ bool tryLoadPolicy(
     }
   }
 
-  final tag = (ok == total) ? '' : '  (PARTIAL — IGNORING)';
+  final tag = (ok == total) ? '' : '  (PARTIAL)';
   print('Loaded policy ← $path ($ok/$total tensors filled)$tag');
   return ok > 0;
 }
@@ -385,14 +429,14 @@ void _warmFeatureNorm({
     double x=padCx, h=180, vx=0, vy=20;
 
     switch (want) {
-      case 1: // goLeft → need dx < -0.08*W (spawn to LEFT of pad)
+      case 1: // goLeft
         x  = (padCx - (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
             .clamp(10.0, env.cfg.worldW - 10.0);
         h  = 120 + 120*r.nextDouble();
         vx = (r.nextDouble()*14.0) - 7.0;
         vy = 28.0 + 10.0*r.nextDouble();
         break;
-      case 2: // goRight → need dx > +0.08*W (spawn to RIGHT of pad)
+      case 2: // goRight
         x  = (padCx + (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
             .clamp(10.0, env.cfg.worldW - 10.0);
         h  = 120 + 120*r.nextDouble();
@@ -483,14 +527,14 @@ _PretrainIntentStats _pretrainIntentLocal({
     double x=padCx, h=180, vx=0, vy=20;
 
     switch (intentIdx) {
-      case 1: // goLeft → dx < -0.08*W
+      case 1: // goLeft
         x  = (padCx - (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
             .clamp(10.0, env.cfg.worldW - 10.0);
         h  = 120 + 120*r.nextDouble();
         vx = (r.nextDouble()*14.0) - 7.0;
         vy = 28.0 + 10.0*r.nextDouble();
         break;
-      case 2: // goRight → dx > +0.08*W
+      case 2: // goRight
         x  = (padCx + (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
             .clamp(10.0, env.cfg.worldW - 10.0);
         h  = 120 + 120*r.nextDouble();
@@ -583,7 +627,7 @@ _PretrainIntentStats _pretrainIntentLocal({
         final (_pred, _p, cache) = policy.actIntentGreedy(xN);
         decisionCaches.add(cache);
         intentChoices.add(ys[idx]);
-        decisionReturns.add(cache.v);   // A=0 trick (baseline-free)
+        decisionReturns.add(cache.v);
         alignLabels.add(ys[idx]);
       }
 
@@ -634,55 +678,49 @@ _PretrainIntentStats _mineAndFixDescendSlow({
   required FeatureExtractor fe,
   required eng.GameEngine env,
   required PolicyNetwork policy,
-  int N = 6000,                 // how many mined samples we want
-  int epochs = 2,               // a couple small CE passes
+  int N = 6000,
+  int epochs = 2,
   double lr = 5e-4,
-  double weight = 3.0,          // upweight loss for this class
+  double weight = 3.0,
   int seed = 42424,
 }) {
   final r = math.Random(seed);
   env.reset(seed: 777);
   final xs = <List<double>>[];
-  final ys = <int>[]; // all = descendSlow label
+  final ys = <int>[];
 
-  // Mine: states where teacher==descendSlow but policy!=descendSlow
   while (xs.length < N) {
     final padCx = env.terrain.padCenter.toDouble();
 
-    // Randomize a *strong* descendSlow state that is unlikely to be brakeUp:
     env.lander.pos.x = (padCx + (r.nextDouble() * 0.10 - 0.05) * env.cfg.worldW)
         .clamp(10.0, env.cfg.worldW - 10.0);
     final gy = env.terrain.heightAt(env.lander.pos.x);
-    final height = 160 + r.nextDouble() * 240;     // >120 to match teacher; well above brakeUp zone
+    final height = 160 + r.nextDouble() * 240;
     env.lander.pos.y = (gy - height).clamp(0.0, env.cfg.worldH - 10.0);
     env.lander.vel.x = (r.nextDouble() * 18.0) - 9.0;
-    env.lander.vel.y = 22.0 + r.nextDouble() * 20.0; // vy > 20, but not crazy (avoid brakeUp)
+    env.lander.vel.y = 22.0 + r.nextDouble() * 20.0;
     env.lander.angle = 0.0;
     env.lander.fuel  = env.cfg.t.maxFuel;
 
     final yTeacher = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
-    if (yTeacher != 3 /* descendSlow */) continue;
+    if (yTeacher != 3) continue;
 
     final x = fe.extract(env);
 
-    // See what policy thinks *before* training
     final xN = trainer.norm?.normalize(x, update: false) ?? x;
     final (pred, _p, _c) = policy.actIntentGreedy(xN);
 
-    // Keep hard negatives (pred≠descendSlow) and a bit of easy positives for stability
     final keep = (pred != 3) || (r.nextDouble() < 0.25);
     if (!keep) continue;
 
     xs.add(x);
-    ys.add(3); // label is descendSlow
+    ys.add(3);
   }
 
-  // Warm norm on this distro (safe even if already warm)
   for (final x in xs) {
     try { (trainer.norm as dynamic).observe(x); } catch (_) { trainer.norm?.normalize(x, update: true); }
   }
 
-  // Train a bit on mined batch
   final idxs = List<int>.generate(xs.length, (i) => i)..shuffle(r);
   const B = 64;
   for (int ep = 0; ep < epochs; ep++) {
@@ -696,7 +734,7 @@ _PretrainIntentStats _mineAndFixDescendSlow({
         final xi = trainer.norm?.normalize(xs[idxs[i]], update: false) ?? xs[idxs[i]];
         final (_pred, _p, cache) = policy.actIntentGreedy(xi);
         caches.add(cache);
-        labels.add(3);          // descendSlow
+        labels.add(3);
         returns.add(cache.v);
       }
       policy.updateFromEpisode(
@@ -704,7 +742,7 @@ _PretrainIntentStats _mineAndFixDescendSlow({
         intentChoices: labels,
         decisionReturns: returns,
         alignLabels: labels,
-        alignWeight: weight,    // << upweight this class
+        alignWeight: weight,
         lr: lr,
         entropyBeta: 0.0,
         valueBeta: 0.0,
@@ -714,7 +752,6 @@ _PretrainIntentStats _mineAndFixDescendSlow({
     }
   }
 
-  // Train-set acc on mined data (sanity)
   int correct = 0;
   for (int i = 0; i < xs.length; i++) {
     final xi = trainer.norm?.normalize(xs[i], update: false) ?? xs[i];
@@ -725,6 +762,17 @@ _PretrainIntentStats _mineAndFixDescendSlow({
 }
 
 /* ------------------------------------ main ------------------------------------ */
+
+List<int> _parseHiddenList(String? s, {List<int> fallback = const [64, 64]}) {
+  if (s == null || s.trim().isEmpty) return List<int>.from(fallback);
+  final parts = s.split(',').map((t) => t.trim()).where((t) => t.isNotEmpty).toList();
+  final out = <int>[];
+  for (final p in parts) {
+    final v = int.tryParse(p);
+    if (v != null && v > 0) out.add(v);
+  }
+  return out.isEmpty ? List<int>.from(fallback) : out;
+}
 
 void main(List<String> argv) {
   final args = _Args(argv);
@@ -761,6 +809,9 @@ void main(List<String> argv) {
 
   final determinism = args.getFlag('determinism_probe', def: true);
 
+  // hidden layers (comma-separated), e.g. --hidden=96,96,64
+  final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
+
   double bestMeanCost = double.infinity;
   int bestCostIter = -1;
 
@@ -774,8 +825,8 @@ void main(List<String> argv) {
   final env = eng.GameEngine(cfg);
 
   final fe = FeatureExtractor(groundSamples: 3, stridePx: 48);
-  final policy = PolicyNetwork(inputSize: fe.inputSize, h1: 64, h2: 64, seed: seed);
-  print('Loaded init policy. h1=${policy.h1} h2=${policy.h2} | FE(gs=${fe.groundSamples} stride=${fe.stridePx})');
+  final policy = PolicyNetwork(inputSize: fe.inputSize, hidden: hidden, seed: seed);
+  print('Loaded init policy. hidden=${policy.hidden} | FE(gs=${fe.groundSamples} stride=${fe.stridePx})');
 
   final trainer = Trainer(
     env: env,
@@ -805,8 +856,7 @@ void main(List<String> argv) {
     env: env,
     ignoreLoadedNorm: ignoreLoadedNorm,
   );
-
-   */
+  */
 
   if (determinism) {
     env.reset(seed: 1234);
@@ -817,18 +867,16 @@ void main(List<String> argv) {
     print('Determinism probe: steps ${a.steps} vs ${b.steps} | cost ${a.cost.toStringAsFixed(6)} vs ${b.cost.toStringAsFixed(6)} => ${ok ? "OK" : "MISMATCH"}');
   }
 
-  // Optionally reset action heads
+  // Optionally reset action heads (turn/thr)
   if (resetActionHeads) {
-    List<List<double>> _randInit(int rows, int cols, int s) {
-      final r = math.Random(s);
-      final limit = math.sqrt(6.0 / (rows + cols));
-      return List.generate(rows, (_) => List<double>.generate(cols, (_) => (r.nextDouble()*2-1)*limit));
-    }
-    policy.W_thr = _randInit(1, policy.h2, seed ^ 0xA1);
-    policy.b_thr = List<double>.filled(1, 0.0);
-    policy.W_turn = _randInit(3, policy.h2, seed ^ 0xB2);
-    policy.b_turn = List<double>.filled(3, 0.0);
-    print('Action heads reset (W_thr, b_thr, W_turn, b_turn).');
+    final hiddenDim = policy.trunk.layers.isEmpty
+        ? policy.inputSize
+        : policy.trunk.layers.last.b.length;
+    policy.heads.thr.W = _xavier(1, hiddenDim, seed ^ 0xA1);
+    policy.heads.thr.b = List<double>.filled(1, 0.0);
+    policy.heads.turn.W = _xavier(3, hiddenDim, seed ^ 0xB2);
+    policy.heads.turn.b = List<double>.filled(3, 0.0);
+    print('Action heads reset (thr & turn).');
   }
 
   // ===== PRETRAIN =====
@@ -859,7 +907,7 @@ void main(List<String> argv) {
         fe: fe,
         env: env,
         policy: policy,
-        perBand: 2500,      // try 2500–4000 if needed
+        perBand: 2500,
         epochs: 2,
         lr: pretrainLr,
         weight: 3.5,
@@ -867,7 +915,6 @@ void main(List<String> argv) {
       );
       print('DescendSlow targeted fix → acc=${(stDescFix.acc*100).toStringAsFixed(1)}% n=${stDescFix.n}');
 
-      // After _pretrainIntentLocal(...) and any targeted passes:
       calibrateIntentBiasToTeacher(
         trainer: trainer, fe: fe, env: env, policy: policy,
         N: 6000, iters: 50, lr: 0.5, seed: seed ^ 0xCA1,
@@ -879,16 +926,13 @@ void main(List<String> argv) {
         N: 6000, epochs: 2, lr: pretrainLr, weight: 3.0, seed: seed ^ 0xC0DE,
       );
       print('DescendSlow hard-neg fix → acc=${(mined.acc*100).toStringAsFixed(1)}% n=${mined.n}');
-
-       */
+      */
 
       savePolicy('policy_pretrained.json', policy, fe, env, norm: trainer.norm);
     }
 
-    // Action heads pretrain – not implemented in this agent build
     if (pretrainActionsN > 0) {
-      print('Note: --pretrain_actions_n=$pretrainActionsN requested, '
-          'but this agent build has no Trainer.pretrainActions(). Skipping action pretrain.');
+      print('Note: --pretrain_actions_n=$pretrainActionsN requested, but this agent build has no separate action-pretrain. Skipping.');
     }
 
     if (onlyPretrain) {
@@ -979,7 +1023,7 @@ void calibrateIntentBiasToTeacher({
     xsRaw.add(fe.extract(env));
   }
 
-  // 2) Build a *temporary* local norm on xsRaw (don’t touch trainer.norm)
+  // 2) Build a temporary local norm on xsRaw (don’t touch trainer.norm)
   final tmpNorm = RunningNorm(fe.inputSize, momentum: 0.995);
   for (final x in xsRaw) { tmpNorm.normalize(x, update: true); }
   final xs = xsRaw.map((x) => tmpNorm.normalize(x, update: false)).toList();
@@ -998,7 +1042,7 @@ void calibrateIntentBiasToTeacher({
     final pMean = pSum.map((s) => s / N).toList();
     for (int k = 0; k < K; k++) {
       final g = math.log(tMarg[k]) - math.log(pMean[k] + eps);
-      policy.b_intent[k] += lr * g;
+      policy.heads.intent.b[k] += lr * g; // << updated to new location
     }
   }
 
@@ -1010,10 +1054,10 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
   required FeatureExtractor fe,
   required eng.GameEngine env,
   required PolicyNetwork policy,
-  int perBand = 2500,          // how many hard examples to mine per band
+  int perBand = 2500,
   int epochs = 2,
   double lr = 5e-4,
-  double weight = 3.5,         // upweight this class
+  double weight = 3.5,
   int seed = 60606,
 }) {
   final r = math.Random(seed);
@@ -1024,7 +1068,6 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
 
   int minedBand1 = 0, minedBand2 = 0;
 
-  // helper: push a state if teacher=descendSlow AND model mispredicts as hover/brakeUp
   bool _tryPush() {
     final yTeach = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
     if (yTeach != 3) return false;
@@ -1033,30 +1076,27 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
     final xN = trainer.norm?.normalize(xRaw, update: false) ?? xRaw;
     final (pred, _p, _c) = policy.actIntentGreedy(xN);
 
-    if (pred == 3) return false; // not hard
-    if (pred != 0 && pred != 4) return false; // keep only hover/brakeUp confusions
+    if (pred == 3) return false;            // not hard
+    if (pred != 0 && pred != 4) return false; // only hover/brakeUp confusions
 
     xs.add(xRaw);
     ys.add(3);
     return true;
   }
 
-  // -----------------------------
-  // Band 1: close to pad, modest height, low vy (teacher would say descendSlow, model says hover)
-  // |dx| ∈ [0, 0.08W), height ∈ [130, 220], vy ∈ [20, 32]
-  // -----------------------------
+  // Band 1
   while (minedBand1 < perBand) {
     final padCx = env.terrain.padCenter.toDouble();
     final W = env.cfg.worldW;
     final H = env.cfg.worldH;
 
     final sign = (r.nextBool() ? 1.0 : -1.0);
-    final dx = sign * (0.08 * W * r.nextDouble()); // |dx| < 0.08W
+    final dx = sign * (0.08 * W * r.nextDouble());
     final px = (padCx + dx).clamp(10.0, W - 10.0);
     final gy = env.terrain.heightAt(px);
 
-    final height = 130.0 + r.nextDouble() * 90.0;   // 130..220
-    final vy = 20.0 + r.nextDouble() * 12.0;        // 20..32
+    final height = 130.0 + r.nextDouble() * 90.0;
+    final vy = 20.0 + r.nextDouble() * 12.0;
     final vx = (r.nextDouble() * 16.0) - 8.0;
 
     env.lander
@@ -1070,10 +1110,7 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
     if (_tryPush()) minedBand1++;
   }
 
-  // -----------------------------
-  // Band 2: close to pad, higher height, higher vy (model flips to brakeUp too early)
-  // |dx| ∈ [0, 0.08W), height ∈ [200, 320], vy ∈ [36, 60]
-  // -----------------------------
+  // Band 2
   while (minedBand2 < perBand) {
     final padCx = env.terrain.padCenter.toDouble();
     final W = env.cfg.worldW;
@@ -1084,8 +1121,8 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
     final px = (padCx + dx).clamp(10.0, W - 10.0);
     final gy = env.terrain.heightAt(px);
 
-    final height = 200.0 + r.nextDouble() * 120.0;  // 200..320
-    final vy = 36.0 + r.nextDouble() * 24.0;        // 36..60
+    final height = 200.0 + r.nextDouble() * 120.0;
+    final vy = 36.0 + r.nextDouble() * 24.0;
     final vx = (r.nextDouble() * 16.0) - 8.0;
 
     env.lander
@@ -1099,12 +1136,10 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
     if (_tryPush()) minedBand2++;
   }
 
-  // Warm norm (safe even if already warm)
   for (final x in xs) {
     try { (trainer.norm as dynamic).observe(x); } catch (_) { trainer.norm?.normalize(x, update: true); }
   }
 
-  // Train a couple epochs on the mined set
   final N = xs.length;
   final idx = List<int>.generate(N, (i) => i)..shuffle(r);
   const B = 64;
@@ -1120,7 +1155,7 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
         final xi = trainer.norm?.normalize(xs[idx[i]], update: false) ?? xs[idx[i]];
         final (_pred, _p, cache) = policy.actIntentGreedy(xi);
         caches.add(cache);
-        labels.add(3); // descendSlow
+        labels.add(3);
         returns.add(cache.v);
       }
 
@@ -1139,7 +1174,6 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
     }
   }
 
-  // quick train-set acc
   int correct = 0;
   for (int i = 0; i < N; i++) {
     final xi = trainer.norm?.normalize(xs[i], update: false) ?? xs[i];
@@ -1154,11 +1188,13 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
 
 Pretrain only (intent; reset action heads; ignore old norm):
   dart run lib/ai/train_agent.dart \
+    --hidden=64,64 \
     --pretrain_intent=10000 --pretrain_epochs=3 --pretrain_align=3.0 --pretrain_lr=0.0005 \
     --reset_action_heads --ignore_loaded_norm --only_pretrain
 
 Full train (after pretrain):
   dart run lib/ai/train_agent.dart \
+    --hidden=96,96,64 \
     --train_iters=200 --batch=32 --lr=0.0003 \
     --plan_hold=1 --use_learned_controller --blend_policy=0.75 \
     --value_beta=0.7
