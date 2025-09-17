@@ -654,6 +654,13 @@ class EpisodeResult {
   });
 }
 
+// >>> NEW: external dense reward hook (e.g., potential-field shaping)
+typedef ExternalRewardHook = double Function({
+required eng.GameEngine env,
+required double dt,
+required int tStep,
+});
+
 class Trainer {
   final eng.GameEngine env;
   final FeatureExtractorRays fe;
@@ -695,6 +702,9 @@ class Trainer {
   int _pwmCount = 0;
   int _pwmOn = 0;
 
+  // >>> NEW: external reward hook
+  final ExternalRewardHook? externalRewardHook;
+
   Trainer({
     required this.env,
     required this.fe,
@@ -718,6 +728,9 @@ class Trainer {
     this.gateScoreMin = -double.infinity,
     this.gateOnlyLanded = false,
     this.gateVerbose = true,
+
+    // NEW
+    this.externalRewardHook,
   })  : segmentAsCost = segmentAsCost,
         norm = RunningNorm(fe.inputSize, momentum: 0.995);
 
@@ -875,6 +888,9 @@ class Trainer {
     int steps = 0;
     bool landed = false;
 
+    // NEW: accumulate external per-step reward until next decision boundary
+    double pfAcc = 0.0;
+
     while (true) {
       if (framesLeft <= 0) {
         var x = fe.extract(env);
@@ -899,7 +915,8 @@ class Trainer {
           decisionCaches.add(cache);
           intentChoices.add(idx);
           alignLabels.add(yTeacher);
-          decisionRewards.add(r_t);            // <-- store reward, not advantage yet
+          decisionRewards.add(r_t + pfAcc);    // include accumulated external reward
+          pfAcc = 0.0;                         // reset for next decision window
         }
 
         // --- compute discounted returns (advantages) from decisionRewards ---
@@ -937,7 +954,7 @@ class Trainer {
           }
         }
 
-    // adaptive plan hold
+        // adaptive plan hold
         final padCx = env.terrain.padCenter.toDouble();
         final dxAbs = (env.lander.pos.x.toDouble() - padCx).abs();
         final vxAbs = env.lander.vel.x.toDouble().abs();
@@ -993,6 +1010,11 @@ class Trainer {
         _pwmCount = 0; _pwmOn = 0;
       }
 
+      // --- NEW: accumulate external per-step reward (e.g. PF shaping)
+      if (externalRewardHook != null) {
+        pfAcc += externalRewardHook!(env: env, dt: dt, tStep: steps);
+      }
+
       final info = env.step(dt, et.ControlInput(
         thrust: execThrust, left: execLeft, right: execRight, intentIdx: currentIntentIdx,
       ));
@@ -1006,9 +1028,14 @@ class Trainer {
         segSum += _segmentScore(env, terminalBonus: true);
         segCount++;
 
-        // NEW: feed terminal credit into the PG
+        // push any remaining external reward into the final decision
+        if (train && decisionRewards.isNotEmpty && pfAcc.abs() > 0) {
+          decisionRewards[decisionRewards.length - 1] += pfAcc;
+          pfAcc = 0.0;
+        }
+
+        // feed terminal credit into the PG
         if (train && decisionRewards.isNotEmpty) {
-          // Recreate the same terminal bonus used in _segmentScore(..., terminalBonus: true)
           double terminalReward = 0.0;
           if (landed) {
             terminalReward = 10.0;

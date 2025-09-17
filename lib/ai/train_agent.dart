@@ -7,7 +7,9 @@ import '../engine/types.dart' as et;
 import '../engine/game_engine.dart' as eng;
 import '../engine/raycast.dart'; // RayConfig
 
-import 'agent.dart'; // FeatureExtractorRays, PolicyNetwork, Trainer, RunningNorm, kIntentNames, predictiveIntentLabelAdaptive
+import 'agent.dart' as ai; // FeatureExtractorRays, PolicyNetwork, Trainer, RunningNorm, kIntentNames, predictiveIntentLabelAdaptive
+import 'agent.dart';       // bring symbols into scope (PolicyNetwork etc.)
+import 'potential_field.dart'; // <-- PF: buildPotentialField, PotentialField
 
 /* ------------------------------- tiny arg parser ------------------------------- */
 
@@ -179,7 +181,7 @@ et.EngineConfig makeConfig({
   );
 }
 
-/* ------------------------------ determinism probe ------------------------------ */
+/* ----------------------------- determinism probe ------------------------------ */
 
 typedef _RolloutRes = ({int steps, double cost});
 
@@ -297,7 +299,7 @@ void _warmFeatureNorm({
       case 5: // brakeLeft  (moving right too fast near pad)
         x = (padCx + (r.nextDouble() * 0.02 - 0.01) * padHalfW).clamp(10.0, padHalfW - 10.0);
         h = 120 + 100 * r.nextDouble();
-        vx = 28.0 + 24.0 * r.nextDouble();   // +vx
+        vx = 28.0 + 24.0 * r.nextDouble(); // +vx
         vy = 18.0 + 18.0 * r.nextDouble();
         break;
       case 6: // brakeRight (moving left too fast near pad)
@@ -334,6 +336,68 @@ void _warmFeatureNorm({
     accepted++;
   }
   print('Feature norm warmed with $accepted synthetic samples.');
+}
+
+/* ----------------------------- PF shaping helpers ------------------------------ */
+
+class PFShapingCfg {
+  final double wDeltaPhi;   // reward per unit potential drop
+  final double wAlign;      // reward per unit cos(v, flow)
+  final double wVelDelta;   // penalty per unit ||v - v_pf|| / vmax
+  final double clampSpeed;  // suggestVelocity clamp
+  final double vmax;        // normalization for velocity error
+  const PFShapingCfg({
+    this.wDeltaPhi = 4.0,
+    this.wAlign = 1.5,
+    this.wVelDelta = 0.4,
+    this.clampSpeed = 90.0,
+    this.vmax = 140.0,
+  });
+}
+
+/// Build a per-step reward hook for current episode/terrain.
+/// Requires Trainer to call `externalRewardHook(env:..., dt:..., tStep:...)` each step.
+ai.ExternalRewardHook makePFRewardHook({
+  required eng.GameEngine env,
+  PFShapingCfg cfg = const PFShapingCfg(),
+}) {
+  // Build PF once for this episode's terrain
+  final pf = buildPotentialField(env, nx: 160, ny: 120, iters: 1200, omega: 1.7, tol: 1e-4);
+
+  double prevPhi = pf.samplePhi(env.lander.pos.x, env.lander.pos.y);
+
+  return ({required eng.GameEngine env, required double dt, required int tStep}) {
+    final x = env.lander.pos.x;
+    final y = env.lander.pos.y;
+
+    // 1) Δφ: positive when moving downhill (toward pad)
+    final phi = pf.samplePhi(x, y);
+    final dPhi = (prevPhi - phi);
+    prevPhi = phi;
+
+    // 2) Alignment between actual velocity and −∇φ
+    final vx = env.lander.vel.x;
+    final vy = env.lander.vel.y;
+    final flow = pf.sampleFlow(x, y); // returns unit (nx,ny)
+    final vmag = math.sqrt(vx * vx + vy * vy);
+    double align = 0.0;
+    if (vmag > 1e-6) {
+      align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny; // [-1,1]
+    }
+
+    // 3) Velocity delta to PF "prediction" vector (suggested velocity)
+    final sugg = pf.suggestVelocity(x, y, clampSpeed: cfg.clampSpeed);
+    final dvx = vx - sugg.vx;
+    final dvy = vy - sugg.vy;
+    final vErr = math.sqrt(dvx * dvx + dvy * dvy) / cfg.vmax;
+
+    final r = cfg.wDeltaPhi * dPhi + cfg.wAlign * align - cfg.wVelDelta * vErr;
+
+    // Optional temporal decay:
+    // return r * (1.0 - 0.0008 * tStep).clamp(0.5, 1.0);
+
+    return r;
+  };
 }
 
 /* ------------------------------------ main ------------------------------------ */
@@ -414,6 +478,9 @@ void main(List<String> argv) {
   final policy = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
   print('Loaded init policy. hidden=${policy.hidden} | FE(kind=rays, in=$inDim, rays=${env.rayCfg.rayCount}, oneHot=$kindsOneHot)');
 
+  // ===== PF shaping hook (mutable; rebuilt per episode) =====
+  ai.ExternalRewardHook? pfHook = makePFRewardHook(env: env);
+
   // ----- Trainer -----
   final trainer = Trainer(
     env: env,
@@ -436,6 +503,11 @@ void main(List<String> argv) {
     gateScoreMin: gateScoreMin,
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
+
+    // NEW: add dense PF reward per step
+    externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
+      return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
+    }),
   );
 
   // Determinism probe (physics)
@@ -476,6 +548,10 @@ void main(List<String> argv) {
 
     for (int b = 0; b < batch; b++) {
       env.reset(seed: rnd.nextInt(1 << 30));
+
+      // Rebuild PF-based reward hook for this terrain/episode
+      pfHook = makePFRewardHook(env: env);
+
       final res = trainer.runEpisode(
         train: true, // Trainer handles gating internally & prints [TRAIN] lines
         greedy: false,
@@ -536,7 +612,7 @@ void main(List<String> argv) {
 
 /* ----------------------------------- usage ------------------------------------
 
-Train with internal gating on segment score (higher is better). Example:
+Train with PF shaping + internal gating on segment score (higher is better). Example:
 
   dart run lib/ai/train_agent.dart \
     --hidden=96,96,64 \
@@ -546,8 +622,8 @@ Train with internal gating on segment score (higher is better). Example:
     --determinism_probe
 
 Notes:
-- [TRAIN] accepted/skipped lines are printed by Trainer when gateVerbose=true
-  and gate_min is set (score gate).
-- Rays are forward-aligned (RayConfig.forwardAligned=true). One-hot per-ray
-  channels are auto-detected from feature length (6 + 4*rayCount).
+- Requires Trainer to support `externalRewardHook` (small change in agent.dart).
+- PF shaping terms:
+    r = wDeltaPhi * Δφ  +  wAlign * cos(v, −∇φ)  −  wVelDelta * ||v − v_pf||/vmax
+  Tune weights in PFShapingCfg if needed.
 -------------------------------------------------------------------------------- */
