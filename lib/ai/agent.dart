@@ -1,5 +1,6 @@
 // lib/ai/agent.dart
 import 'dart:math' as math;
+import 'nn_helper.dart' as nn;                 // <— helper
 import '../engine/types.dart' as et;
 import '../engine/game_engine.dart' as eng;
 
@@ -159,44 +160,35 @@ int predictiveIntentLabelAdaptive(
   final vy = L.vel.y.toDouble();
 
   final gy = T.heightAt(px);
-  final h  = (gy - py).toDouble();
+  final h = (gy - py).toDouble();
   final dx = px - padCx;
 
-  // Look-ahead grows with height
   final hNorm = (h / 320.0).clamp(0.0, 1.6);
-  final tau   = (baseTauSec * (0.7 + 0.5 * hNorm)).clamp(minTauSec, maxTauSec);
+  final tau = (baseTauSec * (0.7 + 0.5 * hNorm)).clamp(minTauSec, maxTauSec);
 
-  // crude projection
-  final g  = env.cfg.t.gravity;
+  final g = env.cfg.t.gravity;
   final dxF = dx + vx * tau;
   final vyF = vy + g * tau;
 
-  // Commit bands (wider, with hysteresis)
-  final padEnter = 0.08 * W;   // allow hover/descend inside this
-  final padExit  = 0.14 * W;   // force lateral outside this
+  final padEnter = 0.08 * W;
+  final padExit = 0.14 * W;
 
-  // Emergency brake if we're about to slam
   if (h < 50 && vyF > 45) return intentToIndex(Intent.brakeUp);
 
-  // Outside exit band → lateral
   if (dxF.abs() > padExit) {
     return dxF > 0 ? intentToIndex(Intent.goRight) : intentToIndex(Intent.goLeft);
   }
 
-  // Near pad: if lateral drift is significant, brake it FIRST (anti ping-pong)
-  // If vx would carry us *out* of padEnter, command opposite lateral to damp vx.
   final willExitSoon = (dxF.abs() > padEnter) && (dx.abs() <= padEnter);
-  final vxIsBad = (dx.sign == vx.sign) && vx.abs() > 20.0; // drifting outward
+  final vxIsBad = (dx.sign == vx.sign) && vx.abs() > 20.0;
   if ((willExitSoon || vxIsBad) && h > 90) {
     return dx >= 0 ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
   }
 
-  // Otherwise, controlled descent inside commit band
   if (dxF.abs() <= padEnter) {
     return intentToIndex(Intent.descendSlow);
   }
 
-  // Between enter/exit → gentle lateral nudge toward center
   return dxF > 0 ? intentToIndex(Intent.goRight) : intentToIndex(Intent.goLeft);
 }
 
@@ -205,7 +197,7 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final T = env.terrain;
   final px = L.pos.x.toDouble();
   final gy = T.heightAt(px);
-  final h  = (gy - L.pos.y).toDouble();
+  final h = (gy - L.pos.y).toDouble();
   final vy = L.vel.y.toDouble();
 
   switch (intent) {
@@ -213,14 +205,12 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
       return const et.ControlInput(thrust: true, left: false, right: false);
 
     case Intent.descendSlow: {
-      // Track a gentle vertical target and *don’t* translate if drift is small
       final vTarget = (0.10 * h + 8.0).clamp(8.0, 26.0);
       final need = (vy > vTarget) || (h < 110);
       return et.ControlInput(thrust: need, left: false, right: false);
     }
 
     case Intent.goLeft: {
-      // Translate only at mid heights; near ground do rotation-only nudges
       final translate = (h > 110 && h < 300) && (vy < 35);
       return et.ControlInput(thrust: translate, left: true, right: false);
     }
@@ -232,7 +222,6 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
     case Intent.hover:
     default: {
-      // Light vertical support to avoid sink when hovering
       final vHover = (0.06 * h + 6.0).clamp(6.0, 18.0);
       return et.ControlInput(thrust: vy > vHover, left: false, right: false);
     }
@@ -245,8 +234,7 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
 class ForwardCache {
   final List<double> x;
-  final List<double> h1;
-  final List<double> h2;
+  final List<List<double>> acts; // a0..aL (tanh outputs)
   final List<double> intentLogits;
   final List<double> intentProbs;
   final List<double> turnLogits; // 3 logits
@@ -255,8 +243,7 @@ class ForwardCache {
   final double v; // value head
   ForwardCache({
     required this.x,
-    required this.h1,
-    required this.h2,
+    required this.acts,
     required this.intentLogits,
     required this.intentProbs,
     required this.turnLogits,
@@ -267,122 +254,34 @@ class ForwardCache {
 }
 
 class PolicyNetwork {
-  final int inputSize;
-  final int h1;
-  final int h2;
   static const int kIntents = 5;
 
-  List<List<double>> W1;
-  List<double> b1;
-  List<List<double>> W2;
-  List<double> b2;
-
-  List<List<double>> W_intent;
-  List<double> b_intent;
-
-  List<List<double>> W_turn;
-  List<double> b_turn;
-
-  List<List<double>> W_thr;
-  List<double> b_thr;
-
-  List<List<double>> W_val;
-  List<double> b_val;
+  final int inputSize;
+  final List<int> hidden;     // e.g., [64,64] or [96,96,64]
+  final nn.MLPTrunk trunk;
+  final nn.PolicyHeads heads;
 
   PolicyNetwork({
     required this.inputSize,
-    this.h1 = 64,
-    this.h2 = 64,
+    List<int> hidden = const [64, 64],
     int seed = 0,
-  })  : W1 = _xavier(h: 64, w: inputSize, seed: seed ^ 0x11),
-        b1 = List<double>.filled(64, 0.0),
-        W2 = _xavier(h: 64, w: 64, seed: seed ^ 0x22),
-        b2 = List<double>.filled(64, 0.0),
-        W_intent = _xavier(h: kIntents, w: 64, seed: seed ^ 0x33),
-        b_intent = List<double>.filled(kIntents, 0.0),
-        W_turn = _xavier(h: 3, w: 64, seed: seed ^ 0x44),
-        b_turn = List<double>.filled(3, 0.0),
-        W_thr = _xavier(h: 1, w: 64, seed: seed ^ 0x55),
-        b_thr = List<double>.filled(1, 0.0),
-        W_val = _xavier(h: 1, w: 64, seed: seed ^ 0x66),
-        b_val = List<double>.filled(1, 0.0);
-
-  static List<List<double>> _xavier({required int h, required int w, int seed = 0}) {
-    final r = math.Random(seed);
-    final limit = math.sqrt(6.0 / (h + w));
-    return List.generate(h, (_) => List<double>.generate(w, (_) => (r.nextDouble()*2-1)*limit));
-  }
-
-  static List<double> _matVec(List<List<double>> W, List<double> x, List<double> b) {
-    final h = W.length, w = x.length;
-    final y = List<double>.filled(h, 0.0);
-    for (int i = 0; i < h; i++) {
-      double s = b[i];
-      final Wi = W[i];
-      for (int j = 0; j < w; j++) s += Wi[j] * x[j];
-      y[i] = s;
-    }
-    return y;
-  }
-
-  static double _tanhScalar(double x) {
-    final ax = x.abs();
-    if (ax > 20.0) return x.isNegative ? -1.0 : 1.0;
-    final e = math.exp(-2.0 * ax);
-    final t = (1.0 - e) / (1.0 + e);
-    return x.isNegative ? -t : t;
-  }
-
-  static void _tanhInPlace(List<double> v) {
-    for (int i = 0; i < v.length; i++) {
-      v[i] = _tanhScalar(v[i]);
-    }
-  }
-
-  static List<double> _softmax(List<double> z) {
-    double m = z[0];
-    for (int i = 1; i < z.length; i++) if (z[i] > m) m = z[i];
-    double s = 0.0;
-    final out = List<double>.filled(z.length, 0.0);
-    for (int i = 0; i < z.length; i++) {
-      final e = math.exp(z[i] - m);
-      out[i] = e.isFinite ? e : 0.0;
-      s += out[i];
-    }
-    final inv = (s > 0 && s.isFinite) ? (1.0 / s) : 0.0;
-    for (int i = 0; i < z.length; i++) out[i] *= inv;
-    return out;
-  }
-
-  static double _sigmoid(double x) {
-    if (x >= 0) {
-      final ex = math.exp(-x);
-      return 1.0 / (1.0 + ex);
-    } else {
-      final ex = math.exp(x);
-      return ex / (1.0 + ex);
-    }
-  }
+  })  : hidden = List<int>.from(hidden),
+        trunk  = nn.MLPTrunk(inputSize: inputSize, hiddenSizes: hidden, seed: seed ^ 0x7777),
+        heads  = nn.PolicyHeads(hidden.isEmpty ? inputSize : hidden.last, seed: seed ^ 0x8888);
 
   ForwardCache _forwardFull(List<double> x) {
-    final h1v = _matVec(W1, x, b1);
-    _tanhInPlace(h1v);
-    final h2v = _matVec(W2, h1v, b2);
-    _tanhInPlace(h2v);
-
-    final intentLogits = _matVec(W_intent, h2v, b_intent);
-    final intentProbs = _softmax(intentLogits);
-
-    final turnLogits = _matVec(W_turn, h2v, b_turn);
-    final thrLogit = _matVec(W_thr, h2v, b_thr)[0];
-    final thrProb = _sigmoid(thrLogit);
-
-    final v = _matVec(W_val, h2v, b_val)[0];
+    final acts = trunk.forwardAll(x);
+    final h = acts.last;
+    final intentLogits = heads.intent.forward(h);
+    final intentProbs  = nn.Ops.softmax(intentLogits);
+    final turnLogits   = heads.turn.forward(h);
+    final thrLogit     = heads.thr.forward(h)[0];
+    final thrProb      = nn.Ops.sigmoid(thrLogit);
+    final v            = heads.val.forward(h)[0];
 
     return ForwardCache(
       x: List<double>.from(x),
-      h1: h1v,
-      h2: h2v,
+      acts: acts,
       intentLogits: intentLogits,
       intentProbs: intentProbs,
       turnLogits: turnLogits,
@@ -393,13 +292,13 @@ class PolicyNetwork {
   }
 
   (int, List<double>, ForwardCache) actIntentGreedy(List<double> x) {
-    final cache = _forwardFull(x);
+    final c = _forwardFull(x);
     int arg = 0;
-    double best = cache.intentProbs[0];
-    for (int i = 1; i < cache.intentProbs.length; i++) {
-      if (cache.intentProbs[i] > best) { best = cache.intentProbs[i]; arg = i; }
+    double best = c.intentProbs[0];
+    for (int i = 1; i < c.intentProbs.length; i++) {
+      if (c.intentProbs[i] > best) { best = c.intentProbs[i]; arg = i; }
     }
-    return (arg, cache.intentProbs, cache);
+    return (arg, c.intentProbs, c);
   }
 
   (bool, bool, bool, List<double>, ForwardCache) actGreedy(List<double> x) {
@@ -412,7 +311,7 @@ class PolicyNetwork {
     }
     final left = (tArg == 0);
     final right = (tArg == 2);
-    final probs = <double>[ c.thrProb, ..._softmax(c.turnLogits) ];
+    final probs = <double>[ c.thrProb, ...nn.Ops.softmax(c.turnLogits) ];
     return (thrust, left, right, probs, c);
   }
 
@@ -440,77 +339,52 @@ class PolicyNetwork {
       return g;
     }
 
+    // Trunk grad holders
+    List<List<List<double>>> gW_trunk = [
+      for (final lin in trunk.layers)
+        List.generate(lin.W.length, (_) => List<double>.filled(lin.W[0].length, 0.0))
+    ];
+    List<List<double>> gb_trunk = [
+      for (final lin in trunk.layers) List<double>.filled(lin.b.length, 0.0)
+    ];
+
+    // Heads grads
+    final gW_int = List.generate(heads.intent.W.length,
+            (_) => List<double>.filled(heads.intent.W[0].length, 0.0));
+    final gb_int = List<double>.filled(heads.intent.b.length, 0.0);
+
+    final gW_turn = List.generate(heads.turn.W.length,
+            (_) => List<double>.filled(heads.turn.W[0].length, 0.0));
+    final gb_turn = List<double>.filled(heads.turn.b.length, 0.0);
+
+    final gW_thr = List.generate(heads.thr.W.length,
+            (_) => List<double>.filled(heads.thr.W[0].length, 0.0));
+    final gb_thr = List<double>.filled(heads.thr.b.length, 0.0);
+
     // ----- Intent CE (supervised) -----
     if (intentMode && alignWeight > 0 && decisionCaches.isNotEmpty) {
       final N = decisionCaches.length;
-
-      final gW2 = List.generate(h2, (_) => List<double>.filled(h1, 0.0));
-      final gb2 = List<double>.filled(h2, 0.0);
-      final gW1 = List.generate(h1, (_) => List<double>.filled(inputSize, 0.0));
-      final gb1 = List<double>.filled(h1, 0.0);
-
-      final gW_int = List.generate(kIntents, (_) => List<double>.filled(h2, 0.0));
-      final gb_int = List<double>.filled(kIntents, 0.0);
-
       for (int n = 0; n < N; n++) {
         final c = decisionCaches[n];
+        final h = c.acts.last;
         final y = alignLabels[n].clamp(0, kIntents - 1);
-        final dLog = List<double>.from(c.intentProbs);
-        dLog[y] -= 1.0; // p - y
+        final dLog = nn.Ops.crossEntropyGrad(c.intentProbs, y); // p - y
 
-        for (int i = 0; i < kIntents; i++) {
-          gb_int[i] += dLog[i];
-          for (int j = 0; j < h2; j++) {
-            gW_int[i][j] += dLog[i] * c.h2[j];
-          }
-        }
+        final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
 
-        final dh2 = List<double>.filled(h2, 0.0);
-        for (int j = 0; j < h2; j++) {
-          double s = 0.0;
-          for (int i = 0; i < kIntents; i++) s += W_intent[i][j] * dLog[i];
-          final sech2 = 1.0 - c.h2[j] * c.h2[j];
-          dh2[j] = s * sech2;
-        }
-
-        final dh1 = List<double>.filled(h1, 0.0);
-        for (int j = 0; j < h2; j++) {
-          gb2[j] += dh2[j];
-          for (int k = 0; k < h1; k++) {
-            gW2[j][k] += dh2[j] * c.h1[k];
-            dh1[k] += W2[j][k] * dh2[j];
-          }
-        }
-        for (int k = 0; k < h1; k++) {
-          final sech2 = 1.0 - c.h1[k] * c.h1[k];
-          dh1[k] *= sech2;
-        }
-
-        for (int k = 0; k < h1; k++) {
-          gb1[k] += dh1[k];
-          for (int t = 0; t < inputSize; t++) {
-            gW1[k][t] += dh1[k] * c.x[t];
-          }
-        }
+        trunk.backwardFromTopGrad(
+          dTop: dH,
+          acts: c.acts,
+          gW: gW_trunk,
+          gb: gb_trunk,
+        );
       }
 
       final scale = lr * alignWeight / N;
-      for (int i = 0; i < kIntents; i++) {
-        b_intent[i] -= _clipGrad(scale * gb_int[i]);
-        for (int j = 0; j < h2; j++) {
-          W_intent[i][j] -= _clipGrad(scale * gW_int[i][j]);
-        }
-      }
-      for (int j = 0; j < h2; j++) {
-        b2[j] -= _clipGrad(scale * gb2[j]);
-        for (int k = 0; k < h1; k++) {
-          W2[j][k] -= _clipGrad(scale * gW2[j][k]);
-        }
-      }
-      for (int k = 0; k < h1; k++) {
-        b1[k] -= _clipGrad(scale * gb1[k]);
-        for (int t = 0; t < inputSize; t++) {
-          W1[k][t] -= _clipGrad(scale * gW1[k][t]);
+      for (int i = 0; i < heads.intent.b.length; i++) {
+        heads.intent.b[i] -= _clipGrad(scale * gb_int[i]);
+        for (int j = 0; j < heads.intent.W[0].length; j++) {
+          heads.intent.W[i][j] -= _clipGrad(scale * gW_int[i][j]);
         }
       }
     }
@@ -524,108 +398,69 @@ class PolicyNetwork {
 
     if (hasAction) {
       final M = actionCaches!.length;
-
-      final gW2 = List.generate(h2, (_) => List<double>.filled(h1, 0.0));
-      final gb2 = List<double>.filled(h2, 0.0);
-      final gW1 = List.generate(h1, (_) => List<double>.filled(inputSize, 0.0));
-      final gb1 = List<double>.filled(h1, 0.0);
-
-      final gW_turn = List.generate(3, (_) => List<double>.filled(h2, 0.0));
-      final gb_turn = List<double>.filled(3, 0.0);
-
-      final gW_thr = List.generate(1, (_) => List<double>.filled(h2, 0.0));
-      final gb_thr = List<double>.filled(1, 0.0);
-
       double meanThrLogit = 0.0;
       double teacherThrRate = 0.0;
 
       for (int n = 0; n < M; n++) {
         final c = actionCaches![n];
+        final h = c.acts.last;
 
-        // turn CE
-        final turnProbs = _softmax(c.turnLogits);
+        final turnProbs = nn.Ops.softmax(c.turnLogits);
         final yt = actionTurnTargets![n].clamp(0, 2);
-        final dTurn = List<double>.from(turnProbs);
-        dTurn[yt] -= 1.0;
+        final dTurn = nn.Ops.crossEntropyGrad(turnProbs, yt, numClasses: 3);
 
-        for (int i = 0; i < 3; i++) {
-          gb_turn[i] += dTurn[i];
-          for (int j = 0; j < h2; j++) {
-            gW_turn[i][j] += dTurn[i] * c.h2[j];
-          }
-        }
-
-        // thrust BCE
-        final thrProb = c.thrProb;
         final yb = actionThrustTargets![n] ? 1.0 : 0.0;
+        final dThr = nn.Ops.bceGradFromLogit(c.thrLogit, yb);
         teacherThrRate += yb;
-        final dThr = (thrProb - yb);
-        gb_thr[0] += dThr;
-        for (int j = 0; j < h2; j++) {
-          gW_thr[0][j] += dThr * c.h2[j];
-        }
+
+        final dH_turn = heads.turn.backward(x: h, dOut: dTurn, gW: gW_turn, gb: gb_turn);
+        final dH_thr  = heads.thr.backward (x: h, dOut: [dThr], gW: gW_thr , gb: gb_thr );
+
+        final dH = List<double>.filled(h.length, 0.0);
+        for (int i = 0; i < h.length; i++) dH[i] = dH_turn[i] + dH_thr[i];
+
+        trunk.backwardFromTopGrad(
+          dTop: dH,
+          acts: c.acts,
+          gW: gW_trunk,
+          gb: gb_trunk,
+        );
+
         meanThrLogit += c.thrLogit;
-
-        // backprop to shared trunk
-        final dh2 = List<double>.filled(h2, 0.0);
-        for (int j = 0; j < h2; j++) {
-          double s = 0.0;
-          for (int i = 0; i < 3; i++) s += W_turn[i][j] * dTurn[i];
-          s += W_thr[0][j] * dThr;
-          final sech2 = 1.0 - c.h2[j] * c.h2[j];
-          dh2[j] = s * sech2;
-        }
-        final dh1 = List<double>.filled(h1, 0.0);
-        for (int j = 0; j < h2; j++) {
-          gb2[j] += dh2[j];
-          for (int k = 0; k < h1; k++) {
-            gW2[j][k] += dh2[j] * c.h1[k];
-            dh1[k] += W2[j][k] * dh2[j];
-          }
-        }
-        for (int k = 0; k < h1; k++) {
-          final sech2 = 1.0 - c.h1[k] * c.h1[k];
-          dh1[k] *= sech2;
-        }
-        for (int k = 0; k < h1; k++) {
-          gb1[k] += dh1[k];
-          for (int t = 0; t < inputSize; t++) {
-            gW1[k][t] += dh1[k] * c.x[t];
-          }
-        }
       }
 
-      final scale = lr * actionAlignWeight / M;
-      for (int i = 0; i < 3; i++) {
-        b_turn[i] -= _clipGrad(scale * gb_turn[i]);
-        for (int j = 0; j < h2; j++) {
-          W_turn[i][j] -= _clipGrad(scale * gW_turn[i][j]);
+      final scale = lr * actionAlignWeight / actionCaches.length;
+      for (int i = 0; i < heads.turn.b.length; i++) {
+        heads.turn.b[i] -= _clipGrad(scale * gb_turn[i]);
+        for (int j = 0; j < heads.turn.W[0].length; j++) {
+          heads.turn.W[i][j] -= _clipGrad(scale * gW_turn[i][j]);
         }
       }
-      b_thr[0] -= _clipGrad(scale * gb_thr[0]);
-      for (int j = 0; j < h2; j++) {
-        W_thr[0][j] -= _clipGrad(scale * gW_thr[0][j]);
-      }
-      for (int j = 0; j < h2; j++) {
-        b2[j] -= _clipGrad(scale * gb2[j]);
-        for (int k = 0; k < h1; k++) {
-          W2[j][k] -= _clipGrad(scale * gW2[j][k]);
-        }
-      }
-      for (int k = 0; k < h1; k++) {
-        b1[k] -= _clipGrad(scale * gb1[k]);
-        for (int t = 0; t < inputSize; t++) {
-          W1[k][t] -= _clipGrad(scale * gW1[k][t]);
-        }
+      heads.thr.b[0] -= _clipGrad(scale * gb_thr[0]);
+      for (int j = 0; j < heads.thr.W[0].length; j++) {
+        heads.thr.W[0][j] -= _clipGrad(scale * gW_thr[0][j]);
       }
 
-      // quick bias calibration for thrust fire-rate
-      meanThrLogit /= M;
-      teacherThrRate /= M;
-      final eps = 1e-6;
-      final logitTarget = math.log((teacherThrRate + eps) / (1 - teacherThrRate + eps));
+      // quick thrust bias calibration
+      meanThrLogit /= actionCaches.length;
+      teacherThrRate /= actionCaches.length;
+      final logitTarget = nn.Ops.logit(teacherThrRate);
       final calibStep = 0.25;
-      b_thr[0] += (logitTarget - meanThrLogit) * calibStep;
+      heads.thr.b[0] += (logitTarget - meanThrLogit) * calibStep;
+    }
+
+    // ----- Apply trunk update (shared grads) -----
+    final trunkScale = lr; // same step; grads accumulated above
+    for (int li = 0; li < trunk.layers.length; li++) {
+      final L = trunk.layers[li];
+      final gb = gb_trunk[li];
+      final gW = gW_trunk[li];
+      for (int i = 0; i < L.b.length; i++) L.b[i] -= _clipGrad(trunkScale * gb[i]);
+      for (int i = 0; i < L.W.length; i++) {
+        for (int j = 0; j < L.W[0].length; j++) {
+          L.W[i][j] -= _clipGrad(trunkScale * gW[i][j]);
+        }
+      }
     }
   }
 }
@@ -638,7 +473,7 @@ class EpisodeResult {
   final int steps;
   final double totalCost;
   final bool landed;
-  final double segMean; // ← mean per-frame segment score (raw; higher is better)
+  final double segMean; // mean per-frame segment score (raw; higher is better)
   EpisodeResult({
     required this.steps,
     required this.totalCost,
@@ -664,26 +499,23 @@ class Trainer {
   final double actionAlignWeight;
   final bool normalizeFeatures;
 
-  // NEW: treat segment score as a cost (lower is better) when computing returns
   final bool segmentAsCost;
 
   final RunningNorm? norm;
   int _epCounter = 0;
 
-  // Segment telemetry
   double _segEma = 0.0;
   int _segDecisions = 0;
   int _segPrintEvery = 400;
 
   double _prevAbsDx = double.nan;
-  int _segNearGroundDec = 0;
   int _segPadZoneDec = 0;
   double _segMeanOverspeed = 0.0;
   int _segThrustNearGroundOn = 0;
   int _segThrustNearGroundTotal = 0;
 
   // PWM thrust state
-  double _pwmA = 0.0;     // accumulator
+  double _pwmA = 0.0;
   int _pwmCount = 0;
   int _pwmOn = 0;
 
@@ -703,14 +535,13 @@ class Trainer {
     required this.intentAlignWeight,
     required this.actionAlignWeight,
     required this.normalizeFeatures,
-    bool segmentAsCost = true, // ← optional param; defaults to "use segment as cost"
+    bool segmentAsCost = true,
   })  : segmentAsCost = segmentAsCost,
         norm = RunningNorm(fe.inputSize, momentum: 0.995);
 
   void _segTelemetryReset() {
     _segEma = 0.0;
     _segDecisions = 0;
-    _segNearGroundDec = 0;
     _segPadZoneDec = 0;
     _segMeanOverspeed = 0.0;
     _segThrustNearGroundOn = 0;
@@ -736,27 +567,17 @@ class Trainer {
 
     final nearGround = h < 200.0;
     final padZone = (dx <= 0.05 * W) && (h < 140.0);
-    if (nearGround) _segNearGroundDec++;
-    if (padZone) _segPadZoneDec++;
-
-    if (nearGround) {
-      _segThrustNearGroundTotal++;
-      if (thrustOn) _segThrustNearGroundOn++;
-    }
+    if (nearGround) _segThrustNearGroundTotal++;
+    if (nearGround && thrustOn) _segThrustNearGroundOn++;
 
     if (verbose && (_segDecisions % _segPrintEvery == 0)) {
-      final padPct = (_segPadZoneDec == 0) ? 0.0 : (100.0 * _segPadZoneDec / _segDecisions);
+      final padPct = (_segDecisions == 0) ? 0.0 : (100.0 * _segPadZoneDec / _segDecisions);
       final ngThr = (_segThrustNearGroundTotal == 0) ? 0.0
           : (100.0 * _segThrustNearGroundOn / _segThrustNearGroundTotal);
-      /*
-      print(
-          'SEG ema=${_segEma.toStringAsFixed(3)} | meanOverspeed=${_segMeanOverspeed.toStringAsFixed(2)} '
-              '| padZone%=${padPct.toStringAsFixed(1)} | thrustNG%=${ngThr.toStringAsFixed(1)} '
-              '| h=${h.toStringAsFixed(1)} vy=${vy.toStringAsFixed(1)} dx=${dx.toStringAsFixed(1)}'
-      );
-
-       */
+      // print debug if needed
+      // print('SEG ema=${_segEma.toStringAsFixed(3)} overspeed=${_segMeanOverspeed.toStringAsFixed(2)} pad%=${padPct.toStringAsFixed(1)} thrustNG%=${ngThr.toStringAsFixed(1)}');
     }
+    if (padZone) _segPadZoneDec++;
   }
 
   void _segTelemetryFlush({String tag='SEG'}) {
@@ -783,9 +604,8 @@ class Trainer {
     final dxNorm = (dx / (0.5 * W)).clamp(0.0, 1.0);
     final rCenterGlobal = 1.0 - dxNorm;
 
-    // Commit bands aligned with teacher:
-    final tight = 0.08 * W;   // enter
-    final soft  = 0.14 * W;   // exit
+    final tight = 0.08 * W;
+    final soft  = 0.14 * W;
     double rCenterBand;
     if (dx <= tight) rCenterBand = 1.0;
     else if (dx <= soft) {
@@ -793,7 +613,6 @@ class Trainer {
       rCenterBand = math.max(0.0, 1.0 - t * t);
     } else rCenterBand = 0.0;
 
-    // Progress toward center
     double rProgress = 0.0;
     if (_prevAbsDx.isFinite) {
       final d = (_prevAbsDx - dx).clamp(-30.0, 30.0);
@@ -801,7 +620,6 @@ class Trainer {
     }
     _prevAbsDx = dx;
 
-    // Descent shaping
     final vyTarget = (0.10 * h + 8.0).clamp(8.0, 28.0);
     final err = vy - vyTarget;
     final sigmaUnder = 7.0, sigmaOver = 5.0;
@@ -809,24 +627,17 @@ class Trainer {
     final eOver  = math.exp(-math.pow((math.max(0.0, err))/sigmaOver , 2));
     final rDescent = 0.5 * eUnder + 0.5 * eOver;
 
-    // NEW: inside tight band, prefer small |vx|
     final vxPenalty = (dx <= tight) ? (- (vx.abs().clamp(0.0, 60.0) / 60.0)) : 0.0;
-
-    // Directional nudge (vx should reduce dx)
     final inward = (dx > 4.0) ? (((padCx - L.pos.x) * vx) > 0 ? 1.0 : -1.0) : 0.0;
 
-    final ang = L.angle.toDouble();                 // radians
-
+    final ang = L.angle.toDouble();
     double rLevel = 0.0;
     if (h < 160.0) {
-      final angAbs = ang.abs().clamp(0.0, 0.35);    // up to ~20°
-      // Penalize tilt near ground (scaled to ~[-2,0])
+      final angAbs = ang.abs().clamp(0.0, 0.35);
       rLevel = - 2.0 * (angAbs / 0.35);
-      // bonus when *very* level
-      if (angAbs < 0.05) rLevel += 0.25;            // small cherry on top
+      if (angAbs < 0.05) rLevel += 0.25;
     }
 
-// ...when you compose the final score:
     double score =
         5.0 * rCenterGlobal +
             4.0 * rDescent +
@@ -834,9 +645,9 @@ class Trainer {
             2.0 * rProgress +
             0.6 * inward +
             1.5 * vxPenalty +
-            1.2 * rLevel;                // << add this
+            1.2 * rLevel;
 
-    if (dx > soft) score -= 0.4;  // lingering far from pad
+    if (dx > soft) score -= 0.4;
     if (h < 120.0 && vy > 38.0) score -= 2.5;
 
     return score;
@@ -850,7 +661,7 @@ class Trainer {
     }
     final z = probs.map((p) => math.log(_clip(p, 1e-12, 1.0))).toList();
     for (int i = 0; i < z.length; i++) z[i] /= temp;
-    final sm = PolicyNetwork._softmax(z);
+    final sm = nn.Ops.softmax(z);
     final u = r.nextDouble();
     double acc = 0.0;
     for (int i = 0; i < sm.length; i++) {
@@ -882,11 +693,9 @@ class Trainer {
     env.reset(seed: r.nextInt(1 << 30));
     double totalCost = 0.0;
 
-    // per-episode accumulators for segment mean
     double segSum = 0.0;
     int segCount = 0;
 
-    // reset per-episode scratch
     _pwmA = 0.0; _pwmCount = 0; _pwmOn = 0;
     _prevAbsDx = double.nan;
 
@@ -915,13 +724,12 @@ class Trainer {
           decisionCaches.add(cache);
           intentChoices.add(idx);
           alignLabels.add(yTeacher);
-          // segment score ONLY at decision states; flip sign if treating as cost
           final segHere = _segmentScore(env);
           final segRL = segmentAsCost ? -segHere : segHere;
           decisionReturns.add(segRL);
         }
 
-        // --- adaptive plan hold ---
+        // adaptive plan hold
         final padCx = env.terrain.padCenter.toDouble();
         final dxAbs = (env.lander.pos.x.toDouble() - padCx).abs();
         final vxAbs = env.lander.vel.x.toDouble().abs();
@@ -929,61 +737,34 @@ class Trainer {
         final h = (gy - env.lander.pos.y).toDouble();
         final W = env.cfg.worldW.toDouble();
 
-        // --- adaptive plan hold (be aggressive about updating intent) ---
-        int dynHold = 1; // default: re-decide every frame
-
-        // steer often when far or moving sideways fast
+        int dynHold = 1;
         if (dxAbs > 0.12 * W || vxAbs > 60.0) dynHold = 1;
-
-        // allow 2 frames only if high and roughly centered
         if (dynHold == 1 && h > 320.0 && dxAbs < 0.04 * W && vxAbs < 25.0) dynHold = 2;
-
         framesLeft = dynHold;
       }
 
-      // teacher control for chosen intent
       final intent = indexToIntent(currentIntentIdx);
       final uTeacher = controllerForIntent(intent, env);
 
-      // student action (policy heads)
       var xAct = fe.extract(env);
       xAct = norm?.normalize(xAct, update: false) ?? xAct;
       final (thBool, lf, rt, probs, cAct) = policy.actGreedy(xAct);
 
-// --- compute descent target and error
       final groundY = env.terrain.heightAt(env.lander.pos.x);
       final height  = (groundY - env.lander.pos.y).toDouble();
-      double vyTarget = (0.10 * height + 8.0).clamp(8.0, 28.0); // same as segment score
-      final vyNow = env.lander.vel.y.toDouble();                // + downward
-      final errVy = vyNow - vyTarget;                           // >0 = too fast down
 
-// model/teacher blend in probability space
       final pThrModel   = probs[0].clamp(0.0, 1.0);
       final pThrTeacher = uTeacher.thrust ? 1.0 : 0.0;
-// Blend in probability-space
       final pThrExec = blendPolicy * pThrModel + (1.0 - blendPolicy) * pThrTeacher;
 
-// Accumulate (bounded) and print AFTER increment
       _pwmA = (_pwmA + pThrExec).clamp(0.0, 10.0);
 
-      /*
-      if ((_pwmCount % 120) == 0) {
-        print('pThr_teacher=${(100*pThrTeacher).toStringAsFixed(1)}%  '
-            'pThr_exec=${(100*pThrExec).toStringAsFixed(1)}%  A=${_pwmA.toStringAsFixed(2)}');
-      }
-
-       */
-
-// Emit pulse(s) if we’ve accumulated ≥ 1
       bool thrustPWM = false;
       while (_pwmA >= 1.0) {
         thrustPWM = true;
         _pwmA -= 1.0;
       }
 
-// Near-ground flare bias (optional, tiny)
-//      final groundY = env.terrain.heightAt(env.lander.pos.x);
-//      final height = (groundY - env.lander.pos.y).toDouble();
       if (height < 90.0 && !thrustPWM && pThrExec > 0.65) {
         thrustPWM = true;
         _pwmA = (_pwmA - 0.65).clamp(0.0, 0.999);
@@ -993,21 +774,17 @@ class Trainer {
       final execLeft   = useLearnedController ? lf : uTeacher.left;
       final execRight  = useLearnedController ? rt : uTeacher.right;
 
-      // segment telemetry (frame-level) + accumulate mean
       final seg = _segmentScore(env);
       segSum += seg; segCount++;
       _segTelemetryTick(env, seg, execThrust, verbose:true);
 
-      // store action caches for supervision (teacher labels)
       actionCaches.add(cAct);
       actionTurnTargets.add(uTeacher.left ? 0 : (uTeacher.right ? 2 : 1));
       actionThrustTargets.add(uTeacher.thrust);
 
-      // PWM duty debug
       _pwmCount++; if (execThrust) _pwmOn++;
       if ((_pwmCount % 240) == 0) {
-        final duty = 100.0 * _pwmOn / _pwmCount;
-//        print('PWM duty=${duty.toStringAsFixed(1)}%  pThr_model=${(100*pThrModel).toStringAsFixed(1)}%  h=${height.toStringAsFixed(1)} vy=${env.lander.vel.y.toStringAsFixed(1)}');
+        // final duty = 100.0 * _pwmOn / _pwmCount;
         _pwmCount = 0; _pwmOn = 0;
       }
 
