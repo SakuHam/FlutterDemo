@@ -84,33 +84,43 @@ class PotentialField {
       _mask[_idx(nx - 1, j)] = 3;
     }
 
-    // Pad area as Dirichlet (phi=0)
-    final padX1 = env.terrain.padX1.toDouble() - padInflate;
-    final padX2 = env.terrain.padX2.toDouble() + padInflate;
-    final padY  = env.terrain.padY.toDouble() + padInflate; // slight vertical extent above pad
-    for (int j = 0; j < ny; j++) {
+// --- Pad area as Dirichlet (phi = 0) on the grid row closest to padY ---
+    final padX1 = env.terrain.padX1.toDouble();
+    final padX2 = env.terrain.padX2.toDouble();
+    final padY  = env.terrain.padY.toDouble();
+
+// nearest grid row to the physical pad line
+    final jPad = (padY / dy).round().clamp(0, ny - 1);
+
+// ensure we hit the pad even if grid is coarse: use a tiny vertical band
+    final jPad2 = ((padY + 0.45 * dy) / dy).round().clamp(0, ny - 1);
+    final jPadMin = math.min(jPad, jPad2);
+    final jPadMax = math.max(jPad, jPad2);
+
+    for (int j = jPadMin; j <= jPadMax; j++) {
       final y = j * dy;
-      if (y < padY) continue; // only near ground band
+      // Only accept rows that are not below the terrain at pad (rare, but safe)
       for (int i = 0; i < nx; i++) {
         final x = i * dx;
         if (x >= padX1 && x <= padX2) {
-          _mask[_idx(i, j)] = 1;
-          _phi[_idx(i, j)] = _padPhi;
+          final k = _idx(i, j);
+          _mask[k] = 1;       // Dirichlet (pad)
+          _phi[k]  = _padPhi; // 0.0
         }
       }
     }
 
-    // Terrain as obstacle (no-flux):
-    // Mark cells whose center is under terrain height curve as obstacle.
+    // --- Terrain as obstacle (no-flux) ---
+    // For each column, mark cells with y >= groundHeight(x) as obstacle.
+    // (Pad cells above override to Dirichlet already.)
     for (int i = 0; i < nx; i++) {
       final x = i * dx;
       final gy = env.terrain.heightAt(x);
-      // everything with y >= gy is inside terrain
-      final jMinTerrain = math.max(0, (gy / dy).floor());
-      for (int j = jMinTerrain; j < ny; j++) {
+      final jStart = (gy / dy).floor().clamp(0, ny - 1);
+      for (int j = jStart; j < ny; j++) {
         final k = _idx(i, j);
-        if (_mask[k] == 1) continue; // keep pad as Dirichlet
-        _mask[k] = 2; // obstacle
+        if (_mask[k] == 1) continue; // keep pad
+        _mask[k] = 2;                // obstacle
       }
     }
 
