@@ -694,7 +694,7 @@ class RuntimeTwoStagePolicy {
       _framesLeft -= 1;
       return (swapped.thrust, swapped.left, swapped.right, idxNow, _lastReplanProbs ?? const []);
     }
-    
+
     IntentBus.instance.publishControl(
       ControlEvent(
         thrust: ctrl.thrust,
