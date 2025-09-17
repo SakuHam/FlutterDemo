@@ -173,6 +173,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         terrain: terr,
         worldW: engine.cfg.worldW,
         worldH: engine.cfg.worldH,
+        rays: engine.rays,
         step: 0,
         uiMaxFuel: engine.cfg.t.maxFuel,
       );

@@ -5,8 +5,9 @@ import 'dart:math' as math;
 
 import '../engine/types.dart' as et;
 import '../engine/game_engine.dart' as eng;
+import '../engine/raycast.dart' as rc; // RayConfig, RayHitKind
 
-import 'agent.dart'; // uses nn_helper.dart internally
+import 'agent.dart'; // FeatureExtractor (rays), PolicyNetwork, Trainer, etc.
 
 /* ------------------------------- tiny arg parser ------------------------------- */
 
@@ -34,12 +35,13 @@ class _Args {
 /* ------------------------------- feature signature ------------------------------ */
 
 String _feSignature({
-  required int groundSamples,
-  required double stridePx,
+  required int inputSize,
+  required int rayCount,
+  required bool kindsOneHot,
   required double worldW,
   required double worldH,
 }) {
-  return 'gs=$groundSamples;stride=${stridePx.toStringAsFixed(2)};W=${worldW.toInt()};H=${worldH.toInt()}';
+  return 'kind=rays;in=$inputSize;rays=$rayCount;1hot=$kindsOneHot;W=${worldW.toInt()};H=${worldH.toInt()}';
 }
 
 /* ------------------------------- norm update helper ----------------------------- */
@@ -47,7 +49,6 @@ String _feSignature({
 void _normUpdate(RunningNorm? norm, List<double> x) {
   if (norm == null) return;
   try {
-    // Prefer observe(x) if available
     (norm as dynamic).observe(x);
   } catch (_) {
     norm.normalize(x, update: true);
@@ -75,28 +76,96 @@ List<List<double>> _xavier(int out, int inp, int seed) {
   return List.generate(out, (_) => List<double>.generate(inp, (_) => (r.nextDouble() * 2 - 1) * limit));
 }
 
+/* ------------------------------ rays-only teacher ------------------------------ */
+
+/// Find the nearest **pad** ray and return its **ship-frame** angle and normalized distance.
+/// Returns (present, angle, distNorm).
+(bool present, double angle, double distNorm) _nearestPadRayPolar(eng.GameEngine env) {
+  final rays = env.rays;
+  if (rays.isEmpty) return (false, 0.0, 1.0);
+
+  final L = env.lander;
+  final cfg = env.cfg;
+  final maxD = math.sqrt(cfg.worldW * cfg.worldW + cfg.worldH * cfg.worldH);
+
+  bool any = false;
+  double bestD = 1e30, bestAngleShip = 0.0;
+
+  for (final h in rays) {
+    if (h.kind != rc.RayHitKind.pad) continue;
+
+    final dx = h.p.x - L.pos.x;
+    final dy = h.p.y - L.pos.y;
+    final d  = math.sqrt(dx*dx + dy*dy);
+    if (d < bestD) {
+      bestD = d;
+      final worldAng = math.atan2(dy, dx);
+      // ship-frame: subtract yaw, wrap to [-pi, pi]
+      double a = worldAng - L.angle;
+      while (a <= -math.pi) a += 2 * math.pi;
+      while (a >   math.pi) a -= 2 * math.pi;
+      bestAngleShip = a;
+      any = true;
+    }
+  }
+
+  if (!any) return (false, 0.0, 1.0);
+  return (true, bestAngleShip, (bestD / maxD).clamp(0.0, 1.0));
+}
+
+/// Intent teacher that uses ONLY **pad rays** + kinematics (no pad center / terrain samples).
+int _teacherIntentFromRays(eng.GameEngine env) {
+  final L = env.lander;
+  final (_hasPad, a, dN) = _nearestPadRayPolar(env);
+
+  // Emergency brake if screaming downwards regardless of pad rays.
+  if (L.vel.y > 55.0) return 4; // brakeUp
+
+  if (!_hasPad) {
+    // No pad visible: bias to hover/slow descent based on vertical speed.
+    if (L.vel.y > 18.0) return 4;     // brakeUp if too fast
+    if (L.vel.y > 8.0)  return 3;     // descendSlow
+    return 0;                          // hover
+  }
+
+  // Angle gates in ship-frame:
+  const angDead = 12 * math.pi / 180;   // ~12°
+  const farGate = 0.30;                 // >30% of screen diag = "far"
+
+  if (a > angDead)  return 1; // goLeft  (pad is to left of nose)
+  if (a < -angDead) return 2; // goRight (pad is to right of nose)
+
+  // Angle aligned: choose descend/hover based on distance & vertical speed
+  if (dN > farGate) {
+    // far: close laterally first by gentle descend
+    return 3; // descendSlow
+  } else {
+    // near: hold hover unless falling too fast
+    if (L.vel.y > 16.0) return 3; // descendSlow to manage rate
+    return 0;                     // hover
+  }
+}
+
 /* ------------------------------- policy IO (json) ------------------------------ */
 
 Map<String, dynamic> _weightsToJson({
   required PolicyNetwork p,
-  required FeatureExtractor fe,
+  required int rayCount,
+  required bool kindsOneHot,
   required eng.GameEngine env,
   RunningNorm? norm,
 }) {
-  String sig = _feSignature(
-    groundSamples: fe.groundSamples,
-    stridePx: fe.stridePx,
+  final sig = _feSignature(
+    inputSize: p.inputSize,
+    rayCount: rayCount,
+    kindsOneHot: kindsOneHot,
     worldW: env.cfg.worldW,
     worldH: env.cfg.worldH,
   );
 
-  // trunk layers -> [{W,b}, ...]
   final trunkJson = <Map<String, dynamic>>[];
   for (final layer in p.trunk.layers) {
-    trunkJson.add({
-      'W': _deepCopyMat(layer.W),
-      'b': List<double>.from(layer.b),
-    });
+    trunkJson.add({'W': _deepCopyMat(layer.W), 'b': List<double>.from(layer.b)});
   }
 
   Map<String, dynamic> headJson(layer) => {
@@ -117,10 +186,14 @@ Map<String, dynamic> _weightsToJson({
       'thr': headJson(p.heads.thr),
       'val': headJson(p.heads.val),
     },
-    'feature_extractor': {'groundSamples': fe.groundSamples, 'stridePx': fe.stridePx},
+    'feature_extractor': {
+      'kind': 'rays',
+      'rayCount': rayCount,
+      'kindsOneHot': kindsOneHot,
+    },
     'env_hint': {'worldW': env.cfg.worldW, 'worldH': env.cfg.worldH},
     'signature': sig,
-    'format': 'v2', // mark new format
+    'format': 'v2rays',
   };
 
   if (norm != null && norm.inited && norm.dim == p.inputSize) {
@@ -131,7 +204,6 @@ Map<String, dynamic> _weightsToJson({
       'var': norm.var_,
       'signature': sig,
     };
-    // legacy mirror (optional)
     m['norm_mean'] = norm.mean;
     m['norm_var'] = norm.var_;
     m['norm_momentum'] = norm.momentum;
@@ -140,9 +212,22 @@ Map<String, dynamic> _weightsToJson({
   return m;
 }
 
-void savePolicy(String path, PolicyNetwork p, FeatureExtractor fe, eng.GameEngine env, {RunningNorm? norm}) {
+void savePolicy(
+    String path,
+    PolicyNetwork p, {
+      required int rayCount,
+      required bool kindsOneHot,
+      required eng.GameEngine env,
+      RunningNorm? norm,
+    }) {
   final f = File(path);
-  final jsonMap = _weightsToJson(p: p, fe: fe, env: env, norm: norm);
+  final jsonMap = _weightsToJson(
+    p: p,
+    rayCount: rayCount,
+    kindsOneHot: kindsOneHot,
+    env: env,
+    norm: norm,
+  );
   f.writeAsStringSync(const JsonEncoder.withIndent('  ').convert(jsonMap));
   print('Saved policy → $path');
 }
@@ -151,7 +236,8 @@ bool tryLoadPolicy(
     String path,
     PolicyNetwork p, {
       RunningNorm? norm,
-      FeatureExtractor? fe,
+      required int rayCount,
+      required bool kindsOneHot,
       eng.GameEngine? env,
       bool ignoreLoadedNorm = false,
     }) {
@@ -166,29 +252,19 @@ bool tryLoadPolicy(
     return false;
   }
   if (raw is! Map<String, dynamic>) {
-    print('Unexpected JSON root in $path (expected object). Skipping load.');
+    print('Unexpected JSON root (expected object). Skipping load.');
     return false;
   }
   final m = raw;
 
   int ok = 0, total = 0;
 
-  // Prefer new v2 format
   final arch = (m['arch'] as Map?)?.cast<String, dynamic>();
   final trunkJ = (m['trunk'] as List?)?.cast<dynamic>();
   final headsJ = (m['heads'] as Map?)?.cast<String, dynamic>();
 
   if (arch != null && trunkJ != null && headsJ != null) {
-    final hiddenFile = (arch['hidden'] as List?)?.map((e) => (e as num).toInt()).toList() ?? <int>[];
-    final hiddenNow = p.hidden;
-
-    if (hiddenFile.length != hiddenNow.length ||
-        hiddenFile.asMap().entries.any((e) => e.value != hiddenNow[e.key])) {
-      print(
-          'Warning: Saved hidden sizes ${hiddenFile} don\'t match current ${hiddenNow}. Attempting best-effort load (shape-mismatch tensors skipped).');
-    }
-
-    // Trunk layers
+    // Trunk
     for (int li = 0; li < p.trunk.layers.length; li++) {
       if (li >= trunkJ.length) break;
       final layerObj = (trunkJ[li] as Map).cast<String, dynamic>();
@@ -196,7 +272,6 @@ bool tryLoadPolicy(
       final bj = layerObj['b'];
       final L = p.trunk.layers[li];
 
-      // Shape guard
       if (Wj is List && Wj.isNotEmpty && (Wj[0] as List).length == L.W[0].length && Wj.length == L.W.length) {
         _assignMat(L.W, Wj);
         ok++;
@@ -233,15 +308,15 @@ bool tryLoadPolicy(
     _loadHead((headsJ['thr'] as Map?)?.cast<String, dynamic>(), p.heads.thr.W, p.heads.thr.b);
     _loadHead((headsJ['val'] as Map?)?.cast<String, dynamic>(), p.heads.val.W, p.heads.val.b);
   } else {
-    // Legacy fields not supported for deep MLP (W1/W2...)—skip with message
-    print('Note: $path doesn\'t look like v2 format (trunk/heads). Skipping weight load.');
+    print('Note: $path does not look like v2 format (trunk/heads). Skipping weight load.');
   }
 
   // Norm (guarded by signature)
-  if (!ignoreLoadedNorm && norm != null && fe != null && env != null) {
+  if (!ignoreLoadedNorm && norm != null && env != null) {
     final sigNow = _feSignature(
-      groundSamples: fe.groundSamples,
-      stridePx: fe.stridePx,
+      inputSize: p.inputSize,
+      rayCount: rayCount,
+      kindsOneHot: kindsOneHot,
       worldW: env.cfg.worldW,
       worldH: env.cfg.worldH,
     );
@@ -272,12 +347,10 @@ bool tryLoadPolicy(
       final nv = m['norm_var'];
       final nsig = m['norm_signature'];
       if (nm is List && nv is List && nsig == sigNow && sigTop == sigNow) {
-        final n = math.min(norm.dim, math.min(nm.length, nv.length));
         try {
-          norm.mean = List<double>.generate(n, (i) => (nm[i] as num).toDouble())
-            ..length = norm.dim;
-          norm.var_ = List<double>.generate(n, (i) => (nv[i] as num).toDouble())
-            ..length = norm.dim;
+          final n = math.min(norm.dim, math.min(nm.length, nv.length));
+          norm.mean = List<double>.generate(n, (i) => (nm[i] as num).toDouble())..length = norm.dim;
+          norm.var_ = List<double>.generate(n, (i) => (nv[i] as num).toDouble())..length = norm.dim;
           if (m['norm_momentum'] is num) norm.momentum = (m['norm_momentum'] as num).toDouble();
           norm.inited = true;
           print('Loaded feature norm (top-level) (dim=${norm.dim}) from $path (signature match).');
@@ -381,7 +454,11 @@ EvalStats evaluate({
     );
     costs.add(res.totalCost);
     stepsSum += res.steps;
-    if (env.status == et.GameStatus.landed) landed++; else crashed++;
+    if (env.status == et.GameStatus.landed) {
+      landed++;
+    } else {
+      crashed++;
+    }
 
     final padCx = env.terrain.padCenter;
     absDxSum += (env.lander.pos.x - padCx).abs();
@@ -389,7 +466,7 @@ EvalStats evaluate({
 
   costs.sort();
   final st = EvalStats();
-  st.meanCost = costs.isEmpty ? 0 : costs.reduce((a,b)=>a+b) / costs.length;
+  st.meanCost = costs.isEmpty ? 0 : costs.reduce((a, b) => a + b) / costs.length;
   st.medianCost = costs.isEmpty ? 0 : costs[costs.length ~/ 2];
   st.landPct = 100.0 * landed / episodes;
   st.crashPct = 100.0 * crashed / episodes;
@@ -410,7 +487,7 @@ void _resetFeatureNorm(RunningNorm? norm) {
 void _warmFeatureNorm({
   required RunningNorm? norm,
   required Trainer trainer,
-  required FeatureExtractor fe,
+  required FeatureExtractorRays fe,
   required eng.GameEngine env,
   int perClass = 600,
   int seed = 4242,
@@ -421,64 +498,26 @@ void _warmFeatureNorm({
   int accepted = 0, target = perClass * PolicyNetwork.kIntents;
 
   while (accepted < target) {
-    final want = r.nextInt(PolicyNetwork.kIntents);
-
-    final padCx = env.terrain.padCenter.toDouble();
-    final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
-        .clamp(12.0, env.cfg.worldW.toDouble());
-    double x=padCx, h=180, vx=0, vy=20;
-
-    switch (want) {
-      case 1: // goLeft
-        x  = (padCx - (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
-            .clamp(10.0, env.cfg.worldW - 10.0);
-        h  = 120 + 120*r.nextDouble();
-        vx = (r.nextDouble()*14.0) - 7.0;
-        vy = 28.0 + 10.0*r.nextDouble();
-        break;
-      case 2: // goRight
-        x  = (padCx + (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
-            .clamp(10.0, env.cfg.worldW - 10.0);
-        h  = 120 + 120*r.nextDouble();
-        vx = (r.nextDouble()*14.0) - 7.0;
-        vy = 28.0 + 10.0*r.nextDouble();
-        break;
-      case 3: // descendSlow
-        x  = padCx + (r.nextDouble()*0.05 - 0.025) * padHalfW;
-        h  = 0.55*env.cfg.worldH + 0.20*env.cfg.worldH*r.nextDouble();
-        vx = (r.nextDouble()*24.0) - 12.0;
-        vy = 24.0 + 12.0*r.nextDouble();
-        break;
-      case 4: // brakeUp
-        x  = padCx + (r.nextDouble()*0.05 - 0.025) * padHalfW;
-        h  = 40.0 + 50.0*r.nextDouble();
-        vx = (r.nextDouble()*14.0) - 7.0;
-        vy = 120.0 + 50.0*r.nextDouble();
-        break;
-      default: // hover
-        x  = padCx + (r.nextDouble()*0.03 - 0.015) * padHalfW;
-        h  = 0.20*env.cfg.worldH + 0.15*env.cfg.worldH*r.nextDouble();
-        vx = (r.nextDouble()*10.0) - 5.0;
-        vy = (r.nextDouble()*10.0) - 5.0;
-        break;
-    }
-
-    final gy = env.terrain.heightAt(x);
+    // randomize a state (don’t rely on pad center in the features)
+    final W = env.cfg.worldW;
+    final H = env.cfg.worldH;
     env.lander
-      ..pos.x = x.clamp(10.0, env.cfg.worldW-10.0)
-      ..pos.y = (gy - h).clamp(0.0, env.cfg.worldH-10.0)
-      ..vel.x = vx
-      ..vel.y = vy
+      ..pos.x = (r.nextDouble() * (W - 20.0) + 10.0)
+      ..pos.y = (r.nextDouble() * (H * 0.75)).clamp(0.0, H - 10.0)
+      ..vel.x = r.nextDouble() * 160.0 - 80.0
+      ..vel.y = r.nextDouble() * 120.0 + 10.0
       ..angle = 0.0
-      ..fuel = env.cfg.t.maxFuel;
+      ..fuel  = env.cfg.t.maxFuel;
 
-    if (predictiveIntentLabelAdaptive(env) != want) continue;
+    final y = _teacherIntentFromRays(env);
+    // keep class balance by sampling “want” at random
+    if (r.nextInt(PolicyNetwork.kIntents) != y) continue;
 
     final feat = fe.extract(env);
     _normUpdate(trainer.norm, feat);
     accepted++;
   }
-  print('Feature norm warmed with $accepted synthetic samples.');
+  print('Feature norm warmed with $accepted synthetic samples (rays-teacher).');
 }
 
 /* ---------------------------- intent pretrain (local) -------------------------- */
@@ -490,7 +529,7 @@ class _PretrainIntentStats {
 
 _PretrainIntentStats _pretrainIntentLocal({
   required Trainer trainer,
-  required FeatureExtractor fe,
+  required FeatureExtractorRays fe,
   required eng.GameEngine env,
   required PolicyNetwork policy,
   int samples = 6000,
@@ -503,67 +542,25 @@ _PretrainIntentStats _pretrainIntentLocal({
   final K = PolicyNetwork.kIntents;
   final targetPerClass = (samples / K).ceil();
 
-  // balanced buffers
   final xsByK = List.generate(K, (_) => <List<double>>[]);
   final ysByK = List.generate(K, (_) => <int>[]);
-
-  void _setState({required double x, required double height, required double vx, required double vy}) {
-    final gy = env.terrain.heightAt(x);
-    final y = (gy - height).clamp(0.0, env.cfg.worldH - 10.0);
-    env.lander.pos.x = x.clamp(10.0, env.cfg.worldW - 10.0);
-    env.lander.pos.y = y;
-    env.lander.vel.x = vx;
-    env.lander.vel.y = vy;
-    env.lander.angle = 0.0;
-    env.lander.fuel  = env.cfg.t.maxFuel;
-  }
 
   env.reset(seed: 123456);
 
   bool _synthOneFor(int intentIdx, math.Random r) {
-    final padCx = env.terrain.padCenter.toDouble();
-    final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5)
-        .clamp(12.0, env.cfg.worldW.toDouble());
-    double x=padCx, h=180, vx=0, vy=20;
+    // randomize around screen (no pad/terrain dependence in features)
+    final W = env.cfg.worldW;
+    final H = env.cfg.worldH;
 
-    switch (intentIdx) {
-      case 1: // goLeft
-        x  = (padCx - (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
-            .clamp(10.0, env.cfg.worldW - 10.0);
-        h  = 120 + 120*r.nextDouble();
-        vx = (r.nextDouble()*14.0) - 7.0;
-        vy = 28.0 + 10.0*r.nextDouble();
-        break;
-      case 2: // goRight
-        x  = (padCx + (0.22 + 0.18*r.nextDouble()) * env.cfg.worldW)
-            .clamp(10.0, env.cfg.worldW - 10.0);
-        h  = 120 + 120*r.nextDouble();
-        vx = (r.nextDouble()*14.0) - 7.0;
-        vy = 28.0 + 10.0*r.nextDouble();
-        break;
-      case 3: // descendSlow
-        x  = padCx + (r.nextDouble()*0.05 - 0.025) * padHalfW;
-        h  = 0.55*env.cfg.worldH + 0.20*env.cfg.worldH*r.nextDouble();
-        vx = (r.nextDouble()*24.0) - 12.0;
-        vy = 24.0 + 12.0*r.nextDouble();
-        break;
-      case 4: // brakeUp
-        x  = padCx + (r.nextDouble()*0.05 - 0.025) * padHalfW;
-        h  = 40.0 + 50.0*r.nextDouble();
-        vx = (r.nextDouble()*14.0) - 7.0;
-        vy = 120.0 + 50.0*r.nextDouble();
-        break;
-      default: // hover
-        x  = padCx + (r.nextDouble()*0.03 - 0.015) * padHalfW;
-        h  = 0.20*env.cfg.worldH + 0.15*env.cfg.worldH*r.nextDouble();
-        vx = (r.nextDouble()*10.0) - 5.0;
-        vy = (r.nextDouble()*10.0) - 5.0;
-        break;
-    }
+    env.lander
+      ..pos.x = (r.nextDouble() * (W - 20.0) + 10.0)
+      ..pos.y = (r.nextDouble() * (H * 0.80)).clamp(0.0, H - 10.0)
+      ..vel.x = r.nextDouble() * 160.0 - 80.0
+      ..vel.y = 10.0 + r.nextDouble() * 140.0
+      ..angle = 0.0
+      ..fuel  = env.cfg.t.maxFuel;
 
-    _setState(x: x, height: h, vx: vx, vy: vy);
-
-    final y = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
+    final y = _teacherIntentFromRays(env);
     if (y != intentIdx) return false;
 
     final feat = fe.extract(env);
@@ -572,7 +569,7 @@ _PretrainIntentStats _pretrainIntentLocal({
     return true;
   }
 
-  const maxAttemptsPerClass = 20000;
+  const maxAttemptsPerClass = 30000;
   for (int k = 0; k < K; k++) {
     int attempts = 0;
     while (xsByK[k].length < targetPerClass && attempts < maxAttemptsPerClass) {
@@ -580,6 +577,7 @@ _PretrainIntentStats _pretrainIntentLocal({
       attempts++;
     }
     if (xsByK[k].isEmpty) {
+      // back-off: copy from a neighbor class
       final fallback = (k == 0 ? 3 : 0);
       while (xsByK[k].length < math.max(16, targetPerClass ~/ 4) &&
           xsByK[fallback].isNotEmpty) {
@@ -589,7 +587,7 @@ _PretrainIntentStats _pretrainIntentLocal({
     }
   }
 
-  // Oversample partially-filled classes to hit targetPerClass
+  // Oversample partially-filled classes
   for (int k = 0; k < K; k++) {
     if (xsByK[k].isEmpty) continue;
     final need = targetPerClass - xsByK[k].length;
@@ -600,8 +598,12 @@ _PretrainIntentStats _pretrainIntentLocal({
     }
   }
 
-  final xs = <List<double>>[]; final ys = <int>[];
-  for (int k = 0; k < K; k++) { xs.addAll(xsByK[k]); ys.addAll(ysByK[k]); }
+  final xs = <List<double>>[];
+  final ys = <int>[];
+  for (int k = 0; k < K; k++) {
+    xs.addAll(xsByK[k]);
+    ys.addAll(ysByK[k]);
+  }
   final N = xs.length;
   final perm = List<int>.generate(N, (i) => i)..shuffle(rng);
 
@@ -610,16 +612,16 @@ _PretrainIntentStats _pretrainIntentLocal({
     _normUpdate(trainer.norm, x);
   }
 
-  // Simple CE training on intent head (uses PolicyNetwork.updateFromEpisode intent path)
+  // Simple CE training on intent head
   const B = 64;
   for (int ep = 0; ep < epochs; ep++) {
     perm.shuffle(rng);
     for (int off = 0; off < N; off += B) {
       final end = math.min(off + B, N);
       final decisionCaches = <ForwardCache>[];
-      final intentChoices  = <int>[];
-      final decisionReturns= <double>[];
-      final alignLabels    = <int>[];
+      final intentChoices = <int>[];
+      final decisionReturns = <double>[];
+      final alignLabels = <int>[];
 
       for (int i = off; i < end; i++) {
         final idx = perm[i];
@@ -667,98 +669,10 @@ _PretrainIntentStats _pretrainIntentLocal({
   for (int r = 0; r < K; r++) {
     final row = List.generate(K, (c) => conf[r][c].toString().padLeft(4)).join(' ');
     final rowAcc = counts[r] == 0 ? 0.0 : conf[r][r] / counts[r];
-    print('${kIntentNames[r].padRight(12)} | $row   (acc=${(rowAcc*100).toStringAsFixed(1)}%  n=${counts[r]})');
+    print('${kIntentNames[r].padRight(12)} | $row   (acc=${(rowAcc * 100).toStringAsFixed(1)}%  n=${counts[r]})');
   }
 
   return _PretrainIntentStats(acc, N);
-}
-
-_PretrainIntentStats _mineAndFixDescendSlow({
-  required Trainer trainer,
-  required FeatureExtractor fe,
-  required eng.GameEngine env,
-  required PolicyNetwork policy,
-  int N = 6000,
-  int epochs = 2,
-  double lr = 5e-4,
-  double weight = 3.0,
-  int seed = 42424,
-}) {
-  final r = math.Random(seed);
-  env.reset(seed: 777);
-  final xs = <List<double>>[];
-  final ys = <int>[];
-
-  while (xs.length < N) {
-    final padCx = env.terrain.padCenter.toDouble();
-
-    env.lander.pos.x = (padCx + (r.nextDouble() * 0.10 - 0.05) * env.cfg.worldW)
-        .clamp(10.0, env.cfg.worldW - 10.0);
-    final gy = env.terrain.heightAt(env.lander.pos.x);
-    final height = 160 + r.nextDouble() * 240;
-    env.lander.pos.y = (gy - height).clamp(0.0, env.cfg.worldH - 10.0);
-    env.lander.vel.x = (r.nextDouble() * 18.0) - 9.0;
-    env.lander.vel.y = 22.0 + r.nextDouble() * 20.0;
-    env.lander.angle = 0.0;
-    env.lander.fuel  = env.cfg.t.maxFuel;
-
-    final yTeacher = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
-    if (yTeacher != 3) continue;
-
-    final x = fe.extract(env);
-
-    final xN = trainer.norm?.normalize(x, update: false) ?? x;
-    final (pred, _p, _c) = policy.actIntentGreedy(xN);
-
-    final keep = (pred != 3) || (r.nextDouble() < 0.25);
-    if (!keep) continue;
-
-    xs.add(x);
-    ys.add(3);
-  }
-
-  for (final x in xs) {
-    try { (trainer.norm as dynamic).observe(x); } catch (_) { trainer.norm?.normalize(x, update: true); }
-  }
-
-  final idxs = List<int>.generate(xs.length, (i) => i)..shuffle(r);
-  const B = 64;
-  for (int ep = 0; ep < epochs; ep++) {
-    idxs.shuffle(r);
-    for (int off = 0; off < xs.length; off += B) {
-      final end = math.min(off + B, xs.length);
-      final caches = <ForwardCache>[];
-      final labels = <int>[];
-      final returns = <double>[];
-      for (int i = off; i < end; i++) {
-        final xi = trainer.norm?.normalize(xs[idxs[i]], update: false) ?? xs[idxs[i]];
-        final (_pred, _p, cache) = policy.actIntentGreedy(xi);
-        caches.add(cache);
-        labels.add(3);
-        returns.add(cache.v);
-      }
-      policy.updateFromEpisode(
-        decisionCaches: caches,
-        intentChoices: labels,
-        decisionReturns: returns,
-        alignLabels: labels,
-        alignWeight: weight,
-        lr: lr,
-        entropyBeta: 0.0,
-        valueBeta: 0.0,
-        huberDelta: 1.0,
-        intentMode: true,
-      );
-    }
-  }
-
-  int correct = 0;
-  for (int i = 0; i < xs.length; i++) {
-    final xi = trainer.norm?.normalize(xs[i], update: false) ?? xs[i];
-    final (pred, _p, _c) = policy.actIntentGreedy(xi);
-    if (pred == 3) correct++;
-  }
-  return _PretrainIntentStats(correct / xs.length, xs.length);
 }
 
 /* ------------------------------------ main ------------------------------------ */
@@ -784,7 +698,6 @@ void main(List<String> argv) {
   final pretrainAlign = args.getDouble('pretrain_align', def: 2.0);
   final pretrainLr = args.getDouble('pretrain_lr', def: 3e-4);
   final pretrainAll = args.getFlag('pretrain_all', def: false);
-  final pretrainActionsN = args.getInt('pretrain_actions_n', def: 0);
   final resetActionHeads = args.getFlag('reset_action_heads', def: false);
   final onlyPretrain = args.getFlag('only_pretrain', def: false);
   final ignoreLoadedNorm = args.getFlag('ignore_loaded_norm', def: false);
@@ -809,7 +722,6 @@ void main(List<String> argv) {
 
   final determinism = args.getFlag('determinism_probe', def: true);
 
-  // hidden layers (comma-separated), e.g. --hidden=96,96,64
   final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
 
   double bestMeanCost = double.infinity;
@@ -824,15 +736,40 @@ void main(List<String> argv) {
   );
   final env = eng.GameEngine(cfg);
 
-  final fe = FeatureExtractor(groundSamples: 3, stridePx: 48);
-  final policy = PolicyNetwork(inputSize: fe.inputSize, hidden: hidden, seed: seed);
-  print('Loaded init policy. hidden=${policy.hidden} | FE(gs=${fe.groundSamples} stride=${fe.stridePx})');
+  // Ensure rays active
+  env.rayCfg = const rc.RayConfig(
+    rayCount: 180,
+    includeFloor: false,
+    forwardAligned: true,
+  );
+
+  // Build FE and probe actual feature length
+  final fe = FeatureExtractorRays(rayCount:180, forwardAligned:true); // rays-based FE in agent.dart
+  env.reset(seed: seed ^ 0xC0FFEE);
+  env.step(1 / 60.0, const et.ControlInput(thrust: false, left: false, right: false));
+
+  final rayCount = env.rayCfg.rayCount;
+  final x0 = fe.extract(env);
+  final inDim = x0.length;
+
+  final kindsOneHot = (inDim == 6 + rayCount * 4);
+  final expected726 = 6 + rayCount * 4;
+  final expectedScalar = 6 + rayCount;
+
+  if (fe.inputSize != inDim) {
+    print('Note: FE.inputSize=${fe.inputSize} vs actual=$inDim (expected $expected726 or $expectedScalar); continuing.');
+  }
+
+  final policy = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
+  print('Loaded init policy. hidden=${policy.hidden} | FE(kind=rays, in=$inDim, rays=$rayCount, oneHot=$kindsOneHot)');
+
+  final useNorm = (fe.inputSize == inDim);
 
   final trainer = Trainer(
     env: env,
     fe: fe,
     policy: policy,
-    dt: 1/60.0,
+    dt: 1 / 60.0,
     gamma: 0.99,
     seed: seed,
     twoStage: true,
@@ -843,16 +780,21 @@ void main(List<String> argv) {
     blendPolicy: blendPolicy.clamp(0.0, 1.0),
     intentAlignWeight: pretrainAll ? pretrainAlign : 0.25,
     actionAlignWeight: actionAlignWeight,
-    normalizeFeatures: true,
+    normalizeFeatures: useNorm,
   );
 
-  // Try to load existing weights (+norm w/ signature guard)
+  if (!useNorm) {
+    print('Feature norm disabled (trainer.norm dim=${fe.inputSize} != feature len=$inDim).');
+  }
+
+  // Optional: load existing weights
   /*
   tryLoadPolicy(
     'policy_pretrained.json',
     policy,
-    norm: trainer.norm,
-    fe: fe,
+    norm: useNorm ? trainer.norm : null,
+    rayCount: rayCount,
+    kindsOneHot: kindsOneHot,
     env: env,
     ignoreLoadedNorm: ignoreLoadedNorm,
   );
@@ -867,11 +809,8 @@ void main(List<String> argv) {
     print('Determinism probe: steps ${a.steps} vs ${b.steps} | cost ${a.cost.toStringAsFixed(6)} vs ${b.cost.toStringAsFixed(6)} => ${ok ? "OK" : "MISMATCH"}');
   }
 
-  // Optionally reset action heads (turn/thr)
   if (resetActionHeads) {
-    final hiddenDim = policy.trunk.layers.isEmpty
-        ? policy.inputSize
-        : policy.trunk.layers.last.b.length;
+    final hiddenDim = policy.trunk.layers.isEmpty ? policy.inputSize : policy.trunk.layers.last.b.length;
     policy.heads.thr.W = _xavier(1, hiddenDim, seed ^ 0xA1);
     policy.heads.thr.b = List<double>.filled(1, 0.0);
     policy.heads.turn.W = _xavier(3, hiddenDim, seed ^ 0xB2);
@@ -880,13 +819,19 @@ void main(List<String> argv) {
   }
 
   // ===== PRETRAIN =====
-  if (pretrainAll || onlyPretrain || pretrainN > 0 || pretrainActionsN > 0) {
-    if (ignoreLoadedNorm || !((trainer.norm?.inited) ?? false)) {
+  if (pretrainAll || onlyPretrain || pretrainN > 0) {
+    if (useNorm && (ignoreLoadedNorm || !((trainer.norm?.inited) ?? false))) {
       _resetFeatureNorm(trainer.norm);
-      _warmFeatureNorm(norm: trainer.norm, trainer: trainer, fe: fe, env: env, perClass: 700, seed: seed ^ 0xACE);
+      _warmFeatureNorm(
+        norm: trainer.norm,
+        trainer: trainer,
+        fe: fe,
+        env: env,
+        perClass: 700,
+        seed: seed ^ 0xACE,
+      );
     }
 
-    // Intent pretrain (local, CE)
     if (pretrainN > 0) {
       print('Pretraining intent on $pretrainN snapshots (epochs=$pretrainEpochs, align=$pretrainAlign, lr=$pretrainLr) ...');
       final st = _pretrainIntentLocal(
@@ -900,7 +845,7 @@ void main(List<String> argv) {
         alignWeight: pretrainAlign,
         seed: seed ^ 0xBEEF,
       );
-      print('Intent pretrain → acc=${(st.acc*100).toStringAsFixed(1)}% n=${st.n}');
+      print('Intent pretrain → acc=${(st.acc * 100).toStringAsFixed(1)}% n=${st.n}');
 
       final stDescFix = _pretrainDescendSlowTargeted(
         trainer: trainer,
@@ -913,26 +858,27 @@ void main(List<String> argv) {
         weight: 3.5,
         seed: seed ^ 0xFACE,
       );
-      print('DescendSlow targeted fix → acc=${(stDescFix.acc*100).toStringAsFixed(1)}% n=${stDescFix.n}');
+      print('DescendSlow targeted fix → acc=${(stDescFix.acc * 100).toStringAsFixed(1)}% n=${stDescFix.n}');
 
       calibrateIntentBiasToTeacher(
-        trainer: trainer, fe: fe, env: env, policy: policy,
-        N: 6000, iters: 50, lr: 0.5, seed: seed ^ 0xCA1,
+        trainer: trainer,
+        fe: fe,
+        env: env,
+        policy: policy,
+        N: 6000,
+        iters: 50,
+        lr: 0.5,
+        seed: seed ^ 0xCA1,
       );
 
-      /*
-      final mined = _mineAndFixDescendSlow(
-        trainer: trainer, fe: fe, env: env, policy: policy,
-        N: 6000, epochs: 2, lr: pretrainLr, weight: 3.0, seed: seed ^ 0xC0DE,
+      savePolicy(
+        'policy_pretrained.json',
+        policy,
+        rayCount: rayCount,
+        kindsOneHot: kindsOneHot,
+        env: env,
+        norm: useNorm ? trainer.norm : null,
       );
-      print('DescendSlow hard-neg fix → acc=${(mined.acc*100).toStringAsFixed(1)}% n=${mined.n}');
-      */
-
-      savePolicy('policy_pretrained.json', policy, fe, env, norm: trainer.norm);
-    }
-
-    if (pretrainActionsN > 0) {
-      print('Note: --pretrain_actions_n=$pretrainActionsN requested, but this agent build has no separate action-pretrain. Skipping.');
     }
 
     if (onlyPretrain) {
@@ -978,20 +924,43 @@ void main(List<String> argv) {
       if (ev.meanCost < bestMeanCost) {
         bestMeanCost = ev.meanCost;
         bestCostIter = it + 1;
-        savePolicy('policy_best_cost.json', policy, fe, env, norm: trainer.norm);
+        savePolicy(
+          'policy_best_cost.json',
+          policy,
+          rayCount: rayCount,
+          kindsOneHot: kindsOneHot,
+          env: env,
+          norm: useNorm ? trainer.norm : null,
+        );
         print('★ New BEST by cost at iter ${it + 1}: meanCost=${ev.meanCost.toStringAsFixed(3)} → saved policy_best_cost.json');
       }
-      savePolicy('policy_iter_${it + 1}.json', policy, fe, env, norm: trainer.norm);
+      savePolicy(
+        'policy_iter_${it + 1}.json',
+        policy,
+        rayCount: rayCount,
+        kindsOneHot: kindsOneHot,
+        env: env,
+        norm: useNorm ? trainer.norm : null,
+      );
     }
   }
 
-  savePolicy('policy_final.json', policy, fe, env, norm: trainer.norm);
+  savePolicy(
+    'policy_final.json',
+    policy,
+    rayCount: rayCount,
+    kindsOneHot: kindsOneHot,
+    env: env,
+    norm: useNorm ? trainer.norm : null,
+  );
   print('Training done. Saved → policy_final.json');
 }
 
+/* ------------------------ bias calibration & targeted fix ---------------------- */
+
 void calibrateIntentBiasToTeacher({
   required Trainer trainer,
-  required FeatureExtractor fe,
+  required FeatureExtractorRays fe,
   required eng.GameEngine env,
   required PolicyNetwork policy,
   int N = 6000,
@@ -1006,33 +975,32 @@ void calibrateIntentBiasToTeacher({
   final xsRaw = <List<double>>[];
   final tCounts = List<int>.filled(K, 0);
 
-  // 1) Collect (raw) random snapshots + teacher labels
   for (int i = 0; i < N; i++) {
-    final padCx = env.terrain.padCenter.toDouble();
-    env.lander.pos.x = (padCx + (r.nextDouble()*400 - 200)).clamp(10.0, env.cfg.worldW - 10.0);
-    final gy = env.terrain.heightAt(env.lander.pos.x);
-    env.lander.pos.y = (gy - (60 + 300*r.nextDouble())).clamp(0.0, env.cfg.worldH - 10.0);
-    env.lander.vel.x = r.nextDouble()*180 - 90;
-    env.lander.vel.y = r.nextDouble()*140 + 10;
-    env.lander.angle = 0.0;
-    env.lander.fuel  = env.cfg.t.maxFuel;
+    final W = env.cfg.worldW;
+    final H = env.cfg.worldH;
+    env.lander
+      ..pos.x = (r.nextDouble() * (W - 20.0) + 10.0)
+      ..pos.y = (r.nextDouble() * (H * 0.80)).clamp(0.0, H - 10.0)
+      ..vel.x = r.nextDouble() * 180 - 90
+      ..vel.y = r.nextDouble() * 140 + 10
+      ..angle = 0.0
+      ..fuel  = env.cfg.t.maxFuel;
 
-    final y = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
+    final y = _teacherIntentFromRays(env);
     tCounts[y] += 1;
 
     xsRaw.add(fe.extract(env));
   }
 
-  // 2) Build a temporary local norm on xsRaw (don’t touch trainer.norm)
-  final tmpNorm = RunningNorm(fe.inputSize, momentum: 0.995);
-  for (final x in xsRaw) { tmpNorm.normalize(x, update: true); }
+  final tmpNorm = RunningNorm(policy.inputSize, momentum: 0.995);
+  for (final x in xsRaw) {
+    tmpNorm.normalize(x, update: true);
+  }
   final xs = xsRaw.map((x) => tmpNorm.normalize(x, update: false)).toList();
 
-  // 3) Teacher marginal
   final eps = 1e-6;
-  final tMarg = List<double>.generate(K, (k) => (tCounts[k] + eps) / (N + K*eps));
+  final tMarg = List<double>.generate(K, (k) => (tCounts[k] + eps) / (N + K * eps));
 
-  // 4) Fit intent biases only: b_k += lr * (log(t_k) - log(pMean_k))
   for (int it = 0; it < iters; it++) {
     final pSum = List<double>.filled(K, 0.0);
     for (final x in xs) {
@@ -1042,16 +1010,16 @@ void calibrateIntentBiasToTeacher({
     final pMean = pSum.map((s) => s / N).toList();
     for (int k = 0; k < K; k++) {
       final g = math.log(tMarg[k]) - math.log(pMean[k] + eps);
-      policy.heads.intent.b[k] += lr * g; // << updated to new location
+      policy.heads.intent.b[k] += lr * g;
     }
   }
 
-  print('Calibrated intent biases to teacher marginals on $N snapshots (local norm).');
+  print('Calibrated intent biases to teacher marginals on $N snapshots (rays-teacher).');
 }
 
 _PretrainIntentStats _pretrainDescendSlowTargeted({
   required Trainer trainer,
-  required FeatureExtractor fe,
+  required FeatureExtractorRays fe,
   required eng.GameEngine env,
   required PolicyNetwork policy,
   int perBand = 2500,
@@ -1062,76 +1030,55 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
 }) {
   final r = math.Random(seed);
   final xs = <List<double>>[];
-  final ys = <int>[];
 
   env.reset(seed: 909090);
 
-  int minedBand1 = 0, minedBand2 = 0;
-
   bool _tryPush() {
-    final yTeach = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
-    if (yTeach != 3) return false;
+    final yTeach = _teacherIntentFromRays(env);
+    if (yTeach != 3) return false; // only mine true descendSlow
 
     final xRaw = fe.extract(env);
     final xN = trainer.norm?.normalize(xRaw, update: false) ?? xRaw;
     final (pred, _p, _c) = policy.actIntentGreedy(xN);
 
     if (pred == 3) return false;            // not hard
-    if (pred != 0 && pred != 4) return false; // only hover/brakeUp confusions
+    // keep classic confusions: hover/brakeUp
+    if (pred != 0 && pred != 4) return false;
 
     xs.add(xRaw);
-    ys.add(3);
     return true;
   }
 
-  // Band 1
+  int minedBand1 = 0, minedBand2 = 0;
+
+  // Band 1 (near-ish to anywhere on screen)
   while (minedBand1 < perBand) {
-    final padCx = env.terrain.padCenter.toDouble();
     final W = env.cfg.worldW;
     final H = env.cfg.worldH;
 
-    final sign = (r.nextBool() ? 1.0 : -1.0);
-    final dx = sign * (0.08 * W * r.nextDouble());
-    final px = (padCx + dx).clamp(10.0, W - 10.0);
-    final gy = env.terrain.heightAt(px);
-
-    final height = 130.0 + r.nextDouble() * 90.0;
-    final vy = 20.0 + r.nextDouble() * 12.0;
-    final vx = (r.nextDouble() * 16.0) - 8.0;
-
     env.lander
-      ..pos.x = px
-      ..pos.y = (gy - height).clamp(0.0, H - 10.0)
-      ..vel.x = vx
-      ..vel.y = vy
+      ..pos.x = (r.nextDouble() * (W - 20.0) + 10.0)
+      ..pos.y = (H * 0.25 + r.nextDouble() * H * 0.25).clamp(0.0, H - 10.0)
+      ..vel.x = r.nextDouble() * 16.0 - 8.0
+      ..vel.y = 20.0 + r.nextDouble() * 12.0
       ..angle = 0.0
-      ..fuel = env.cfg.t.maxFuel;
+      ..fuel  = env.cfg.t.maxFuel;
 
     if (_tryPush()) minedBand1++;
   }
 
-  // Band 2
+  // Band 2 (higher & faster)
   while (minedBand2 < perBand) {
-    final padCx = env.terrain.padCenter.toDouble();
     final W = env.cfg.worldW;
     final H = env.cfg.worldH;
 
-    final sign = (r.nextBool() ? 1.0 : -1.0);
-    final dx = sign * (0.08 * W * r.nextDouble());
-    final px = (padCx + dx).clamp(10.0, W - 10.0);
-    final gy = env.terrain.heightAt(px);
-
-    final height = 200.0 + r.nextDouble() * 120.0;
-    final vy = 36.0 + r.nextDouble() * 24.0;
-    final vx = (r.nextDouble() * 16.0) - 8.0;
-
     env.lander
-      ..pos.x = px
-      ..pos.y = (gy - height).clamp(0.0, H - 10.0)
-      ..vel.x = vx
-      ..vel.y = vy
+      ..pos.x = (r.nextDouble() * (W - 20.0) + 10.0)
+      ..pos.y = (H * 0.45 + r.nextDouble() * H * 0.35).clamp(0.0, H - 10.0)
+      ..vel.x = r.nextDouble() * 16.0 - 8.0
+      ..vel.y = 36.0 + r.nextDouble() * 24.0
       ..angle = 0.0
-      ..fuel = env.cfg.t.maxFuel;
+      ..fuel  = env.cfg.t.maxFuel;
 
     if (_tryPush()) minedBand2++;
   }
@@ -1155,7 +1102,7 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
         final xi = trainer.norm?.normalize(xs[idx[i]], update: false) ?? xs[idx[i]];
         final (_pred, _p, cache) = policy.actIntentGreedy(xi);
         caches.add(cache);
-        labels.add(3);
+        labels.add(3);            // descendSlow
         returns.add(cache.v);
       }
 
@@ -1186,17 +1133,20 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
 
 /* ----------------------------------- usage ------------------------------------
 
-Pretrain only (intent; reset action heads; ignore old norm):
+Train (no intent pretrain, norm auto-disabled if sizes mismatch):
+  dart run lib/ai/train_agent.dart \
+    --hidden=64,64 \
+    --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 --blend_policy=1.0
+
+Intent pretrain:
   dart run lib/ai/train_agent.dart \
     --hidden=64,64 \
     --pretrain_intent=10000 --pretrain_epochs=3 --pretrain_align=3.0 --pretrain_lr=0.0005 \
-    --reset_action_heads --ignore_loaded_norm --only_pretrain
+    --reset_action_heads --only_pretrain
 
-Full train (after pretrain):
+Full train after pretrain:
   dart run lib/ai/train_agent.dart \
     --hidden=96,96,64 \
     --train_iters=200 --batch=32 --lr=0.0003 \
-    --plan_hold=1 --use_learned_controller --blend_policy=0.75 \
-    --value_beta=0.7
-
+    --plan_hold=1 --blend_policy=0.75 --value_beta=0.7
 -------------------------------------------------------------------------------- */

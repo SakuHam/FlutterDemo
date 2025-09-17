@@ -6,52 +6,69 @@ import 'package:flutter/services.dart' show rootBundle;
 // UI types
 import 'package:flutter/material.dart' show Offset;
 import '../engine/types.dart' show LanderState, Terrain;
+import '../engine/raycast.dart' show RayHit, RayHitKind; // for ray-based FE
 
 // Intent bus (runtime)
 import 'intent_bus.dart';
 
-/// ================= Runtime features (must mirror training) =================
-class RuntimeFeatureExtractor {
-  final int groundSamples;
-  final double stridePx;
-  const RuntimeFeatureExtractor({this.groundSamples = 3, this.stridePx = 48});
+/* =============================================================================
+   Feature extractors
+   ========================================================================== */
 
-  /// Training layout (IMPORTANT, must match lib/ai/agent.dart FeatureExtractor):
-  /// [ px/W, py/H, vx/200, vy/200, ang/pi, fuel/maxFuelUI,
-  ///   padCx/W, dxPad/(0.5W), (gy - py)/300, slope/2, samples... ]
-  ///
-  /// NOTE: In UI we don't know Tunables.maxFuel; the training default is 1000,
-  /// but the Flutter demo typically uses 100. Expose a param if you need it.
+abstract class _RuntimeFE {
+  int get inputSize;
   List<double> extract({
     required LanderState lander,
     required Terrain terrain,
     required double worldW,
     required double worldH,
-    double uiMaxFuel = 100.0, // set to your UI max fuel; training divides by maxFuel
+    List<RayHit>? rays,
+    double uiMaxFuel = 100.0,
+  });
+}
+
+/// -------- Legacy terrain/pad/ground-samples (back-compat) --------
+class _RuntimeFE_Legacy implements _RuntimeFE {
+  final int groundSamples;
+  final double stridePx;
+  const _RuntimeFE_Legacy({this.groundSamples = 3, this.stridePx = 48});
+
+  @override
+  int get inputSize => 10 + groundSamples;
+
+  /// Layout must mirror legacy training extractor:
+  /// [ px/W, py/H, vx/200, vy/200, ang/pi, fuel/maxFuelUI,
+  ///   padCx/W, dxPad/(0.5W), (gy - py)/300, slope/2, samples... ]
+  @override
+  List<double> extract({
+    required LanderState lander,
+    required Terrain terrain,
+    required double worldW,
+    required double worldH,
+    List<RayHit>? rays, // unused in legacy mode
+    double uiMaxFuel = 100.0,
   }) {
     final pxAbs = lander.pos.x;
     final pyAbs = lander.pos.y;
 
-    final px = pxAbs / worldW;
-    final py = pyAbs / worldH;
+    final px = (pxAbs / worldW);
+    final py = (pyAbs / worldH);
     final vx = (lander.vel.x / 200.0).clamp(-3.0, 3.0);
     final vy = (lander.vel.y / 200.0).clamp(-3.0, 3.0);
     final ang = (lander.angle / math.pi).clamp(-2.0, 2.0);
     final fuel = (lander.fuel / (uiMaxFuel > 0 ? uiMaxFuel : 1.0)).clamp(0.0, 1.0);
 
     final padCenterAbs = (terrain.padX1 + terrain.padX2) * 0.5;
-    final padCenter = padCenterAbs / worldW;
+    final padCenter = (padCenterAbs / worldW);
     final dxToPad = ((pxAbs - padCenterAbs) / (0.5 * worldW)).clamp(-1.5, 1.5);
 
     final gyCenter = terrain.heightAt(pxAbs);
     final hAbove = ((gyCenter - pyAbs) / 300.0).clamp(-2.0, 2.0);
 
-    // Slope uses +/- 8 px sample like training (agent.dart): slope = (hR - hL) / 16, then /2.0
     final gyL = terrain.heightAt((pxAbs - 8.0).clamp(0.0, worldW));
     final gyR = terrain.heightAt((pxAbs + 8.0).clamp(0.0, worldW));
     final slope = (((gyR - gyL) / 16.0) / 2.0).clamp(-2.0, 2.0);
 
-    // local ground samples (same spacing used during training)
     final samples = <double>[];
     final n = groundSamples;
     final centerIdx = n ~/ 2;
@@ -64,11 +81,81 @@ class RuntimeFeatureExtractor {
 
     return [px, py, vx, vy, ang, fuel, padCenter, dxToPad, hAbove, slope, ...samples];
   }
-
-  int get inputSize => 10 + groundSamples;
 }
 
-/// ========================== Minimal math (pure Dart) ==========================
+/// -------- Ray-based (lander stats + ray channels) --------
+/// Scalars: [px/W, py/H, vx/200, vy/200, ang/pi, fuel/uiMaxFuel]
+/// Per ray:
+///   if kindsOneHot=false: [distNorm]
+///   if kindsOneHot=true:  [distNorm, isTerrain, isPad, isWall]
+class _RuntimeFE_Rays implements _RuntimeFE {
+  final int rayCount;
+  final bool kindsOneHot;
+  const _RuntimeFE_Rays({required this.rayCount, required this.kindsOneHot});
+
+  @override
+  int get inputSize => 6 + rayCount * (kindsOneHot ? 4 : 1);
+
+  @override
+  List<double> extract({
+    required LanderState lander,
+    required Terrain terrain,
+    required double worldW,
+    required double worldH,
+    List<RayHit>? rays,
+    double uiMaxFuel = 100.0,
+  }) {
+    if (rays == null) {
+      throw StateError(
+          'Runtime FE (rays) requires a rays list. Pass engine.rays into actWithIntent(..., rays: engine.rays).');
+    }
+
+    // Base 6
+    final px = (lander.pos.x / worldW);
+    final py = (lander.pos.y / worldH);
+    final vx = (lander.vel.x / 200.0).clamp(-3.0, 3.0);
+    final vy = (lander.vel.y / 200.0).clamp(-3.0, 3.0);
+    final ang = (lander.angle / math.pi).clamp(-2.0, 2.0);
+    final fuel = (lander.fuel / (uiMaxFuel > 0 ? uiMaxFuel : 1.0)).clamp(0.0, 1.0);
+
+    final out = <double>[px, py, vx, vy, ang, fuel];
+
+    // Normalize distance by world diagonal for stability
+    final maxD = math.sqrt(worldW * worldW + worldH * worldH);
+
+    // Ensure deterministic size (pad/truncate)
+    final int n = rayCount;
+    for (int i = 0; i < n; i++) {
+      RayHit? rh;
+      if (i < rays.length) {
+        rh = rays[i];
+      }
+      final d = (rh == null) ? maxD : ((Offset(rh.p.x, rh.p.y) - Offset(lander.pos.x, lander.pos.y)).distance);
+      final dN = (d / maxD).clamp(0.0, 1.0);
+
+      if (!kindsOneHot) {
+        out.add(dN);
+      } else {
+        double tTerr = 0, tPad = 0, tWall = 0;
+        if (rh != null) {
+          switch (rh.kind) {
+            case RayHitKind.terrain: tTerr = 1; break;
+            case RayHitKind.pad:     tPad  = 1; break;
+            case RayHitKind.wall:    tWall = 1; break;
+          }
+        }
+        out.addAll([dN, tTerr, tPad, tWall]);
+      }
+    }
+
+    return out;
+  }
+}
+
+/* =============================================================================
+   Tiny math
+   ========================================================================== */
+
 List<double> _matVec(List<List<double>> W, List<double> x) {
   final m = W.length, n = x.length;
   final out = List<double>.filled(m, 0.0);
@@ -101,16 +188,6 @@ List<double> _tanhVec(List<double> v) {
   return out;
 }
 
-double _sigmoid(double x) {
-  if (x >= 0) {
-    final ex = math.exp(-x);
-    return 1.0 / (1.0 + ex);
-  } else {
-    final ex = math.exp(x);
-    return ex / (1.0 + ex);
-  }
-}
-
 List<double> _softmax(List<double> z) {
   double m = z[0];
   for (int i = 1; i < z.length; i++) if (z[i] > m) m = z[i];
@@ -135,7 +212,10 @@ int _argmax(List<double> a) {
   return idx;
 }
 
-/// =================== Heads & MLP (arbitrary hidden layers) ====================
+/* =============================================================================
+   MLP & Norm
+   ========================================================================== */
+
 class _Linear {
   List<List<double>> W;
   List<double> b;
@@ -148,7 +228,7 @@ class _Linear {
 }
 
 class _MLP {
-  final List<_Linear> layers; // all hidden layers (tanh activations between)
+  final List<_Linear> layers; // tanh activations between
   _MLP(this.layers);
 
   List<double> forward(List<double> x) {
@@ -182,12 +262,17 @@ class _RuntimeNorm {
   }
 }
 
-/// ======================= Intents (mirror training enum) =======================
+/* =============================================================================
+   Intents (must mirror training)
+   ========================================================================== */
+
 enum Intent { hover, goLeft, goRight, descendSlow, brakeUp }
 const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','brakeUp'];
 
-/// ===== UI-side low-level controller (no GameEngine dependency!) =====
-/// Converts an intent into (thrust,left,right) using only Lander/Terrain/world.
+/* =============================================================================
+   Low-level controller (heuristic) to execute the chosen intent
+   ========================================================================== */
+
 ({bool thrust, bool left, bool right}) _controllerForIntentUI(
     Intent intent, {
       required LanderState lander,
@@ -205,7 +290,7 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
 
   final groundY = terrain.heightAt(lander.pos.x);
   final height  = (groundY - lander.pos.y).clamp(0.0, 1e9);
-  final ceilingDist = (lander.pos.y - 0.0).clamp(0.0, 1e9); // UI ceiling at y=0
+  final ceilingDist = (lander.pos.y - 0.0).clamp(0.0, 1e9);
 
   const double vxGoalAbs = 80.0;
   const double kAngV     = 0.015;
@@ -266,25 +351,27 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
     thrust = false;
   }
 
-  // UI hard ceiling at y=0
   if (lander.pos.y < 4) thrust = false;
 
   return (thrust: thrust, left: left, right: right);
 }
 
-/// =================== Two-stage runtime policy (planner) ===================
+/* =============================================================================
+   Runtime policy
+   ========================================================================== */
+
 class RuntimeTwoStagePolicy {
   // Architecture (inferred)
   final int inputSize;
   final _MLP trunk; // arbitrary hidden layers (tanh)
   final _Linear headIntent; // (K, Hlast)
-  // (Optionally loaded; unused by UI planner, kept for compatibility)
+  // Optional loaded heads (not used by planner, kept for parity)
   final _Linear? headTurn;  // (3, Hlast)
   final _Linear? headThr;   // (1, Hlast)
   final _Linear? headVal;   // (1, Hlast)
 
   // FE & planner config
-  final RuntimeFeatureExtractor fe;
+  final _RuntimeFE fe;
   final int planHold; // frames to hold an intent
 
   // Saved feature normalization (optional)
@@ -309,12 +396,9 @@ class RuntimeTwoStagePolicy {
     required this.signature,
   });
 
-  /// Create from JSON string. Supports:
-  ///  - v2 format: { arch.hidden, trunk: [{W,b},...], heads: {intent,turn,thr,val}, signature, norm{...} }
-  ///  - legacy v1: inputSize/h1/h2, W1/W2/b1/b2, W_intent/b_intent, ...
   static RuntimeTwoStagePolicy fromJson(
       String jsonString, {
-        RuntimeFeatureExtractor? fe,
+        _RuntimeFE? fe,
         int planHold = 1,
       }) {
     final Map<String, dynamic> j = json.decode(jsonString);
@@ -325,7 +409,6 @@ class RuntimeTwoStagePolicy {
         (v as List).map<double>((x)=> (x as num).toDouble()).toList();
 
     _RuntimeNorm? _readNorm(Map<String, dynamic> root, int expectDim, String? expectSig) {
-      // prefer nested 'norm'
       final nm = (root['norm'] as Map?)?.cast<String, dynamic>();
       if (nm != null) {
         final dim = (nm['dim'] as num?)?.toInt() ?? -1;
@@ -336,7 +419,6 @@ class RuntimeTwoStagePolicy {
               var_: _as1d(nm['var']));
         }
       }
-      // fallback to legacy top-level triplet (guard by signature if present)
       final nmv = root['norm_mean'];
       final nvv = root['norm_var'];
       final nsig = root['norm_signature'];
@@ -352,27 +434,25 @@ class RuntimeTwoStagePolicy {
       return null;
     }
 
-    // v2 path?
+    // v2?
     final arch = (j['arch'] as Map?)?.cast<String, dynamic>();
     final trunkJ = (j['trunk'] as List?)?.cast<dynamic>();
     final headsJ = (j['heads'] as Map?)?.cast<String, dynamic>();
-    final v2 = (arch != null && trunkJ != null && headsJ != null);
+    final isV2 = (arch != null && trunkJ != null && headsJ != null);
 
-    if (v2) {
+    if (isV2) {
       final inputSize = (arch!['input'] as num).toInt();
-      final hidden = (arch['hidden'] as List).map((e) => (e as num).toInt()).toList();
       final sig = j['signature'] as String?;
 
-      // build trunk
+      // Build trunk
       final layers = <_Linear>[];
       int expectIn = inputSize;
       for (int li = 0; li < trunkJ!.length; li++) {
         final layerObj = (trunkJ[li] as Map).cast<String, dynamic>();
         final W = _as2d(layerObj['W']);
         final b = _as1d(layerObj['b']);
-        // shape check (best effort)
         if (W.isEmpty || W[0].length != expectIn || W.length != b.length) {
-          throw StateError('Trunk layer $li has mismatched shape (got ${W.length}x${W[0].length}, bias ${b.length}, expected in=$expectIn).');
+          throw StateError('Trunk layer $li shape mismatch: got ${W.length}x${W[0].length}, bias ${b.length}, expected in=$expectIn');
         }
         layers.add(_Linear(W, b));
         expectIn = b.length;
@@ -380,7 +460,6 @@ class RuntimeTwoStagePolicy {
       final trunk = _MLP(layers);
       final lastDim = trunk.outDim;
 
-      // heads
       _Linear _readHead(String key) {
         final hj = (headsJ![key] as Map).cast<String, dynamic>();
         final W = _as2d(hj['W']);
@@ -397,13 +476,26 @@ class RuntimeTwoStagePolicy {
       if (headsJ.containsKey('thr'))  headThr  = _readHead('thr');
       if (headsJ.containsKey('val'))  headVal  = _readHead('val');
 
-      final fe0 = fe ??
-          RuntimeFeatureExtractor(
-            groundSamples: ((j['feature_extractor']?['groundSamples'] ?? 3) as num).toInt(),
-            stridePx: ((j['feature_extractor']?['stridePx'] ?? 48) as num).toDouble(),
-          );
+      // FE choice
+      _RuntimeFE fe0;
+      if (fe != null) {
+        fe0 = fe;
+      } else {
+        final fej = (j['feature_extractor'] as Map?)?.cast<String, dynamic>() ?? const {};
+        final kind = (fej['kind'] as String?) ?? 'legacy';
+        if (kind == 'rays') {
+          final rayCount = ((fej['rayCount'] ?? 180) as num).toInt();
+          final kindsOneHot = ((fej['kindsOneHot'] ?? true) as bool);
+          fe0 = _RuntimeFE_Rays(rayCount: rayCount, kindsOneHot: kindsOneHot);
+        } else {
+          // fallback if older file encoded legacy params under this key
+          final gs = ((fej['groundSamples'] ?? 3) as num).toInt();
+          final stride = ((fej['stridePx'] ?? 48) as num).toDouble();
+          fe0 = _RuntimeFE_Legacy(groundSamples: gs, stridePx: stride);
+        }
+      }
 
-      final norm = _readNorm(j, fe0.inputSize, sig);
+      final norm = _readNorm(j, inputSize, sig);
 
       return RuntimeTwoStagePolicy._(
         inputSize: inputSize,
@@ -419,15 +511,14 @@ class RuntimeTwoStagePolicy {
       );
     }
 
-    // ----- Legacy v1 loader (W1/W2/... with two hidden tanh layers) -----
+    // Legacy v1
+    List<List<double>> _as2dReq(String k) => _as2d(j[k]);
+    List<double> _as1dReq(String k) => _as1d(j[k]);
+
     final inputSize = (j['inputSize'] as num).toInt();
-    final h1 = (j['h1'] as num).toInt();
-    final h2 = (j['h2'] as num).toInt();
-
-    final W1 = _as2d(j['W1']); final b1 = _as1d(j['b1']);
-    final W2 = _as2d(j['W2']); final b2 = _as1d(j['b2']);
-
-    final W_intent = _as2d(j['W_intent']); final b_intent = _as1d(j['b_intent']);
+    final W1 = _as2dReq('W1'); final b1 = _as1dReq('b1');
+    final W2 = _as2dReq('W2'); final b2 = _as1dReq('b2');
+    final W_int = _as2dReq('W_intent'); final b_int = _as1dReq('b_intent');
 
     _Linear? headTurn, headThr, headVal;
     if (j.containsKey('W_turn') && j.containsKey('b_turn')) {
@@ -440,18 +531,19 @@ class RuntimeTwoStagePolicy {
       headVal = _Linear(_as2d(j['W_val']), _as1d(j['b_val']));
     }
 
-    // Build equivalent trunk (two layers, tanh)
     final trunk = _MLP([_Linear(W1, b1), _Linear(W2, b2)]);
-    final headIntent = _Linear(W_intent, b_intent);
+    final headIntent = _Linear(W_int, b_int);
 
-    final fe0 = fe ??
-        RuntimeFeatureExtractor(
-          groundSamples: ((j['fe']?['groundSamples'] ?? j['feature_extractor']?['groundSamples'] ?? 3) as num).toInt(),
-          stridePx: ((j['fe']?['stridePx'] ?? j['feature_extractor']?['stridePx'] ?? 48) as num).toDouble(),
-        );
+    // Try to read legacy FE hints (optional)
+    final feh = (j['fe'] as Map?)?.cast<String, dynamic>() ??
+        (j['feature_extractor'] as Map?)?.cast<String, dynamic>() ??
+        const {};
+    final gs = ((feh['groundSamples'] ?? 3) as num).toInt();
+    final stride = ((feh['stridePx'] ?? 48) as num).toDouble();
+    final fe0 = _RuntimeFE_Legacy(groundSamples: gs, stridePx: stride);
 
     final sig = j['signature'] as String?;
-    final norm = _readNorm(j, fe0.inputSize, sig);
+    final norm = _readNorm(j, inputSize, sig);
 
     return RuntimeTwoStagePolicy._(
       inputSize: inputSize,
@@ -475,19 +567,19 @@ class RuntimeTwoStagePolicy {
     return RuntimeTwoStagePolicy.fromJson(js, planHold: planHold);
   }
 
-  /// Reset internal planner so next call will re-plan immediately.
   void resetPlanner() { _framesLeft = 0; _currentIntentIdx = -1; }
 
   /// Main runtime step: choose/hold intent, emit control, publish bus events.
   ///
-  /// Returns low-level control AND the chosen intent index + probs for zero-lag HUD.
+  /// If the loaded policy expects **ray features**, you **must** pass [rays].
   (bool thrust, bool left, bool right, int intentIdx, List<double> probs) actWithIntent({
     required LanderState lander,
     required Terrain terrain,
     required double worldW,
     required double worldH,
+    List<RayHit>? rays,            // REQUIRED when FE is rays
     int step = 0,
-    double uiMaxFuel = 100.0, // match what you pass to FE at training-time if needed
+    double uiMaxFuel = 100.0,
   }) {
     // Re-plan if needed
     if (_framesLeft <= 0) {
@@ -496,14 +588,12 @@ class RuntimeTwoStagePolicy {
         terrain: terrain,
         worldW: worldW,
         worldH: worldH,
+        rays: rays,
         uiMaxFuel: uiMaxFuel,
       );
       if (norm != null) x = norm!.apply(x);
 
-      // trunk forward
       final h = trunk.forward(x);
-
-      // intent head (greedy at runtime)
       final logits = headIntent.forward(h);
       final probs = _softmax(logits);
       final idx = _argmax(probs);
@@ -512,7 +602,6 @@ class RuntimeTwoStagePolicy {
       _framesLeft = planHold;
       _lastReplanProbs = probs;
 
-      // Publish intent (UI/debug bus)
       IntentBus.instance.publishIntent(
         IntentEvent(
           intent: kIntentNames[idx],
@@ -533,7 +622,6 @@ class RuntimeTwoStagePolicy {
       worldH: worldH,
     );
 
-    // Publish control (UI/debug bus)
     IntentBus.instance.publishControl(
       ControlEvent(
         thrust: ctrl.thrust,
