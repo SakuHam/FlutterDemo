@@ -19,11 +19,10 @@ class Hull {
   static Vector2 _rot(Vector2 v, double c, double s) =>
       Vector2(c * v.x - s * v.y, s * v.x + c * v.y);
 
-  static ({Vector2 top, Vector2 left, Vector2 right})
-  verts(Vector2 pos, double ang) {
+  static ({Vector2 top, Vector2 left, Vector2 right}) verts(Vector2 pos, double ang) {
     final c = math.cos(ang), s = math.sin(ang);
-    final top = pos + _rot(_vTop, c, s);
-    final left = pos + _rot(_vLeftFoot, c, s);
+    final top   = pos + _rot(_vTop,       c, s);
+    final left  = pos + _rot(_vLeftFoot,  c, s);
     final right = pos + _rot(_vRightFoot, c, s);
     return (top: top, left: left, right: right);
   }
@@ -45,7 +44,8 @@ class Hull {
   }
 }
 
-/// Closest-point contact resolver against terrain + world bounds.
+/// Closest-point contact resolver against terrain + world bounds,
+/// with an extra vertex-in-polygon guard to prevent corner tunneling.
 class ContactResolver {
   final EngineConfig cfg;
   final Terrain terrain;
@@ -58,6 +58,8 @@ class ContactResolver {
     final W = cfg.worldW.toDouble();
     final H = cfg.worldH.toDouble();
     const eps = 1e-6;
+
+    // ===== Bounds first (ceil & walls) =====
 
     // Ceiling (top support)
     final top = Hull.supportPoint(pos, angle, 0.0, -1.0);
@@ -86,7 +88,48 @@ class ContactResolver {
       return (kind: ContactKind.wall, pos: newPos, vel: newVel);
     }
 
-    // Ground / Pad (bottom support)
+    // ===== Vertex-in-polygon guard (prevents corner tunneling) =====
+    // If any hull vertex is inside the solid polygon, push out along nearest edge normal.
+    final outer = terrain.poly.outer;
+    if (outer.length >= 3) {
+      final vtx = Hull.verts(pos, angle);
+      final List<Vector2> hullPts = [vtx.top, vtx.left, vtx.right];
+
+      // Determine outer ring orientation to pick outward normal correctly.
+      final bool outerIsCCW = _signedArea(outer) > 0.0;
+
+      for (final v in hullPts) {
+        if (_pointInOuterCCW(v, outer)) {
+          final nearest = _nearestEdgeToPoint(v, outerIsCCW);
+          // Small bias so we end up clearly outside
+          const double bias = 0.5;
+          final corr = Vector2(
+            nearest.normal.x * (nearest.dist + bias),
+            nearest.normal.y * (nearest.dist + bias),
+          );
+          final newPos = Vector2(pos.x + corr.x, pos.y + corr.y);
+
+          // Kill inward velocity component (inelastic pushout)
+          final vn = vel.x * nearest.normal.x + vel.y * nearest.normal.y;
+          Vector2 newVel = vel;
+          if (vn < 0) {
+            newVel = Vector2(
+              vel.x - vn * nearest.normal.x,
+              vel.y - vn * nearest.normal.y,
+            );
+          }
+
+          final kind = (nearest.kind == PolyEdgeKind.pad)
+              ? ContactKind.pad
+              : ContactKind.terrain;
+
+          return (kind: kind, pos: newPos, vel: newVel);
+        }
+      }
+    }
+
+    // ===== Ground / Pad (bottom support, legacy height probe) =====
+    // Kept for compatibility/feel; the vertex guard above already fixes corner misses.
     final bottom = Hull.supportPoint(pos, angle, 0.0, 1.0);
     final groundY = terrain.heightAt(bottom.x);
     if (bottom.y >= groundY - eps) {
@@ -100,5 +143,104 @@ class ContactResolver {
     }
 
     return (kind: ContactKind.none, pos: pos, vel: vel);
+  }
+
+  // ---------- Geometry helpers ----------
+
+  /// Ray-crossing test for a point against the OUTER ring (assumed CCW, but works regardless).
+  /// Boundary points are treated as inside (<= eps).
+  bool _pointInOuterCCW(Vector2 p, List<Vector2> ring) {
+    bool inside = false;
+    for (int i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      final a = ring[i], b = ring[j];
+      final yi = a.y, yj = b.y;
+      final xi = a.x, xj = b.x;
+      final denom = (yj - yi);
+      final xIntersect = (denom.abs() < 1e-12)
+          ? xi
+          : (xj - xi) * (p.y - yi) / denom + xi;
+      final cond = ((yi > p.y) != (yj > p.y)) && (p.x < xIntersect);
+      if (cond) inside = !inside;
+    }
+    if (!inside) {
+      // Boundary as inside
+      const eps = 1e-6;
+      for (int i = 0; i < ring.length; i++) {
+        final a = ring[i];
+        final b = ring[(i + 1) % ring.length];
+        if (_pointSegmentDistance(p, a, b) <= eps) return true;
+      }
+    }
+    return inside;
+  }
+
+  double _pointSegmentDistance(Vector2 p, Vector2 a, Vector2 b) {
+    final vx = b.x - a.x, vy = b.y - a.y;
+    final wx = p.x - a.x, wy = p.y - a.y;
+    final c1 = vx * wx + vy * wy;
+    if (c1 <= 0) return math.sqrt(wx * wx + wy * wy);
+    final c2 = vx * vx + vy * vy;
+    if (c2 <= c1) {
+      final dx = p.x - b.x, dy = p.y - b.y;
+      return math.sqrt(dx * dx + dy * dy);
+    }
+    final t = c1 / c2;
+    final px = a.x + t * vx, py = a.y + t * vy;
+    final dx = p.x - px, dy = p.y - py;
+    return math.sqrt(dx * dx + dy * dy);
+  }
+
+  /// Nearest edge (by perpendicular distance) to point p.
+  /// Returns closest point on the edge, outward normal (unit), distance, and edge kind.
+  ({
+  Vector2 closest,
+  Vector2 normal,
+  double dist,
+  PolyEdgeKind kind,
+  }) _nearestEdgeToPoint(Vector2 p, bool outerIsCCW) {
+    final edges = terrain.poly.edges;
+    double bestD = double.infinity;
+    Vector2 bestP = p;
+    Vector2 bestN = Vector2(0, -1);
+    PolyEdgeKind bestK = PolyEdgeKind.terrain;
+
+    for (final e in edges) {
+      final a = e.a, b = e.b;
+      // project p onto segment ab
+      final abx = b.x - a.x, aby = b.y - a.y;
+      final apx = p.x - a.x, apy = p.y - a.y;
+      final ab2 = abx * abx + aby * aby;
+      final double t = (ab2 <= 1e-12) ? 0.0 : ((apx * abx + apy * aby) / ab2).clamp(0.0, 1.0);
+      final q = Vector2(a.x + abx * t, a.y + aby * t);
+      final dx = p.x - q.x, dy = p.y - q.y;
+      final d = math.sqrt(dx * dx + dy * dy);
+      if (d < bestD) {
+        bestD = d;
+        bestP = q;
+        // For CCW outer ring, we treat the left normal (-dy, dx) as pointing OUT of solid.
+        // For CW outer, right normal (dy, -dx) points outward.
+        double nx, ny;
+        if (outerIsCCW) {
+          nx = -aby; ny = abx;
+        } else {
+          nx = aby;  ny = -abx;
+        }
+        final len = math.sqrt(nx * nx + ny * ny);
+        if (len > 1e-12) { nx /= len; ny /= len; }
+        bestN = Vector2(nx, ny);
+        bestK = e.kind;
+      }
+    }
+    return (closest: bestP, normal: bestN, dist: bestD, kind: bestK);
+  }
+
+  double _signedArea(List<Vector2> ring) {
+    double a = 0;
+    for (int i = 0; i < ring.length; i++) {
+      final p = ring[i];
+      final q = ring[(i + 1) % ring.length];
+      a += p.x * q.y - p.y * q.x;
+    }
+    return 0.5 * a;
   }
 }
