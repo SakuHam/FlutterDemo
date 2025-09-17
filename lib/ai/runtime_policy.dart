@@ -152,6 +152,29 @@ class _RuntimeFE_Rays implements _RuntimeFE {
   }
 }
 
+({double x, double y, bool valid}) _avgPadVector({
+  required List<RayHit> rays,
+  required double px,
+  required double py,
+}) {
+  double sx = 0.0, sy = 0.0, wsum = 0.0;
+  for (final r in rays) {
+    if (r.kind != RayHitKind.pad) continue;
+    final dx = r.p.x - px;
+    final dy = r.p.y - py;
+    final d2 = dx*dx + dy*dy;
+    if (d2 <= 1e-9) continue;
+    // Heavier weight when closer to the pad; clamp to avoid explosions
+    final w = 1.0 / math.sqrt(d2 + 1e-6);
+    sx += w * dx;
+    sy += w * dy;
+    wsum += w;
+  }
+  if (wsum <= 0) return (x: 0.0, y: 0.0, valid: false);
+  final inv = 1.0 / wsum;
+  return (x: sx * inv, y: sy * inv, valid: true);
+}
+
 /* =============================================================================
    Tiny math
    ========================================================================== */
@@ -383,6 +406,9 @@ class RuntimeTwoStagePolicy {
   int _currentIntentIdx = -1;
   List<double>? _lastReplanProbs;
 
+  final bool fixPolarityWithPadRays; // swap goLeft/goRight if pad-avg disagrees
+  final bool mirrorX;                // hard flip left/right mapping (debug/safety)
+
   RuntimeTwoStagePolicy._({
     required this.inputSize,
     required this.trunk,
@@ -394,6 +420,8 @@ class RuntimeTwoStagePolicy {
     required this.planHold,
     required this.norm,
     required this.signature,
+    this.fixPolarityWithPadRays = false,
+    this.mirrorX = false,
   });
 
   static RuntimeTwoStagePolicy fromJson(
@@ -507,6 +535,8 @@ class RuntimeTwoStagePolicy {
         planHold: planHold,
         norm: norm,
         signature: sig,
+        fixPolarityWithPadRays: true,
+        mirrorX: false,
       );
     }
 
@@ -601,6 +631,38 @@ class RuntimeTwoStagePolicy {
       _framesLeft = planHold;
       _lastReplanProbs = probs;
 
+// Optional polarity fix using average of pad rays (more stable than nearest)
+      if (fixPolarityWithPadRays && rays != null && rays.isNotEmpty) {
+        final av = _avgPadVector(
+          rays: rays,
+          px: lander.pos.x,
+          py: lander.pos.y,
+        );
+        if (av.valid) {
+          // If pad is to the left (negative x from craft), we *expect* goLeft.
+          final padIsLeft = av.x < 0.0;
+
+          // Current NN choice:
+          final isLeft  = _currentIntentIdx == Intent.goLeft.index;
+          final isRight = _currentIntentIdx == Intent.goRight.index;
+
+          // If NN picked left but pad vector says right (or vice versa), flip.
+          if ((isLeft  && !padIsLeft) ||
+              (isRight &&  padIsLeft)) {
+            _currentIntentIdx =
+            isLeft ? Intent.goRight.index : Intent.goLeft.index;
+
+            // Optional: tiny debug pulse to confirm flips in logs
+            IntentBus.instance.publishIntent(IntentEvent(
+              intent: kIntentNames[_currentIntentIdx],
+              probs: _lastReplanProbs ?? const [],
+              step: step,
+              meta: {'polarity_fix': true},
+            ));
+          }
+        }
+      }
+
       IntentBus.instance.publishIntent(
         IntentEvent(
           intent: kIntentNames[idx],
@@ -613,7 +675,7 @@ class RuntimeTwoStagePolicy {
 
     final idxNow = _currentIntentIdx < 0 ? 0 : _currentIntentIdx;
     final intent = Intent.values[idxNow];
-    final ctrl = _controllerForIntentUI(
+    var ctrl = _controllerForIntentUI(
       intent,
       lander: lander,
       terrain: terrain,
@@ -621,6 +683,18 @@ class RuntimeTwoStagePolicy {
       worldH: worldH,
     );
 
+    // Optional global turn inversion (debug/safety)
+    if (mirrorX) {
+      // Swap emitted turn commands
+      final swapped = (thrust: ctrl.thrust, left: ctrl.right, right: ctrl.left);
+      IntentBus.instance.publishControl(ControlEvent(
+        thrust: swapped.thrust, left: swapped.left, right: swapped.right,
+        step: step, meta: {'intent': kIntentNames[idxNow], 'mirrorX': true},
+      ));
+      _framesLeft -= 1;
+      return (swapped.thrust, swapped.left, swapped.right, idxNow, _lastReplanProbs ?? const []);
+    }
+    
     IntentBus.instance.publishControl(
       ControlEvent(
         thrust: ctrl.thrust,
