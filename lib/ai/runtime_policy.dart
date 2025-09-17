@@ -5,7 +5,7 @@ import 'package:flutter/services.dart' show rootBundle;
 
 // UI types
 import 'package:flutter/material.dart' show Offset;
-import '../game_page.dart' show Lander, Terrain;
+import '../engine/types.dart' show LanderState, Terrain;
 
 // Intent bus (runtime)
 import 'intent_bus.dart';
@@ -16,107 +16,196 @@ class RuntimeFeatureExtractor {
   final double stridePx;
   const RuntimeFeatureExtractor({this.groundSamples = 3, this.stridePx = 48});
 
-  /// Training layout (IMPORTANT):
-  /// [px, py, vx, vy, ang, fuel, padCenter, dxCenter, dGround, slope, samples...]
+  /// Training layout (IMPORTANT, must match lib/ai/agent.dart FeatureExtractor):
+  /// [ px/W, py/H, vx/200, vy/200, ang/pi, fuel/maxFuelUI,
+  ///   padCx/W, dxPad/(0.5W), (gy - py)/300, slope/2, samples... ]
+  ///
+  /// NOTE: In UI we don't know Tunables.maxFuel; the training default is 1000,
+  /// but the Flutter demo typically uses 100. Expose a param if you need it.
   List<double> extract({
-    required Lander lander,
+    required LanderState lander,
     required Terrain terrain,
     required double worldW,
     required double worldH,
+    double uiMaxFuel = 100.0, // set to your UI max fuel; training divides by maxFuel
   }) {
-    final px = lander.position.dx / worldW;
-    final py = lander.position.dy / worldH;
-    final vx = (lander.velocity.dx / 200.0).clamp(-2.0, 2.0);
-    final vy = (lander.velocity.dy / 200.0).clamp(-2.0, 2.0);
-    final ang = (lander.angle / math.pi).clamp(-1.5, 1.5); // angle value, not sin/cos
-    final fuel = (lander.fuel / 100.0).clamp(0.0, 1.0);    // Tunables.maxFuel=100 in UI
+    final pxAbs = lander.pos.x;
+    final pyAbs = lander.pos.y;
 
-    final padCenter = ((terrain.padX1 + terrain.padX2) * 0.5) / worldW;
-    final dxCenter =
-    ((lander.position.dx - (terrain.padX1 + terrain.padX2) * 0.5) / worldW)
-        .clamp(-1.0, 1.0);
+    final px = pxAbs / worldW;
+    final py = pyAbs / worldH;
+    final vx = (lander.vel.x / 200.0).clamp(-3.0, 3.0);
+    final vy = (lander.vel.y / 200.0).clamp(-3.0, 3.0);
+    final ang = (lander.angle / math.pi).clamp(-2.0, 2.0);
+    final fuel = (lander.fuel / (uiMaxFuel > 0 ? uiMaxFuel : 1.0)).clamp(0.0, 1.0);
 
-    final gY = terrain.heightAt(lander.position.dx);
-    final dGround = ((gY - lander.position.dy) / worldH).clamp(-1.0, 1.0);
+    final padCenterAbs = (terrain.padX1 + terrain.padX2) * 0.5;
+    final padCenter = padCenterAbs / worldW;
+    final dxToPad = ((pxAbs - padCenterAbs) / (0.5 * worldW)).clamp(-1.5, 1.5);
 
-    final gyL = terrain.heightAt((lander.position.dx - 20).clamp(0.0, worldW));
-    final gyR = terrain.heightAt((lander.position.dx + 20).clamp(0.0, worldW));
-    final slope = (((gyR - gyL) / 40.0) / 0.5).clamp(-2.0, 2.0);
+    final gyCenter = terrain.heightAt(pxAbs);
+    final hAbove = ((gyCenter - pyAbs) / 300.0).clamp(-2.0, 2.0);
 
-    // local ground samples: exactly `groundSamples` with even/odd symmetry
-    final n = groundSamples;
-    final center = (n - 1) / 2.0;
+    // Slope uses +/- 8 px sample like training (agent.dart): slope = (hR - hL) / 16, then /2.0
+    final gyL = terrain.heightAt((pxAbs - 8.0).clamp(0.0, worldW));
+    final gyR = terrain.heightAt((pxAbs + 8.0).clamp(0.0, worldW));
+    final slope = (((gyR - gyL) / 16.0) / 2.0).clamp(-2.0, 2.0);
+
+    // local ground samples (same spacing used during training)
     final samples = <double>[];
-    for (int k = 0; k < n; k++) {
-      final relIndex = k - center;
-      final sx = (lander.position.dx + relIndex * stridePx).clamp(0.0, worldW);
+    final n = groundSamples;
+    final centerIdx = n ~/ 2;
+    for (int i = 0; i < n; i++) {
+      final rel = (i - centerIdx).toDouble();
+      final sx = (pxAbs + rel * stridePx).clamp(0.0, worldW);
       final sy = terrain.heightAt(sx);
-      samples.add(((sy - lander.position.dy) / worldH).clamp(-1.0, 1.0));
+      samples.add(((sy - pyAbs) / 300.0).clamp(-2.0, 2.0));
     }
 
-    return [px, py, vx, vy, ang, fuel, padCenter, dxCenter, dGround, slope, ...samples];
+    return [px, py, vx, vy, ang, fuel, padCenter, dxToPad, hAbove, slope, ...samples];
   }
 
   int get inputSize => 10 + groundSamples;
 }
 
-/// =============== Tiny math (pure Dart, no Flutter/engine deps) ===============
+/// ========================== Minimal math (pure Dart) ==========================
 List<double> _matVec(List<List<double>> W, List<double> x) {
-  final m = W.length, n = W[0].length;
+  final m = W.length, n = x.length;
   final out = List<double>.filled(m, 0.0);
   for (int i = 0; i < m; i++) {
-    double s = 0.0; final Wi = W[i];
+    double s = 0.0;
+    final Wi = W[i];
     for (int j = 0; j < n; j++) s += Wi[j] * x[j];
     out[i] = s;
   }
   return out;
 }
-List<double> _vecAdd(List<double> a, List<double> b) {
-  final out = List<double>.filled(a.length, 0.0);
-  for (int i = 0; i < a.length; i++) out[i] = a[i] + b[i];
+
+List<double> _addBias(List<double> v, List<double> b) {
+  final out = List<double>.filled(v.length, 0.0);
+  for (int i = 0; i < v.length; i++) out[i] = v[i] + b[i];
   return out;
 }
-double _relu(double x) => x > 0 ? x : 0.0;
-List<double> _reluVec(List<double> v) => v.map(_relu).toList();
-double _sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
-List<double> _softmax(List<double> z) {
-  final m = z.reduce((a,b)=>a>b?a:b);
-  var s = 0.0;
-  final e = List<double>.filled(z.length, 0.0);
-  for (int i=0;i<z.length;i++) { e[i] = math.exp(z[i]-m); s += e[i]; }
-  for (int i=0;i<z.length;i++) e[i] /= (s + 1e-12);
-  return e;
+
+double _tanhScalar(double x) {
+  final ax = x.abs();
+  if (ax > 20.0) return x.isNegative ? -1.0 : 1.0;
+  final e = math.exp(-2.0 * ax);
+  final t = (1.0 - e) / (1.0 + e);
+  return x.isNegative ? -t : t;
 }
+
+List<double> _tanhVec(List<double> v) {
+  final out = List<double>.filled(v.length, 0.0);
+  for (int i = 0; i < v.length; i++) out[i] = _tanhScalar(v[i]);
+  return out;
+}
+
+double _sigmoid(double x) {
+  if (x >= 0) {
+    final ex = math.exp(-x);
+    return 1.0 / (1.0 + ex);
+  } else {
+    final ex = math.exp(x);
+    return ex / (1.0 + ex);
+  }
+}
+
+List<double> _softmax(List<double> z) {
+  double m = z[0];
+  for (int i = 1; i < z.length; i++) if (z[i] > m) m = z[i];
+  double s = 0.0;
+  final out = List<double>.filled(z.length, 0.0);
+  for (int i = 0; i < z.length; i++) {
+    final e = math.exp(z[i] - m);
+    out[i] = e.isFinite ? e : 0.0;
+    s += out[i];
+  }
+  final inv = (s > 0 && s.isFinite) ? (1.0 / s) : 0.0;
+  for (int i = 0; i < z.length; i++) out[i] *= inv;
+  return out;
+}
+
 int _argmax(List<double> a) {
-  var bi = 0; var bv = a[0];
-  for (int i=1;i<a.length;i++) if (a[i] > bv) { bv=a[i]; bi=i; }
-  return bi;
+  var idx = 0;
+  var best = a[0];
+  for (int i = 1; i < a.length; i++) {
+    if (a[i] > best) { best = a[i]; idx = i; }
+  }
+  return idx;
+}
+
+/// =================== Heads & MLP (arbitrary hidden layers) ====================
+class _Linear {
+  List<List<double>> W;
+  List<double> b;
+  _Linear(this.W, this.b);
+
+  int get outDim => b.length;
+  int get inDim => W.isEmpty ? 0 : W[0].length;
+
+  List<double> forward(List<double> x) => _addBias(_matVec(W, x), b);
+}
+
+class _MLP {
+  final List<_Linear> layers; // all hidden layers (tanh activations between)
+  _MLP(this.layers);
+
+  List<double> forward(List<double> x) {
+    var h = x;
+    for (int i = 0; i < layers.length; i++) {
+      h = _tanhVec(layers[i].forward(h));
+    }
+    return h;
+  }
+
+  int get outDim => layers.isEmpty ? 0 : layers.last.outDim;
+}
+
+class _RuntimeNorm {
+  bool inited;
+  final int dim;
+  List<double> mean;
+  List<double> var_; // variance
+  _RuntimeNorm(this.dim, {List<double>? mean, List<double>? var_})
+      : inited = (mean != null && var_ != null),
+        mean = mean ?? List<double>.filled(dim, 0.0),
+        var_ = var_ ?? List<double>.filled(dim, 1.0);
+
+  List<double> apply(List<double> x) {
+    if (!inited || x.length != dim) return x;
+    final out = List<double>.filled(dim, 0.0);
+    for (int i = 0; i < dim; i++) {
+      out[i] = (x[i] - mean[i]) / math.sqrt(var_[i] + 1e-6);
+    }
+    return out;
+  }
 }
 
 /// ======================= Intents (mirror training enum) =======================
-enum Intent { hoverCenter, goLeft, goRight, descendSlow, brakeUp }
+enum Intent { hover, goLeft, goRight, descendSlow, brakeUp }
 const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','brakeUp'];
 
 /// ===== UI-side low-level controller (no GameEngine dependency!) =====
 /// Converts an intent into (thrust,left,right) using only Lander/Terrain/world.
 ({bool thrust, bool left, bool right}) _controllerForIntentUI(
     Intent intent, {
-      required Lander lander,
+      required LanderState lander,
       required Terrain terrain,
       required double worldW,
       required double worldH,
     }) {
   final padCx = (terrain.padX1 + terrain.padX2) * 0.5;
-  final dx = lander.position.dx - padCx;
-  final vx = lander.velocity.dx;
-  final vy = lander.velocity.dy;
+  final dx = lander.pos.x - padCx;
+  final vx = lander.vel.x;
+  final vy = lander.vel.y;
   final angle = lander.angle;
 
   bool left = false, right = false, thrust = false;
 
-  final groundY = terrain.heightAt(lander.position.dx);
-  final height  = (groundY - lander.position.dy).clamp(0.0, 1e9);
-  final ceilingDist = (lander.position.dy - 0.0).clamp(0.0, 1e9); // UI ceiling at y=0
+  final groundY = terrain.heightAt(lander.pos.x);
+  final height  = (groundY - lander.pos.y).clamp(0.0, 1e9);
+  final ceilingDist = (lander.pos.y - 0.0).clamp(0.0, 1e9); // UI ceiling at y=0
 
   const double vxGoalAbs = 80.0;
   const double kAngV     = 0.015;
@@ -130,10 +219,10 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
   }
 
   double vxDes = switch (intent) {
-    Intent.goLeft       => -vxGoalAbs,
-    Intent.goRight      =>  vxGoalAbs,
-    Intent.hoverCenter  => -kDxHover * dx,
-    _                   => 0.0,
+    Intent.goLeft   => -vxGoalAbs,
+    Intent.goRight  =>  vxGoalAbs,
+    Intent.hover    => -kDxHover * dx,
+    _               => 0.0,
   };
 
   final vxErr = (vxDes - vx);
@@ -178,34 +267,29 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
   }
 
   // UI hard ceiling at y=0
-  if (lander.position.dy < 4) thrust = false;
+  if (lander.pos.y < 4) thrust = false;
 
   return (thrust: thrust, left: left, right: right);
 }
 
 /// =================== Two-stage runtime policy (planner) ===================
 class RuntimeTwoStagePolicy {
-  final int inputSize, h1, h2;
-
-  // Trunk
-  final List<List<double>> W1, W2;
-  final List<double> b1, b2;
-
-  // Legacy action heads (loaded for compatibility)
-  final List<List<double>> W_thr, W_turn;
-  final List<double> b_thr, b_turn;
-
-  // Two-stage heads
-  final List<List<double>> W_intent; // (K, h2)
-  final List<double> b_intent;       // (K)
-
-  // Critic
-  final List<List<double>> W_val;    // (1, h2)
-  final List<double> b_val;          // (1)
+  // Architecture (inferred)
+  final int inputSize;
+  final _MLP trunk; // arbitrary hidden layers (tanh)
+  final _Linear headIntent; // (K, Hlast)
+  // (Optionally loaded; unused by UI planner, kept for compatibility)
+  final _Linear? headTurn;  // (3, Hlast)
+  final _Linear? headThr;   // (1, Hlast)
+  final _Linear? headVal;   // (1, Hlast)
 
   // FE & planner config
   final RuntimeFeatureExtractor fe;
-  final int planHold;                // frames to hold an intent
+  final int planHold; // frames to hold an intent
+
+  // Saved feature normalization (optional)
+  final _RuntimeNorm? norm;
+  final String? signature;
 
   // Planner state
   int _framesLeft = 0;
@@ -214,24 +298,20 @@ class RuntimeTwoStagePolicy {
 
   RuntimeTwoStagePolicy._({
     required this.inputSize,
-    required this.h1,
-    required this.h2,
-    required this.W1,
-    required this.b1,
-    required this.W2,
-    required this.b2,
-    required this.W_thr,
-    required this.b_thr,
-    required this.W_turn,
-    required this.b_turn,
-    required this.W_intent,
-    required this.b_intent,
-    required this.W_val,
-    required this.b_val,
+    required this.trunk,
+    required this.headIntent,
+    this.headTurn,
+    this.headThr,
+    this.headVal,
     required this.fe,
     required this.planHold,
+    required this.norm,
+    required this.signature,
   });
 
+  /// Create from JSON string. Supports:
+  ///  - v2 format: { arch.hidden, trunk: [{W,b},...], heads: {intent,turn,thr,val}, signature, norm{...} }
+  ///  - legacy v1: inputSize/h1/h2, W1/W2/b1/b2, W_intent/b_intent, ...
   static RuntimeTwoStagePolicy fromJson(
       String jsonString, {
         RuntimeFeatureExtractor? fe,
@@ -244,54 +324,153 @@ class RuntimeTwoStagePolicy {
     List<double> _as1d(dynamic v) =>
         (v as List).map<double>((x)=> (x as num).toDouble()).toList();
 
-    final inputSize = j['inputSize'] as int;
-    final h1 = j['h1'] as int;
-    final h2 = j['h2'] as int;
+    _RuntimeNorm? _readNorm(Map<String, dynamic> root, int expectDim, String? expectSig) {
+      // prefer nested 'norm'
+      final nm = (root['norm'] as Map?)?.cast<String, dynamic>();
+      if (nm != null) {
+        final dim = (nm['dim'] as num?)?.toInt() ?? -1;
+        final sig = nm['signature'] as String?;
+        if (dim == expectDim && (expectSig == null || sig == expectSig)) {
+          return _RuntimeNorm(dim,
+              mean: _as1d(nm['mean']),
+              var_: _as1d(nm['var']));
+        }
+      }
+      // fallback to legacy top-level triplet (guard by signature if present)
+      final nmv = root['norm_mean'];
+      final nvv = root['norm_var'];
+      final nsig = root['norm_signature'];
+      if (nmv is List && nvv is List) {
+        if (expectSig == null || nsig == expectSig) {
+          final mean = _as1d(nmv);
+          final var_ = _as1d(nvv);
+          if (mean.length == expectDim && var_.length == expectDim) {
+            return _RuntimeNorm(expectDim, mean: mean, var_: var_);
+          }
+        }
+      }
+      return null;
+    }
+
+    // v2 path?
+    final arch = (j['arch'] as Map?)?.cast<String, dynamic>();
+    final trunkJ = (j['trunk'] as List?)?.cast<dynamic>();
+    final headsJ = (j['heads'] as Map?)?.cast<String, dynamic>();
+    final v2 = (arch != null && trunkJ != null && headsJ != null);
+
+    if (v2) {
+      final inputSize = (arch!['input'] as num).toInt();
+      final hidden = (arch['hidden'] as List).map((e) => (e as num).toInt()).toList();
+      final sig = j['signature'] as String?;
+
+      // build trunk
+      final layers = <_Linear>[];
+      int expectIn = inputSize;
+      for (int li = 0; li < trunkJ!.length; li++) {
+        final layerObj = (trunkJ[li] as Map).cast<String, dynamic>();
+        final W = _as2d(layerObj['W']);
+        final b = _as1d(layerObj['b']);
+        // shape check (best effort)
+        if (W.isEmpty || W[0].length != expectIn || W.length != b.length) {
+          throw StateError('Trunk layer $li has mismatched shape (got ${W.length}x${W[0].length}, bias ${b.length}, expected in=$expectIn).');
+        }
+        layers.add(_Linear(W, b));
+        expectIn = b.length;
+      }
+      final trunk = _MLP(layers);
+      final lastDim = trunk.outDim;
+
+      // heads
+      _Linear _readHead(String key) {
+        final hj = (headsJ![key] as Map).cast<String, dynamic>();
+        final W = _as2d(hj['W']);
+        final b = _as1d(hj['b']);
+        if (W.isEmpty || W[0].length != lastDim || W.length != b.length) {
+          throw StateError('Head "$key" shape mismatch.');
+        }
+        return _Linear(W, b);
+      }
+
+      final headIntent = _readHead('intent');
+      _Linear? headTurn, headThr, headVal;
+      if (headsJ.containsKey('turn')) headTurn = _readHead('turn');
+      if (headsJ.containsKey('thr'))  headThr  = _readHead('thr');
+      if (headsJ.containsKey('val'))  headVal  = _readHead('val');
+
+      final fe0 = fe ??
+          RuntimeFeatureExtractor(
+            groundSamples: ((j['feature_extractor']?['groundSamples'] ?? 3) as num).toInt(),
+            stridePx: ((j['feature_extractor']?['stridePx'] ?? 48) as num).toDouble(),
+          );
+
+      final norm = _readNorm(j, fe0.inputSize, sig);
+
+      return RuntimeTwoStagePolicy._(
+        inputSize: inputSize,
+        trunk: trunk,
+        headIntent: headIntent,
+        headTurn: headTurn,
+        headThr: headThr,
+        headVal: headVal,
+        fe: fe0,
+        planHold: planHold,
+        norm: norm,
+        signature: sig,
+      );
+    }
+
+    // ----- Legacy v1 loader (W1/W2/... with two hidden tanh layers) -----
+    final inputSize = (j['inputSize'] as num).toInt();
+    final h1 = (j['h1'] as num).toInt();
+    final h2 = (j['h2'] as num).toInt();
 
     final W1 = _as2d(j['W1']); final b1 = _as1d(j['b1']);
     final W2 = _as2d(j['W2']); final b2 = _as1d(j['b2']);
-    final W_thr = _as2d(j['W_thr']); final b_thr = _as1d(j['b_thr']);
-    final W_turn = _as2d(j['W_turn']); final b_turn = _as1d(j['b_turn']);
 
-    // Two-stage bits (must exist for planner runtime)
-    final W_intent = _as2d(j['W_intent']);
-    final b_intent = _as1d(j['b_intent']);
-    final W_val = _as2d(j['W_val']);
-    final b_val = _as1d(j['b_val']);
+    final W_intent = _as2d(j['W_intent']); final b_intent = _as1d(j['b_intent']);
+
+    _Linear? headTurn, headThr, headVal;
+    if (j.containsKey('W_turn') && j.containsKey('b_turn')) {
+      headTurn = _Linear(_as2d(j['W_turn']), _as1d(j['b_turn']));
+    }
+    if (j.containsKey('W_thr') && j.containsKey('b_thr')) {
+      headThr = _Linear(_as2d(j['W_thr']), _as1d(j['b_thr']));
+    }
+    if (j.containsKey('W_val') && j.containsKey('b_val')) {
+      headVal = _Linear(_as2d(j['W_val']), _as1d(j['b_val']));
+    }
+
+    // Build equivalent trunk (two layers, tanh)
+    final trunk = _MLP([_Linear(W1, b1), _Linear(W2, b2)]);
+    final headIntent = _Linear(W_intent, b_intent);
 
     final fe0 = fe ??
         RuntimeFeatureExtractor(
-          groundSamples: (j['fe']?['groundSamples'] ?? 3) as int,
-          stridePx: ((j['fe']?['stridePx'] ?? 48) as num).toDouble(),
+          groundSamples: ((j['fe']?['groundSamples'] ?? j['feature_extractor']?['groundSamples'] ?? 3) as num).toInt(),
+          stridePx: ((j['fe']?['stridePx'] ?? j['feature_extractor']?['stridePx'] ?? 48) as num).toDouble(),
         );
 
-    // shape checks
-    void _expect(bool c, String m) { if (!c) throw StateError(m); }
-    _expect(W1.length == h1 && W1[0].length == inputSize, 'W1 shape');
-    _expect(b1.length == h1, 'b1 len');
-    _expect(W2.length == h2 && W2[0].length == h1, 'W2 shape');
-    _expect(b2.length == h2, 'b2 len');
-    _expect(W_thr.length == 1 && W_thr[0].length == h2, 'W_thr shape');
-    _expect(b_thr.length == 1, 'b_thr len');
-    _expect(W_turn.length == 3 && W_turn[0].length == h2, 'W_turn shape');
-    _expect(b_turn.length == 3, 'b_turn len');
-    _expect(W_intent[0].length == h2, 'W_intent shape');
-    _expect(b_intent.length == W_intent.length, 'b_intent len');
-    _expect(W_val.length == 1 && W_val[0].length == h2, 'W_val shape');
-    _expect(b_val.length == 1, 'b_val len');
-    _expect(fe0.inputSize == inputSize, 'feature size mismatch');
+    final sig = j['signature'] as String?;
+    final norm = _readNorm(j, fe0.inputSize, sig);
 
     return RuntimeTwoStagePolicy._(
-      inputSize: inputSize, h1: h1, h2: h2,
-      W1: W1, b1: b1, W2: W2, b2: b2,
-      W_thr: W_thr, b_thr: b_thr, W_turn: W_turn, b_turn: b_turn,
-      W_intent: W_intent, b_intent: b_intent,
-      W_val: W_val, b_val: b_val,
-      fe: fe0, planHold: planHold,
+      inputSize: inputSize,
+      trunk: trunk,
+      headIntent: headIntent,
+      headTurn: headTurn,
+      headThr: headThr,
+      headVal: headVal,
+      fe: fe0,
+      planHold: planHold,
+      norm: norm,
+      signature: sig,
     );
   }
 
-  static Future<RuntimeTwoStagePolicy> loadFromAsset(String assetPath, {int planHold = 12}) async {
+  static Future<RuntimeTwoStagePolicy> loadFromAsset(
+      String assetPath, {
+        int planHold = 12,
+      }) async {
     final js = await rootBundle.loadString(assetPath);
     return RuntimeTwoStagePolicy.fromJson(js, planHold: planHold);
   }
@@ -303,24 +482,29 @@ class RuntimeTwoStagePolicy {
   ///
   /// Returns low-level control AND the chosen intent index + probs for zero-lag HUD.
   (bool thrust, bool left, bool right, int intentIdx, List<double> probs) actWithIntent({
-    required Lander lander,
+    required LanderState lander,
     required Terrain terrain,
     required double worldW,
     required double worldH,
     int step = 0,
+    double uiMaxFuel = 100.0, // match what you pass to FE at training-time if needed
   }) {
     // Re-plan if needed
     if (_framesLeft <= 0) {
-      final x = fe.extract(lander: lander, terrain: terrain, worldW: worldW, worldH: worldH);
+      var x = fe.extract(
+        lander: lander,
+        terrain: terrain,
+        worldW: worldW,
+        worldH: worldH,
+        uiMaxFuel: uiMaxFuel,
+      );
+      if (norm != null) x = norm!.apply(x);
 
-      // trunk
-      final z1 = _vecAdd(_matVec(W1, x), b1);
-      final h1v = _reluVec(z1);
-      final z2 = _vecAdd(_matVec(W2, h1v), b2);
-      final h2v = _reluVec(z2);
+      // trunk forward
+      final h = trunk.forward(x);
 
       // intent head (greedy at runtime)
-      final logits = _vecAdd(_matVec(W_intent, h2v), b_intent);
+      final logits = headIntent.forward(h);
       final probs = _softmax(logits);
       final idx = _argmax(probs);
 

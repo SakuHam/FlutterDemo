@@ -4,10 +4,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
 
 // Engine
+import 'engine/types.dart' as et;
 import 'engine/types.dart';
 import 'engine/game_engine.dart';
 import 'engine/raycast.dart';
 import 'engine/polygon_carver.dart';
+
+// Runtime policy (AI)
+import 'ai/runtime_policy.dart';
 
 /// Simple UI particle for exhaust/smoke
 class Particle {
@@ -46,10 +50,38 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   double _brushRadius = 28.0;
   bool _carveMode = true;
 
+  // ===== AI runtime policy =====
+  RuntimeTwoStagePolicy? _policy;   // loaded async from assets
+  bool get _aiReady => _policy != null;
+
+  // HUD: last AI intent/probs (optional)
+  int? _lastIntentIdx;
+  List<double> _lastIntentProbs = const [];
+
   @override
   void initState() {
     super.initState();
     _ticker = createTicker(_onTick)..start();
+    _loadPolicy(); // fire-and-forget asset load
+  }
+
+  Future<void> _loadPolicy() async {
+    try {
+      // Adjust asset path if you save with a different name
+      final p = await RuntimeTwoStagePolicy.loadFromAsset(
+        'assets/ai/policy.json',
+        planHold: 2, // re-plan every 2 frames for smoothness; tweak as you like
+      );
+      if (!mounted) return;
+      setState(() {
+        _policy = p;
+      });
+      _toast('AI model loaded');
+    } catch (e) {
+      // Non-fatal: user can still play with manual controls
+      debugPrint('Failed to load AI policy: $e');
+      _toast('AI model failed to load');
+    }
   }
 
   @override
@@ -82,15 +114,25 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
   void _reset() {
     _engine?.reset();
+    _policy?.resetPlanner(); // also reset the planner
     _particles.clear();
     _thrust = _left = _right = false;
+    _lastIntentIdx = null;
+    _lastIntentProbs = const [];
     setState(() {});
   }
 
   void _toggleAI() {
+    if (!_aiReady) {
+      _toast('AI not loaded yet');
+      return;
+    }
     setState(() {
       _aiPlay = !_aiPlay;
-      if (_aiPlay) _thrust = _left = _right = false;
+      if (_aiPlay) {
+        _policy?.resetPlanner();
+        _thrust = _left = _right = false;
+      }
     });
     _toast(_aiPlay ? 'AI: ON' : 'AI: OFF');
   }
@@ -122,11 +164,25 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     if (engine.status != GameStatus.playing) return;
 
     // If AI is on, compute controls (override manual)
-    if (_aiPlay) {
-      final u = _aiHeuristic(engine);
-      _thrust = u.thrust;
-      _left = u.left;
-      _right = u.right;
+    if (_aiPlay && _aiReady) {
+      final lander = engine.lander;     // et.LanderState
+      final terr = engine.terrain;      // et.Terrain
+
+      final (th, lf, rt, idx, probs) = _policy!.actWithIntent(
+        lander: lander,
+        terrain: terr,
+        worldW: engine.cfg.worldW,
+        worldH: engine.cfg.worldH,
+        step: 0,
+        uiMaxFuel: engine.cfg.t.maxFuel,
+      );
+
+      _thrust = th;
+      _left = lf;
+      _right = rt;
+
+      _lastIntentIdx = idx;
+      _lastIntentProbs = probs;
     }
 
     final info = engine.step(
@@ -165,44 +221,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     }
 
     setState(() {});
-  }
-
-  /// Lightweight heuristic autopilot
-  ControlInput _aiHeuristic(GameEngine engine) {
-    final s = engine.lander;
-    final terrain = engine.terrain;
-
-    final padX = terrain.padCenter;
-    final dx = (padX - s.pos.x);
-    final vx = s.vel.x;
-    final vy = s.vel.y;  // + down
-    final angle = s.angle;
-
-    final groundY = terrain.heightAt(s.pos.x);
-    final alt = groundY.isFinite ? (groundY - s.pos.y) : 9999.0;
-
-    final kx = 0.0009;
-    final kv = 0.020;
-    double targetAng = (kx * dx + kv * vx).clamp(-0.6, 0.6);
-    if (alt < 80) targetAng *= (alt / 80).clamp(0.0, 1.0);
-
-    const dead = 0.03;
-    bool left = false, right = false;
-    if (angle < targetAng - dead) right = true;
-    else if (angle > targetAng + dead) left = true;
-
-    double targetVy = 60.0;
-    if (alt < 200) targetVy = 45.0;
-    if (alt < 120) targetVy = 32.0;
-    if (alt < 60)  targetVy = 22.0;
-    if (alt < 30)  targetVy = 14.0;
-
-    bool thrust = (vy > targetVy);
-    if (alt < 50 && angle.abs() > 0.35) thrust = true;
-    if ((dx).abs() < (engine.cfg.worldW * 0.03) && alt < 26 && vy > 8.0) thrust = true;
-    if (s.fuel <= 0.0) thrust = false;
-
-    return ControlInput(thrust: thrust, left: left, right: right);
   }
 
   // ------------ Carving ------------
@@ -306,6 +324,33 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             ),
                           ),
                           const Spacer(),
+                          if (_aiReady)
+                            Tooltip(
+                              message: _lastIntentIdx == null
+                                  ? 'AI idle'
+                                  : 'AI intent: ${kIntentNames[_lastIntentIdx!.clamp(0, kIntentNames.length - 1)]}',
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                decoration: BoxDecoration(
+                                  color: Colors.black.withOpacity(0.45),
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(color: Colors.white24),
+                                ),
+                                child: Row(
+                                  children: [
+                                    const Icon(Icons.bolt, size: 16, color: Colors.white70),
+                                    const SizedBox(width: 6),
+                                    Text(
+                                      _lastIntentIdx == null
+                                          ? 'AI ready'
+                                          : kIntentNames[_lastIntentIdx!.clamp(0, kIntentNames.length - 1)],
+                                      style: const TextStyle(color: Colors.white),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          const SizedBox(width: 8),
                           _aiToggleIcon(),
                           const SizedBox(width: 8),
                           FilterChip(
@@ -401,7 +446,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   Widget _aiToggleIcon() {
     final active = _aiPlay;
     return Tooltip(
-      message: active ? 'AI Play: ON' : 'AI Play: OFF',
+      message: _aiReady
+          ? (active ? 'AI Play: ON' : 'AI Play: OFF')
+          : 'AI loading…',
       child: InkResponse(
         onTap: _toggleAI,
         radius: 24,
@@ -414,7 +461,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
           ),
           child: Icon(
             Icons.smart_toy_outlined,
-            color: active ? Colors.greenAccent : Colors.white70,
+            color: active ? Colors.greenAccent : (_aiReady ? Colors.white70 : Colors.orangeAccent),
             size: 22,
           ),
         ),
@@ -493,8 +540,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 /// Painter that draws polygon terrain (light gray), pad-highlighted edges,
 /// 360° rays, particles, and the lander triangle.
 class GamePainter extends CustomPainter {
-  final LanderState lander;
-  final Terrain terrain;
+  final et.LanderState lander;
+  final et.Terrain terrain;
   final bool thrusting;
   final GameStatus status;
   final List<Particle> particles;
@@ -590,7 +637,7 @@ class GamePainter extends CustomPainter {
       ..strokeWidth = 1
       ..color = Colors.blueAccent.withOpacity(0.55);
 
-    // >>> Terrain rays now RED for visibility <<<
+    // Terrain rays now RED for visibility
     final terrPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.2
@@ -658,14 +705,13 @@ class GamePainter extends CustomPainter {
 
     if (thrusting && lander.fuel > 0) {
       final flameBase = pos + rot(const Offset(0, halfH));
-      final flameTip = pos + rot(const Offset(0, halfH + 22));
       final flamePaint = Paint()
         ..shader = const RadialGradient(colors: [Colors.yellow, Colors.deepOrange]).createShader(
           Rect.fromCircle(center: flameBase, radius: 24),
         );
       final flamePath = Path()
         ..moveTo(flameBase.dx - 6, flameBase.dy)
-        ..quadraticBezierTo(flameBase.dx, flameTip.dy, flameBase.dx + 6, flameBase.dy)
+        ..quadraticBezierTo(flameBase.dx, flameBase.dy + 22, flameBase.dx + 6, flameBase.dy)
         ..close();
       canvas.drawPath(flamePath, flamePaint);
     }
