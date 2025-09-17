@@ -1,7 +1,7 @@
 // lib/ai/agent.dart
 import 'dart:math' as math;
 import '../engine/raycast.dart';
-import 'nn_helper.dart' as nn;                 // <— helper
+import 'nn_helper.dart' as nn;                 // helper (unchanged)
 import '../engine/types.dart' as et;
 import '../engine/game_engine.dart' as eng;
 
@@ -58,7 +58,6 @@ class RunningNorm {
 
   void observe(List<double> x) {
     if (x.length != dim) {
-      // Make it resilient to FE length changes (e.g., switching to rays)
       _resizeTo(x.length);
     }
     if (!inited) {
@@ -94,7 +93,7 @@ class RunningNorm {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                             FEATURE EXTRACTOR                               */
+/*                             FEATURE EXTRACTORS                              */
 /* -------------------------------------------------------------------------- */
 
 class FeatureExtractor {
@@ -149,7 +148,7 @@ class FeatureExtractor {
   }
 }
 
-/// Ray-based features: lander scalars + per-ray channels (no pad pos, no terrain samples).
+/// Ray-based features: lander scalars + per-ray channels.
 /// Scalars (6): [px/W, py/H, vx/200, vy/200, ang/pi, fuel/maxFuel]
 /// Per-ray:
 ///   kindsOneHot=false -> [distNorm]
@@ -166,7 +165,6 @@ class FeatureExtractorRays {
     final W = env.cfg.worldW.toDouble();
     final H = env.cfg.worldH.toDouble();
 
-    // 6 lander scalars
     final px = (L.pos.x.toDouble() / W);
     final py = (L.pos.y.toDouble() / H);
     final vx = (L.vel.x.toDouble() / 200.0).clamp(-3.0, 3.0);
@@ -175,18 +173,12 @@ class FeatureExtractorRays {
     final fuel = (L.fuel / (env.cfg.t.maxFuel > 0 ? env.cfg.t.maxFuel : 1.0)).clamp(0.0, 1.0);
 
     final out = <double>[px, py, vx, vy, ang, fuel];
-
-    // normalize distances by world diagonal
     final maxD = math.sqrt(W * W + H * H);
-
-    // env.rays should contain the last cast rays (ensure GameEngine is configured to fill it)
     final rays = env.rays ?? const <RayHit>[];
 
-    // pad/truncate to a deterministic length
     for (int i = 0; i < rayCount; i++) {
       RayHit? rh = (i < rays.length) ? rays[i] : null;
 
-      // distance from lander to hit (or maxD if missing)
       double d;
       if (rh == null) {
         d = maxD;
@@ -334,7 +326,7 @@ class PolicyNetwork {
   static const int kIntents = 5;
 
   final int inputSize;
-  final List<int> hidden;     // e.g., [64,64] or [96,96,64]
+  final List<int> hidden;
   final nn.MLPTrunk trunk;
   final nn.PolicyHeads heads;
 
@@ -393,18 +385,19 @@ class PolicyNetwork {
   }
 
   void updateFromEpisode({
-    required List<ForwardCache> decisionCaches,
-    required List<int> intentChoices,
-    required List<double> decisionReturns,
-    required List<int> alignLabels,
-    required double alignWeight,
+    required List<ForwardCache> decisionCaches,     // for intent head
+    required List<int> intentChoices,              // chosen intents
+    required List<double> decisionReturns,         // advantages (can be signed)
+    required List<int> alignLabels,                // teacher labels for intent
+    required double alignWeight,                   // CE supervision
+    required double intentPgWeight,                // PG on intent
     required double lr,
     required double entropyBeta,
     required double valueBeta,
     required double huberDelta,
     required bool intentMode,
 
-    List<ForwardCache>? actionCaches,
+    List<ForwardCache>? actionCaches,              // action supervision (turn/thr)
     List<int>? actionTurnTargets,
     List<bool>? actionThrustTargets,
     double actionAlignWeight = 0.0,
@@ -438,26 +431,58 @@ class PolicyNetwork {
             (_) => List<double>.filled(heads.thr.W[0].length, 0.0));
     final gb_thr = List<double>.filled(heads.thr.b.length, 0.0);
 
-    // ----- Intent CE (supervised) -----
+    // ----- Intent Supervision (CE) -----
     if (intentMode && alignWeight > 0 && decisionCaches.isNotEmpty) {
       final N = decisionCaches.length;
       for (int n = 0; n < N; n++) {
         final c = decisionCaches[n];
         final h = c.acts.last;
         final y = alignLabels[n].clamp(0, kIntents - 1);
-        final dLog = nn.Ops.crossEntropyGrad(c.intentProbs, y); // p - y
+        final dLog = nn.Ops.crossEntropyGrad(c.intentProbs, y); // (p - y)
 
         final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
+        trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk);
+      }
+      final scale = lr * alignWeight / N;
+      for (int i = 0; i < heads.intent.b.length; i++) {
+        heads.intent.b[i] -= _clipGrad(scale * gb_int[i]);
+        for (int j = 0; j < heads.intent.W[0].length; j++) {
+          heads.intent.W[i][j] -= _clipGrad(scale * gW_int[i][j]);
+        }
+      }
+      // zero accumulators (so CE and PG don't double-apply same grads)
+      for (int i = 0; i < gb_int.length; i++) gb_int[i] = 0.0;
+      for (int i = 0; i < gW_int.length; i++) {
+        for (int j = 0; j < gW_int[0].length; j++) gW_int[i][j] = 0.0;
+      }
+      for (int li = 0; li < gb_trunk.length; li++) {
+        for (int j = 0; j < gb_trunk[li].length; j++) gb_trunk[li][j] = 0.0;
+        for (int r = 0; r < gW_trunk[li].length; r++) {
+          for (int c2 = 0; c2 < gW_trunk[li][0].length; c2++) gW_trunk[li][r][c2] = 0.0;
+        }
+      }
+    }
 
-        trunk.backwardFromTopGrad(
-          dTop: dH,
-          acts: c.acts,
-          gW: gW_trunk,
-          gb: gb_trunk,
+    // ----- Intent PG (REINFORCE with advantage) -----
+    if (intentPgWeight > 0 && decisionCaches.isNotEmpty) {
+      final N = decisionCaches.length;
+      for (int n = 0; n < N; n++) {
+        final c = decisionCaches[n];
+        final h = c.acts.last;
+        final chosen = intentChoices[n].clamp(0, kIntents - 1);
+        final adv = decisionReturns[n]; // signed advantage
+
+        // dL/dlogits = -adv * (onehot(chosen) - p)  ==  adv * (p - onehot)
+        final dLog = List<double>.generate(
+          c.intentProbs.length,
+              (i) => (c.intentProbs[i] - (i == chosen ? 1.0 : 0.0)) * (-adv), // -adv*(p-y) => gradient descent does '+' with _clip
         );
+
+        final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
+        trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk);
       }
 
-      final scale = lr * alignWeight / N;
+      final scale = lr * intentPgWeight / decisionCaches.length;
       for (int i = 0; i < heads.intent.b.length; i++) {
         heads.intent.b[i] -= _clipGrad(scale * gb_int[i]);
         for (int j = 0; j < heads.intent.W[0].length; j++) {
@@ -527,7 +552,7 @@ class PolicyNetwork {
     }
 
     // ----- Apply trunk update (shared grads) -----
-    final trunkScale = lr; // same step; grads accumulated above
+    final trunkScale = lr; // same step
     for (int li = 0; li < trunk.layers.length; li++) {
       final L = trunk.layers[li];
       final gb = gb_trunk[li];
@@ -550,7 +575,7 @@ class EpisodeResult {
   final int steps;
   final double totalCost;
   final bool landed;
-  final double segMean; // mean per-frame segment score (raw; higher is better)
+  final double segMean; // mean per-frame segment score (higher is better)
   EpisodeResult({
     required this.steps,
     required this.totalCost,
@@ -573,28 +598,26 @@ class Trainer {
   final bool useLearnedController;
   final double blendPolicy; // probability-space blend for thrust
   final double intentAlignWeight;
+  final double intentPgWeight;     // NEW: PG strength
   final double actionAlignWeight;
   final bool normalizeFeatures;
 
-  final bool segmentAsCost;
+  final bool segmentAsCost;        // keep for compatibility; we use score as advantage
 
-  // --- Gating & logging (new) ---
-  final double gateSeg;         // accept only if segMean <= gateSeg (default: +inf)
-  final bool gateOnlyLanded;    // accept only landed episodes
-  final bool gateVerbose;       // print [TRAIN] accepted/skipped
+  // --- Gating & logging (inside Trainer) ---
+  final double gateScoreMin;       // accept only if segMean >= gateScoreMin
+  final bool gateOnlyLanded;       // accept only landed episodes
+  final bool gateVerbose;          // print [TRAIN] accepted/skipped
 
   final RunningNorm? norm;
   int _epCounter = 0;
 
-  double _segEma = 0.0;
-  int _segDecisions = 0;
-  int _segPrintEvery = 400;
+  // Advantage baseline (EMA of per-frame scores)
+  double _scoreEma = 0.0;
+  bool _scoreEmaInit = false;
 
+  // Telemetry helpers
   double _prevAbsDx = double.nan;
-  int _segPadZoneDec = 0;
-  double _segMeanOverspeed = 0.0;
-  int _segThrustNearGroundOn = 0;
-  int _segThrustNearGroundTotal = 0;
 
   // PWM thrust state
   double _pwmA = 0.0;
@@ -615,69 +638,20 @@ class Trainer {
     required this.useLearnedController,
     required this.blendPolicy,
     required this.intentAlignWeight,
+    this.intentPgWeight = 0.6,       // default PG weight
     required this.actionAlignWeight,
     required this.normalizeFeatures,
-    bool segmentAsCost = true,
+    bool segmentAsCost = false,
 
-    // new defaults
-    this.gateSeg = double.infinity,
+    // gating
+    this.gateScoreMin = -double.infinity,
     this.gateOnlyLanded = false,
-    this.gateVerbose = false,
+    this.gateVerbose = true,
   })  : segmentAsCost = segmentAsCost,
         norm = RunningNorm(fe.inputSize, momentum: 0.995);
 
-  void _segTelemetryReset() {
-    _segEma = 0.0;
-    _segDecisions = 0;
-    _segPadZoneDec = 0;
-    _segMeanOverspeed = 0.0;
-    _segThrustNearGroundOn = 0;
-    _segThrustNearGroundTotal = 0;
-  }
-
-  void _segTelemetryTick(eng.GameEngine env, double segScore, bool thrustOn, {bool verbose=false}) {
-    final L = env.lander;
-    final padCx = env.terrain.padCenter.toDouble();
-    final gy = env.terrain.heightAt(L.pos.x);
-    final h = (gy - L.pos.y).toDouble();
-    final W = env.cfg.worldW.toDouble();
-    final dx = (L.pos.x - padCx).abs();
-    final vy = L.vel.y.toDouble();
-
-    final vyTarget = (0.10 * h + 8.0).clamp(8.0, 28.0);
-    final over = vy - vyTarget;
-    final overspeedPos = over > 0 ? over : 0.0;
-
-    _segEma = (_segDecisions == 0) ? segScore : (0.99 * _segEma + 0.01 * segScore);
-    _segMeanOverspeed = (_segDecisions == 0) ? overspeedPos : (0.99 * _segMeanOverspeed + 0.01 * overspeedPos);
-    _segDecisions++;
-
-    final nearGround = h < 200.0;
-    final padZone = (dx <= 0.05 * W) && (h < 140.0);
-    if (nearGround) _segThrustNearGroundTotal++;
-    if (nearGround && thrustOn) _segThrustNearGroundOn++;
-
-    if (verbose && (_segDecisions % _segPrintEvery == 0)) {
-      final padPct = (_segDecisions == 0) ? 0.0 : (100.0 * _segPadZoneDec / _segDecisions);
-      final ngThr = (_segThrustNearGroundTotal == 0) ? 0.0
-          : (100.0 * _segThrustNearGroundOn / _segThrustNearGroundTotal);
-      // debug hook
-      // print('SEG ema=${_segEma.toStringAsFixed(3)} overspeed=${_segMeanOverspeed.toStringAsFixed(2)} pad%=${padPct.toStringAsFixed(1)} thrustNearGround%=${ngThr.toStringAsFixed(1)}');
-    }
-    if (padZone) _segPadZoneDec++;
-  }
-
-  void _segTelemetryFlush({String tag='SEG'}) {
-    final padPct = (_segDecisions == 0) ? 0.0 : (100.0 * _segPadZoneDec / _segDecisions);
-    final ngThr = (_segThrustNearGroundTotal == 0) ? 0.0
-        : (100.0 * _segThrustNearGroundOn / _segThrustNearGroundTotal);
-    print('$tag summary: decisions=$_segDecisions | ema=${_segEma.toStringAsFixed(3)} '
-        '| meanOverspeed=${_segMeanOverspeed.toStringAsFixed(2)} '
-        '| padZone%=${padPct.toStringAsFixed(1)} | thrustNearGround%=${ngThr.toStringAsFixed(1)}');
-    _segTelemetryReset();
-  }
-
-  double _segmentScore(eng.GameEngine env) {
+  // --------- Segment score (dense reward; higher is better) ----------
+  double _segmentScore(eng.GameEngine env, {bool terminalBonus = false}) {
     final L = env.lander;
     final W = env.cfg.worldW.toDouble();
     final padCx = env.terrain.padCenter.toDouble();
@@ -687,7 +661,9 @@ class Trainer {
     final dx = (L.pos.x - padCx).abs();
     final vx = L.vel.x.toDouble();
     final vy = L.vel.y.toDouble();
+    final ang = L.angle.toDouble();
 
+    // Centering
     final dxNorm = (dx / (0.5 * W)).clamp(0.0, 1.0);
     final rCenterGlobal = 1.0 - dxNorm;
 
@@ -700,13 +676,16 @@ class Trainer {
       rCenterBand = math.max(0.0, 1.0 - t * t);
     } else rCenterBand = 0.0;
 
+    // Progress (deadband + forward only)
     double rProgress = 0.0;
+    const epsPx = 3.0;
     if (_prevAbsDx.isFinite) {
-      final d = (_prevAbsDx - dx).clamp(-30.0, 30.0);
-      rProgress = d / 30.0;
+      final d = _prevAbsDx - dx;
+      if (d > epsPx) rProgress = (d.clamp(0.0, 30.0) / 30.0);
     }
     _prevAbsDx = dx;
 
+    // Descent shaping (asymmetric)
     final vyTarget = (0.10 * h + 8.0).clamp(8.0, 28.0);
     final err = vy - vyTarget;
     final sigmaUnder = 7.0, sigmaOver = 5.0;
@@ -714,10 +693,14 @@ class Trainer {
     final eOver  = math.exp(-math.pow((math.max(0.0, err))/sigmaOver , 2));
     final rDescent = 0.5 * eUnder + 0.5 * eOver;
 
-    final vxPenalty = (dx <= tight) ? (- (vx.abs().clamp(0.0, 60.0) / 60.0)) : 0.0;
-    final inward = (dx > 4.0) ? (((padCx - L.pos.x) * vx) > 0 ? 1.0 : -1.0) : 0.0;
+    // Mild |vx| shaping as we approach pad (not only inside tight)
+    double vxShaping = 0.0;
+    if (dx <= soft) {
+      final targ = (dx <= tight) ? 0.0 : math.max(0.0, 60.0 * (dx - tight) / (soft - tight));
+      vxShaping = -((vx.abs() - targ).clamp(0.0, 60.0) / 60.0);
+    }
 
-    final ang = L.angle.toDouble();
+    // Level near ground
     double rLevel = 0.0;
     if (h < 160.0) {
       final angAbs = ang.abs().clamp(0.0, 0.35);
@@ -725,17 +708,32 @@ class Trainer {
       if (angAbs < 0.05) rLevel += 0.25;
     }
 
+    // Soft penalties
     double score =
         5.0 * rCenterGlobal +
             4.0 * rDescent +
             3.0 * rCenterBand +
             2.0 * rProgress +
-            0.6 * inward +
-            1.5 * vxPenalty +
+            1.0 * vxShaping +
             1.2 * rLevel;
 
     if (dx > soft) score -= 0.4;
     if (h < 120.0 && vy > 38.0) score -= 2.5;
+
+    // Small fuel efficiency pressure
+    final fuelFrac = env.lander.fuel / env.cfg.t.maxFuel;
+    score += -0.10 * (1.0 - fuelFrac);
+
+    // Optional terminal shaping (called once at terminal)
+    if (terminalBonus) {
+      if (env.status == et.GameStatus.landed) {
+        score += 10.0;
+      } else {
+        // scale crash penalty by impact
+        final spd = (L.vel.y.abs() + L.vel.x.abs()).clamp(0.0, 120.0);
+        score -= 6.0 + 0.04 * spd;
+      }
+    }
 
     return score;
   }
@@ -761,7 +759,7 @@ class Trainer {
   EpisodeResult runEpisode({
     required bool train,
     required bool greedy,
-    required bool scoreIsReward,
+    required bool scoreIsReward,   // kept for API compat; unused (we use score as advantage)
     double lr = 3e-4,
     double valueBeta = 0.5,
     double huberDelta = 1.0,
@@ -774,7 +772,7 @@ class Trainer {
 
     final decisionCaches = <ForwardCache>[];
     final intentChoices = <int>[];
-    final decisionReturns = <double>[];
+    final decisionReturns = <double>[]; // advantages
     final alignLabels = <int>[];
 
     env.reset(seed: r.nextInt(1 << 30));
@@ -808,12 +806,16 @@ class Trainer {
         currentIntentIdx = idx;
 
         if (train) {
+          // Advantage from delta score (EMA baseline)
+          final segHere = _segmentScore(env);
+          if (!_scoreEmaInit) { _scoreEma = segHere; _scoreEmaInit = true; }
+          _scoreEma = 0.99 * _scoreEma + 0.01 * segHere;
+          final advantage = segHere - _scoreEma;
+
           decisionCaches.add(cache);
           intentChoices.add(idx);
           alignLabels.add(yTeacher);
-          final segHere = _segmentScore(env);
-          final segRL = segmentAsCost ? -segHere : segHere;
-          decisionReturns.add(segRL);
+          decisionReturns.add(advantage);
         }
 
         // adaptive plan hold
@@ -851,7 +853,6 @@ class Trainer {
         thrustPWM = true;
         _pwmA -= 1.0;
       }
-
       if (height < 90.0 && !thrustPWM && pThrExec > 0.65) {
         thrustPWM = true;
         _pwmA = (_pwmA - 0.65).clamp(0.0, 0.999);
@@ -863,7 +864,6 @@ class Trainer {
 
       final seg = _segmentScore(env);
       segSum += seg; segCount++;
-      _segTelemetryTick(env, seg, execThrust, verbose:true);
 
       actionCaches.add(cAct);
       actionTurnTargets.add(uTeacher.left ? 0 : (uTeacher.right ? 2 : 1));
@@ -883,6 +883,9 @@ class Trainer {
 
       if (info.terminal) {
         landed = env.status == et.GameStatus.landed;
+        // one-time terminal shaping
+        segSum += _segmentScore(env, terminalBonus: true);
+        segCount++;
         break;
       }
       if (steps > 5000) break;
@@ -890,19 +893,20 @@ class Trainer {
 
     final segMean = (segCount > 0) ? (segSum / segCount) : 0.0;
 
-    // ---- GATED UPDATE + LOGGING ----
+    // ---- GATED UPDATE + LOGGING (inside Trainer) ----
     bool accept = true;
     if (gateOnlyLanded && !landed) accept = false;
-    if (segMean > gateSeg) accept = false;
+    if (segMean < gateScoreMin) accept = false;   // score is "higher is better"
 
     if (train) {
       if (accept && (decisionCaches.isNotEmpty || actionCaches.isNotEmpty)) {
         policy.updateFromEpisode(
           decisionCaches: decisionCaches,
           intentChoices: intentChoices,
-          decisionReturns: decisionReturns,
+          decisionReturns: decisionReturns,   // advantages
           alignLabels: alignLabels,
           alignWeight: intentAlignWeight,
+          intentPgWeight: intentPgWeight,
           lr: lr,
           entropyBeta: 0.0,
           valueBeta: valueBeta,
