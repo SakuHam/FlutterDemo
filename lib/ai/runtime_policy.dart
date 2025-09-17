@@ -5,7 +5,7 @@ import 'package:flutter/services.dart' show rootBundle;
 
 // UI types
 import 'package:flutter/material.dart' show Offset;
-import '../engine/types.dart' show LanderState, Terrain;
+import '../engine/types.dart' show LanderState, Terrain, RayHitKind;
 import '../engine/raycast.dart' show RayHit, RayHitKind; // for ray-based FE
 
 // Intent bus (runtime)
@@ -36,9 +36,6 @@ class _RuntimeFE_Legacy implements _RuntimeFE {
   @override
   int get inputSize => 10 + groundSamples;
 
-  /// Layout must mirror legacy training extractor:
-  /// [ px/W, py/H, vx/200, vy/200, ang/pi, fuel/maxFuelUI,
-  ///   padCx/W, dxPad/(0.5W), (gy - py)/300, slope/2, samples... ]
   @override
   List<double> extract({
     required LanderState lander,
@@ -84,10 +81,6 @@ class _RuntimeFE_Legacy implements _RuntimeFE {
 }
 
 /// -------- Ray-based (lander stats + ray channels) --------
-/// Scalars: [px/W, py/H, vx/200, vy/200, ang/pi, fuel/uiMaxFuel]
-/// Per ray:
-///   if kindsOneHot=false: [distNorm]
-///   if kindsOneHot=true:  [distNorm, isTerrain, isPad, isWall]
 class _RuntimeFE_Rays implements _RuntimeFE {
   final int rayCount;
   final bool kindsOneHot;
@@ -120,17 +113,24 @@ class _RuntimeFE_Rays implements _RuntimeFE {
 
     final out = <double>[px, py, vx, vy, ang, fuel];
 
-    // Normalize distance by world diagonal for stability
+    // distance normalized by world diagonal
     final maxD = math.sqrt(worldW * worldW + worldH * worldH);
 
-    // Ensure deterministic size (pad/truncate)
+    // deterministic size
     final int n = rayCount;
     for (int i = 0; i < n; i++) {
       RayHit? rh;
       if (i < rays.length) {
         rh = rays[i];
       }
-      final d = (rh == null) ? maxD : ((Offset(rh.p.x, rh.p.y) - Offset(lander.pos.x, lander.pos.y)).distance);
+      double d;
+      if (rh == null) {
+        d = maxD;
+      } else {
+        final dx = rh.p.x - lander.pos.x;
+        final dy = rh.p.y - lander.pos.y;
+        d = math.sqrt(dx * dx + dy * dy);
+      }
       final dN = (d / maxD).clamp(0.0, 1.0);
 
       if (!kindsOneHot) {
@@ -488,7 +488,6 @@ class RuntimeTwoStagePolicy {
           final kindsOneHot = ((fej['kindsOneHot'] ?? true) as bool);
           fe0 = _RuntimeFE_Rays(rayCount: rayCount, kindsOneHot: kindsOneHot);
         } else {
-          // fallback if older file encoded legacy params under this key
           final gs = ((fej['groundSamples'] ?? 3) as num).toInt();
           final stride = ((fej['stridePx'] ?? 48) as num).toDouble();
           fe0 = _RuntimeFE_Legacy(groundSamples: gs, stridePx: stride);

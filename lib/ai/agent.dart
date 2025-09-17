@@ -1,9 +1,9 @@
 // lib/ai/agent.dart
 import 'dart:math' as math;
+import '../engine/raycast.dart';
 import 'nn_helper.dart' as nn;                 // <— helper
 import '../engine/types.dart' as et;
 import '../engine/game_engine.dart' as eng;
-import '../engine/raycast.dart' as rc;
 
 /* -------------------------------------------------------------------------- */
 /*                                INTENT SET                                  */
@@ -22,12 +22,14 @@ const List<String> kIntentNames = [
 int intentToIndex(Intent i) => i.index;
 Intent indexToIntent(int k) => Intent.values[k.clamp(0, Intent.values.length - 1)];
 
+double _clip(double x, double a, double b) => x < a ? a : (x > b ? b : x);
+
 /* -------------------------------------------------------------------------- */
 /*                               RUNNING  NORM                                */
 /* -------------------------------------------------------------------------- */
 
 class RunningNorm {
-  final int dim;
+  int dim;
   List<double> mean;
   List<double> var_; // variance, not std
   double momentum;
@@ -47,9 +49,17 @@ class RunningNorm {
     inited = false;
   }
 
+  void _resizeTo(int newDim) {
+    dim = newDim;
+    mean = List<double>.filled(dim, 0.0);
+    var_  = List<double>.filled(dim, 1.0);
+    inited = false;
+  }
+
   void observe(List<double> x) {
     if (x.length != dim) {
-      throw ArgumentError('RunningNorm dim mismatch: got ${x.length}, want $dim');
+      // Make it resilient to FE length changes (e.g., switching to rays)
+      _resizeTo(x.length);
     }
     if (!inited) {
       for (int i = 0; i < dim; i++) {
@@ -73,6 +83,7 @@ class RunningNorm {
   }
 
   List<double> normalize(List<double> x, {bool update = false}) {
+    if (x.length != dim) _resizeTo(x.length);
     if (update) observe(x);
     final out = List<double>.filled(x.length, 0.0);
     for (int i = 0; i < x.length; i++) {
@@ -83,133 +94,180 @@ class RunningNorm {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                          RAY-BASED FEATURE EXTRACTOR                       */
+/*                             FEATURE EXTRACTOR                               */
 /* -------------------------------------------------------------------------- */
 
-/// Features = [ px/W, py/H, vx/200, vy/200, ang/pi, fuel/maxFuel,
-///              terrainDistNorm[0..N-1], padDistNorm[0..N-1], wallDistNorm[0..N-1] ]
-/// - No pad position, no terrain samples are fed to the net.
-/// - Distances are min-normalized per ray to the world diagonal (no hit => 1.0).
-class FeatureExtractorRays {
-  final int rayCount;         // must match env.rayCfg.rayCount at train/runtime
-  final bool forwardAligned;  // must match env.rayCfg.forwardAligned
-  FeatureExtractorRays({required this.rayCount, this.forwardAligned = true});
+class FeatureExtractor {
+  final int groundSamples;
+  final double stridePx;
 
-  int get inputSize => 6 + 3 * rayCount;
+  FeatureExtractor({this.groundSamples = 3, this.stridePx = 48});
+
+  // [px, py, vx, vy, ang, fuel, padCx, dxToPad, hAboveGround, slope, groundSamples...]
+  int get inputSize => 10 + groundSamples;
 
   List<double> extract(eng.GameEngine env) {
     final L = env.lander;
-    final cfg = env.cfg;
+    final T = env.terrain;
+    final px = L.pos.x.toDouble();
+    final py = L.pos.y.toDouble();
+    final vx = L.vel.x.toDouble();
+    final vy = L.vel.y.toDouble();
+    final ang = L.angle.toDouble();
+    final fuel = L.fuel;
 
-    // Base 6 (state)
-    final base = <double>[
-      L.pos.x / cfg.worldW,
-      L.pos.y / cfg.worldH,
-      (L.vel.x / 200.0).clamp(-3.0, 3.0),
-      (L.vel.y / 200.0).clamp(-3.0, 3.0),
-      (L.angle / math.pi).clamp(-2.0, 2.0),
-      (L.fuel / (cfg.t.maxFuel > 0 ? cfg.t.maxFuel : 1.0)).clamp(0.0, 1.0),
+    final padCx = T.padCenter.toDouble();
+    final dxToPad = (px - padCx);
+
+    final gy = T.heightAt(px);
+    final hAbove = (gy - py);
+
+    final hL = T.heightAt(_clip(px - 8.0, 0.0, env.cfg.worldW));
+    final hR = T.heightAt(_clip(px + 8.0, 0.0, env.cfg.worldW));
+    final slope = (hR - hL) / 16.0;
+
+    final feats = <double>[
+      px / env.cfg.worldW,
+      py / env.cfg.worldH,
+      vx / 200.0,
+      vy / 200.0,
+      ang / math.pi,
+      fuel / (env.cfg.t.maxFuel > 0 ? env.cfg.t.maxFuel : 1.0),
+      padCx / env.cfg.worldW,
+      dxToPad / (0.5 * env.cfg.worldW),
+      hAbove / 300.0,
+      slope / 2.0,
     ];
 
-    final diag = math.sqrt(cfg.worldW * cfg.worldW + cfg.worldH * cfg.worldH);
-    final terr = List<double>.filled(rayCount, 1.0);
-    final pad  = List<double>.filled(rayCount, 1.0);
-    final wall = List<double>.filled(rayCount, 1.0);
+    for (int i = 0; i < groundSamples; i++) {
+      final off = (i - (groundSamples ~/ 2)) * stridePx;
+      final gx = _clip(px + off, 0.0, env.cfg.worldW);
+      final gyS = T.heightAt(gx);
+      feats.add((gyS - py) / 300.0);
+    }
+    return feats;
+  }
+}
 
-    final rays = env.rays; // assumed length == rayCount and ordered by azimuth
-    final n = math.min(rayCount, rays.length);
-    for (int i = 0; i < n; i++) {
-      final h = rays[i];
-      final dx = h.p.x - L.pos.x;
-      final dy = h.p.y - L.pos.y;
-      final dN = (math.sqrt(dx*dx + dy*dy) / diag).clamp(0.0, 1.0);
+/// Ray-based features: lander scalars + per-ray channels (no pad pos, no terrain samples).
+/// Scalars (6): [px/W, py/H, vx/200, vy/200, ang/pi, fuel/maxFuel]
+/// Per-ray:
+///   kindsOneHot=false -> [distNorm]
+///   kindsOneHot=true  -> [distNorm, isTerrain, isPad, isWall]
+class FeatureExtractorRays {
+  final int rayCount;
+  final bool kindsOneHot;
+  FeatureExtractorRays({required this.rayCount, this.kindsOneHot = true});
 
-      switch (h.kind) {
-        case rc.RayHitKind.terrain:
-          if (dN < terr[i]) terr[i] = dN;
-          break;
-        case rc.RayHitKind.pad:
-          if (dN < pad[i]) pad[i] = dN;
-          break;
-        case rc.RayHitKind.wall:
-          if (dN < wall[i]) wall[i] = dN;
-          break;
+  int get inputSize => 6 + rayCount * (kindsOneHot ? 4 : 1);
+
+  List<double> extract(eng.GameEngine env) {
+    final L = env.lander;
+    final W = env.cfg.worldW.toDouble();
+    final H = env.cfg.worldH.toDouble();
+
+    // 6 lander scalars
+    final px = (L.pos.x.toDouble() / W);
+    final py = (L.pos.y.toDouble() / H);
+    final vx = (L.vel.x.toDouble() / 200.0).clamp(-3.0, 3.0);
+    final vy = (L.vel.y.toDouble() / 200.0).clamp(-3.0, 3.0);
+    final ang = (L.angle.toDouble() / math.pi).clamp(-2.0, 2.0);
+    final fuel = (L.fuel / (env.cfg.t.maxFuel > 0 ? env.cfg.t.maxFuel : 1.0)).clamp(0.0, 1.0);
+
+    final out = <double>[px, py, vx, vy, ang, fuel];
+
+    // normalize distances by world diagonal
+    final maxD = math.sqrt(W * W + H * H);
+
+    // env.rays should contain the last cast rays (ensure GameEngine is configured to fill it)
+    final rays = env.rays ?? const <RayHit>[];
+
+    // pad/truncate to a deterministic length
+    for (int i = 0; i < rayCount; i++) {
+      RayHit? rh = (i < rays.length) ? rays[i] : null;
+
+      // distance from lander to hit (or maxD if missing)
+      double d;
+      if (rh == null) {
+        d = maxD;
+      } else {
+        final dx = rh.p.x - L.pos.x;
+        final dy = rh.p.y - L.pos.y;
+        d = math.sqrt(dx * dx + dy * dy).toDouble();
+      }
+      final dN = (d / maxD).clamp(0.0, 1.0);
+
+      if (!kindsOneHot) {
+        out.add(dN);
+      } else {
+        double tTerr = 0, tPad = 0, tWall = 0;
+        if (rh != null) {
+          switch (rh.kind) {
+            case RayHitKind.terrain: tTerr = 1; break;
+            case RayHitKind.pad:     tPad  = 1; break;
+            case RayHitKind.wall:    tWall = 1; break;
+          }
+        }
+        out.addAll([dN, tTerr, tPad, tWall]);
       }
     }
 
-    return [...base, ...terr, ...pad, ...wall];
+    return out;
   }
-}
-
-/* -------------------------------------------------------------------------- */
-/*                       PAD-RAY TEACHER (ANGLE → INTENT)                     */
-/* -------------------------------------------------------------------------- */
-
-/// Extract nearest PAD hit’s angle+distance (ship frame).
-(bool present, double angle, double distNorm) _padPolarFromRays(
-    eng.GameEngine env,
-    ) {
-  final rays = env.rays;
-  if (rays.isEmpty) return (false, 0.0, 1.0);
-
-  final L = env.lander;
-  final cfg = env.cfg;
-  final maxD = math.sqrt(cfg.worldW * cfg.worldW + cfg.worldH * cfg.worldH);
-
-  bool any = false;
-  double bestD = 1e30, bestAngleShip = 0.0;
-
-  for (final h in rays) {
-    if (h.kind != rc.RayHitKind.pad) continue;
-
-    final dx = h.p.x - L.pos.x;
-    final dy = h.p.y - L.pos.y;
-    final d  = math.sqrt(dx*dx + dy*dy);
-    if (d < bestD) {
-      bestD = d;
-      // world angle of vector to hit:
-      final worldAng = math.atan2(dy, dx);
-      // ship-frame angle: subtract lander yaw
-      double a = worldAng - L.angle;
-      // wrap to [-pi, pi]
-      while (a <= -math.pi) a += 2*math.pi;
-      while (a >   math.pi) a -= 2*math.pi;
-      bestAngleShip = a;
-      any = true;
-    }
-  }
-
-  if (!any) return (false, 0.0, 1.0);
-  return (true, bestAngleShip, (bestD / maxD).clamp(0.0, 1.0));
-}
-
-/// Convert pad angle+distance (+ current vy) to an intent label.
-int intentFromPadAngle({
-  required bool present,
-  required double angle,
-  required double distNorm,
-  required double vy,            // + down
-  double leftRightThresh = 10 * math.pi / 180, // ~10°
-  double nearThresh = 0.20,      // dist near if < 0.2 of diagonal
-  double brakeVy = 45.0,
-}) {
-  if (!present) return intentToIndex(Intent.descendSlow);
-
-  // angle<0 => pad to LEFT; angle>0 => RIGHT (ship frame)
-  if (angle <= -leftRightThresh) return intentToIndex(Intent.goLeft);
-  if (angle >=  leftRightThresh) return intentToIndex(Intent.goRight);
-
-  // Almost straight below
-  if (distNorm < nearThresh) {
-    if (vy > brakeVy) return intentToIndex(Intent.brakeUp);
-    return intentToIndex(Intent.hover);
-  }
-  return intentToIndex(Intent.descendSlow);
 }
 
 /* -------------------------------------------------------------------------- */
 /*                                CONTROLLERS                                  */
 /* -------------------------------------------------------------------------- */
+
+int predictiveIntentLabelAdaptive(
+    eng.GameEngine env, {
+      double baseTauSec = 1.0,
+      double minTauSec = 0.45,
+      double maxTauSec = 2.20,
+    }) {
+  final L = env.lander;
+  final T = env.terrain;
+  final W = env.cfg.worldW.toDouble();
+  final padCx = T.padCenter.toDouble();
+
+  final px = L.pos.x.toDouble();
+  final py = L.pos.y.toDouble();
+  final vx = L.vel.x.toDouble();
+  final vy = L.vel.y.toDouble();
+
+  final gy = T.heightAt(px);
+  final h = (gy - py).toDouble();
+  final dx = px - padCx;
+
+  final hNorm = (h / 320.0).clamp(0.0, 1.6);
+  final tau = (baseTauSec * (0.7 + 0.5 * hNorm)).clamp(minTauSec, maxTauSec);
+
+  final g = env.cfg.t.gravity;
+  final dxF = dx + vx * tau;
+  final vyF = vy + g * tau;
+
+  final padEnter = 0.08 * W;
+  final padExit  = 0.14 * W;
+
+  if (h < 50 && vyF > 45) return intentToIndex(Intent.brakeUp);
+
+  if (dxF.abs() > padExit) {
+    return dxF > 0 ? intentToIndex(Intent.goRight) : intentToIndex(Intent.goLeft);
+  }
+
+  final willExitSoon = (dxF.abs() > padEnter) && (dx.abs() <= padEnter);
+  final vxIsBad = (dx.sign == vx.sign) && vx.abs() > 20.0;
+  if ((willExitSoon || vxIsBad) && h > 90) {
+    return dx >= 0 ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
+  }
+
+  if (dxF.abs() <= padEnter) {
+    return intentToIndex(Intent.descendSlow);
+  }
+
+  return dxF > 0 ? intentToIndex(Intent.goRight) : intentToIndex(Intent.goLeft);
+}
 
 et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final L = env.lander;
@@ -520,6 +578,11 @@ class Trainer {
 
   final bool segmentAsCost;
 
+  // --- Gating & logging (new) ---
+  final double gateSeg;         // accept only if segMean <= gateSeg (default: +inf)
+  final bool gateOnlyLanded;    // accept only landed episodes
+  final bool gateVerbose;       // print [TRAIN] accepted/skipped
+
   final RunningNorm? norm;
   int _epCounter = 0;
 
@@ -555,6 +618,11 @@ class Trainer {
     required this.actionAlignWeight,
     required this.normalizeFeatures,
     bool segmentAsCost = true,
+
+    // new defaults
+    this.gateSeg = double.infinity,
+    this.gateOnlyLanded = false,
+    this.gateVerbose = false,
   })  : segmentAsCost = segmentAsCost,
         norm = RunningNorm(fe.inputSize, momentum: 0.995);
 
@@ -590,7 +658,11 @@ class Trainer {
     if (nearGround && thrustOn) _segThrustNearGroundOn++;
 
     if (verbose && (_segDecisions % _segPrintEvery == 0)) {
-      // debug print spot if needed
+      final padPct = (_segDecisions == 0) ? 0.0 : (100.0 * _segPadZoneDec / _segDecisions);
+      final ngThr = (_segThrustNearGroundTotal == 0) ? 0.0
+          : (100.0 * _segThrustNearGroundOn / _segThrustNearGroundTotal);
+      // debug hook
+      // print('SEG ema=${_segEma.toStringAsFixed(3)} overspeed=${_segMeanOverspeed.toStringAsFixed(2)} pad%=${padPct.toStringAsFixed(1)} thrustNearGround%=${ngThr.toStringAsFixed(1)}');
     }
     if (padZone) _segPadZoneDec++;
   }
@@ -606,7 +678,6 @@ class Trainer {
   }
 
   double _segmentScore(eng.GameEngine env) {
-    // Keep this shaping; reward can use pad info.
     final L = env.lander;
     final W = env.cfg.worldW.toDouble();
     final padCx = env.terrain.padCenter.toDouble();
@@ -675,7 +746,7 @@ class Trainer {
       for (int i = 1; i < probs.length; i++) if (probs[i] > best) { best = probs[i]; arg = i; }
       return arg;
     }
-    final z = probs.map((p) => math.log(p.clamp(1e-12, 1.0))).toList();
+    final z = probs.map((p) => math.log(_clip(p, 1e-12, 1.0))).toList();
     for (int i = 0; i < z.length; i++) z[i] /= temp;
     final sm = nn.Ops.softmax(z);
     final u = r.nextDouble();
@@ -724,14 +795,8 @@ class Trainer {
     while (true) {
       if (framesLeft <= 0) {
         var x = fe.extract(env);
-        // Teacher from PAD rays (no pad pos)
-        final (present, ang, dN) = _padPolarFromRays(env);
-        final yTeacher = intentFromPadAngle(
-          present: present,
-          angle: ang,
-          distNorm: dN,
-          vy: env.lander.vel.y.toDouble(),
-        );
+        final yTeacher = predictiveIntentLabelAdaptive(
+            env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
 
         if (normalizeFeatures) {
           norm?.observe(x);
@@ -751,11 +816,18 @@ class Trainer {
           decisionReturns.add(segRL);
         }
 
-        // Tiny adaptive hold (doesn't use pad pos)
-        final vyAbs = env.lander.vel.y.toDouble().abs();
+        // adaptive plan hold
+        final padCx = env.terrain.padCenter.toDouble();
+        final dxAbs = (env.lander.pos.x.toDouble() - padCx).abs();
+        final vxAbs = env.lander.vel.x.toDouble().abs();
+        final gy = env.terrain.heightAt(env.lander.pos.x.toDouble());
+        final h = (gy - env.lander.pos.y).toDouble();
+        final W = env.cfg.worldW.toDouble();
+
         int dynHold = 1;
-        if (vyAbs < 25.0) dynHold = 2;
-        framesLeft = dynHold.clamp(1, planHold);
+        if (dxAbs > 0.12 * W || vxAbs > 60.0) dynHold = 1;
+        if (dynHold == 1 && h > 320.0 && dxAbs < 0.04 * W && vxAbs < 25.0) dynHold = 2;
+        framesLeft = dynHold;
       }
 
       final intent = indexToIntent(currentIntentIdx);
@@ -772,10 +844,14 @@ class Trainer {
       final pThrTeacher = uTeacher.thrust ? 1.0 : 0.0;
       final pThrExec = blendPolicy * pThrModel + (1.0 - blendPolicy) * pThrTeacher;
 
-      // Simple PWM
       _pwmA = (_pwmA + pThrExec).clamp(0.0, 10.0);
+
       bool thrustPWM = false;
-      while (_pwmA >= 1.0) { thrustPWM = true; _pwmA -= 1.0; }
+      while (_pwmA >= 1.0) {
+        thrustPWM = true;
+        _pwmA -= 1.0;
+      }
+
       if (height < 90.0 && !thrustPWM && pThrExec > 0.65) {
         thrustPWM = true;
         _pwmA = (_pwmA - 0.65).clamp(0.0, 0.999);
@@ -794,7 +870,9 @@ class Trainer {
       actionThrustTargets.add(uTeacher.thrust);
 
       _pwmCount++; if (execThrust) _pwmOn++;
-      if ((_pwmCount % 240) == 0) { _pwmCount = 0; _pwmOn = 0; }
+      if ((_pwmCount % 240) == 0) {
+        _pwmCount = 0; _pwmOn = 0;
+      }
 
       final info = env.step(dt, et.ControlInput(
         thrust: execThrust, left: execLeft, right: execRight, intentIdx: currentIntentIdx,
@@ -810,26 +888,42 @@ class Trainer {
       if (steps > 5000) break;
     }
 
-    if (train && (decisionCaches.isNotEmpty || actionCaches.isNotEmpty)) {
-      policy.updateFromEpisode(
-        decisionCaches: decisionCaches,
-        intentChoices: intentChoices,
-        decisionReturns: decisionReturns,
-        alignLabels: alignLabels,
-        alignWeight: intentAlignWeight,
-        lr: lr,
-        entropyBeta: 0.0,
-        valueBeta: 0.0,
-        huberDelta: huberDelta,
-        intentMode: true,
-        actionCaches: actionCaches,
-        actionTurnTargets: actionTurnTargets,
-        actionThrustTargets: actionThrustTargets,
-        actionAlignWeight: actionAlignWeight,
-      );
+    final segMean = (segCount > 0) ? (segSum / segCount) : 0.0;
+
+    // ---- GATED UPDATE + LOGGING ----
+    bool accept = true;
+    if (gateOnlyLanded && !landed) accept = false;
+    if (segMean > gateSeg) accept = false;
+
+    if (train) {
+      if (accept && (decisionCaches.isNotEmpty || actionCaches.isNotEmpty)) {
+        policy.updateFromEpisode(
+          decisionCaches: decisionCaches,
+          intentChoices: intentChoices,
+          decisionReturns: decisionReturns,
+          alignLabels: alignLabels,
+          alignWeight: intentAlignWeight,
+          lr: lr,
+          entropyBeta: 0.0,
+          valueBeta: valueBeta,
+          huberDelta: huberDelta,
+          intentMode: true,
+          actionCaches: actionCaches,
+          actionTurnTargets: actionTurnTargets,
+          actionThrustTargets: actionThrustTargets,
+          actionAlignWeight: actionAlignWeight,
+        );
+        if (gateVerbose) {
+          print('[TRAIN] accepted | steps=$steps | segMean=${segMean.toStringAsFixed(2)} | landed=${landed ? "Y" : "N"} '
+              '| caches: dec=${decisionCaches.length}, act=${actionCaches.length}');
+        }
+      } else {
+        if (gateVerbose) {
+          print('[TRAIN] skipped  | steps=$steps | segMean=${segMean.toStringAsFixed(2)} | landed=${landed ? "Y" : "N"}');
+        }
+      }
     }
 
-    final segMean = (segCount > 0) ? (segSum / segCount) : 0.0;
     return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: segMean);
   }
 }

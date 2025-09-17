@@ -5,9 +5,9 @@ import 'dart:math' as math;
 
 import '../engine/types.dart' as et;
 import '../engine/game_engine.dart' as eng;
-import '../engine/raycast.dart' as rc; // RayConfig, RayHitKind
+import '../engine/raycast.dart'; // RayConfig
 
-import 'agent.dart'; // FeatureExtractor (rays), PolicyNetwork, Trainer, etc.
+import 'agent.dart'; // FeatureExtractor, PolicyNetwork, Trainer, etc.
 
 /* ------------------------------- tiny arg parser ------------------------------- */
 
@@ -74,76 +74,6 @@ List<List<double>> _xavier(int out, int inp, int seed) {
   final r = math.Random(seed);
   final limit = math.sqrt(6.0 / (out + inp));
   return List.generate(out, (_) => List<double>.generate(inp, (_) => (r.nextDouble() * 2 - 1) * limit));
-}
-
-/* ------------------------------ rays-only teacher ------------------------------ */
-
-/// Find the nearest **pad** ray and return its **ship-frame** angle and normalized distance.
-/// Returns (present, angle, distNorm).
-(bool present, double angle, double distNorm) _nearestPadRayPolar(eng.GameEngine env) {
-  final rays = env.rays;
-  if (rays.isEmpty) return (false, 0.0, 1.0);
-
-  final L = env.lander;
-  final cfg = env.cfg;
-  final maxD = math.sqrt(cfg.worldW * cfg.worldW + cfg.worldH * cfg.worldH);
-
-  bool any = false;
-  double bestD = 1e30, bestAngleShip = 0.0;
-
-  for (final h in rays) {
-    if (h.kind != rc.RayHitKind.pad) continue;
-
-    final dx = h.p.x - L.pos.x;
-    final dy = h.p.y - L.pos.y;
-    final d  = math.sqrt(dx*dx + dy*dy);
-    if (d < bestD) {
-      bestD = d;
-      final worldAng = math.atan2(dy, dx);
-      // ship-frame: subtract yaw, wrap to [-pi, pi]
-      double a = worldAng - L.angle;
-      while (a <= -math.pi) a += 2 * math.pi;
-      while (a >   math.pi) a -= 2 * math.pi;
-      bestAngleShip = a;
-      any = true;
-    }
-  }
-
-  if (!any) return (false, 0.0, 1.0);
-  return (true, bestAngleShip, (bestD / maxD).clamp(0.0, 1.0));
-}
-
-/// Intent teacher that uses ONLY **pad rays** + kinematics (no pad center / terrain samples).
-int _teacherIntentFromRays(eng.GameEngine env) {
-  final L = env.lander;
-  final (_hasPad, a, dN) = _nearestPadRayPolar(env);
-
-  // Emergency brake if screaming downwards regardless of pad rays.
-  if (L.vel.y > 55.0) return 4; // brakeUp
-
-  if (!_hasPad) {
-    // No pad visible: bias to hover/slow descent based on vertical speed.
-    if (L.vel.y > 18.0) return 4;     // brakeUp if too fast
-    if (L.vel.y > 8.0)  return 3;     // descendSlow
-    return 0;                          // hover
-  }
-
-  // Angle gates in ship-frame:
-  const angDead = 12 * math.pi / 180;   // ~12°
-  const farGate = 0.30;                 // >30% of screen diag = "far"
-
-  if (a > angDead)  return 1; // goLeft  (pad is to left of nose)
-  if (a < -angDead) return 2; // goRight (pad is to right of nose)
-
-  // Angle aligned: choose descend/hover based on distance & vertical speed
-  if (dN > farGate) {
-    // far: close laterally first by gentle descend
-    return 3; // descendSlow
-  } else {
-    // near: hold hover unless falling too fast
-    if (L.vel.y > 16.0) return 3; // descendSlow to manage rate
-    return 0;                     // hover
-  }
 }
 
 /* ------------------------------- policy IO (json) ------------------------------ */
@@ -498,32 +428,69 @@ void _warmFeatureNorm({
   int accepted = 0, target = perClass * PolicyNetwork.kIntents;
 
   while (accepted < target) {
-    // randomize a state (don’t rely on pad center in the features)
-    final W = env.cfg.worldW;
-    final H = env.cfg.worldH;
-    env.lander
-      ..pos.x = (r.nextDouble() * (W - 20.0) + 10.0)
-      ..pos.y = (r.nextDouble() * (H * 0.75)).clamp(0.0, H - 10.0)
-      ..vel.x = r.nextDouble() * 160.0 - 80.0
-      ..vel.y = r.nextDouble() * 120.0 + 10.0
-      ..angle = 0.0
-      ..fuel  = env.cfg.t.maxFuel;
+    final want = r.nextInt(PolicyNetwork.kIntents);
 
-    final y = _teacherIntentFromRays(env);
-    // keep class balance by sampling “want” at random
-    if (r.nextInt(PolicyNetwork.kIntents) != y) continue;
+    final padCx = env.terrain.padCenter.toDouble();
+    final padHalfW =
+    (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5).clamp(12.0, env.cfg.worldW.toDouble());
+    double x = padCx, h = 180, vx = 0, vy = 20;
+
+    switch (want) {
+      case 1: // goLeft
+        x = (padCx - (0.22 + 0.18 * r.nextDouble()) * env.cfg.worldW).clamp(10.0, env.cfg.worldW - 10.0);
+        h = 120 + 120 * r.nextDouble();
+        vx = (r.nextDouble() * 14.0) - 7.0;
+        vy = 28.0 + 10.0 * r.nextDouble();
+        break;
+      case 2: // goRight
+        x = (padCx + (0.22 + 0.18 * r.nextDouble()) * env.cfg.worldW).clamp(10.0, env.cfg.worldW - 10.0);
+        h = 120 + 120 * r.nextDouble();
+        vx = (r.nextDouble() * 14.0) - 7.0;
+        vy = 28.0 + 10.0 * r.nextDouble();
+        break;
+      case 3: // descendSlow
+        x = padCx + (r.nextDouble() * 0.05 - 0.025) * padHalfW;
+        h = 0.55 * env.cfg.worldH + 0.20 * env.cfg.worldH * r.nextDouble();
+        vx = (r.nextDouble() * 24.0) - 12.0;
+        vy = 24.0 + 12.0 * r.nextDouble();
+        break;
+      case 4: // brakeUp
+        x = padCx + (r.nextDouble() * 0.05 - 0.025) * padHalfW;
+        h = 40.0 + 50.0 * r.nextDouble();
+        vx = (r.nextDouble() * 14.0) - 7.0;
+        vy = 120.0 + 50.0 * r.nextDouble();
+        break;
+      default: // hover
+        x = padCx + (r.nextDouble() * 0.03 - 0.015) * padHalfW;
+        h = 0.20 * env.cfg.worldH + 0.15 * env.cfg.worldH * r.nextDouble();
+        vx = (r.nextDouble() * 10.0) - 5.0;
+        vy = (r.nextDouble() * 10.0) - 5.0;
+        break;
+    }
+
+    final gy = env.terrain.heightAt(x);
+    env.lander
+      ..pos.x = x.clamp(10.0, env.cfg.worldW - 10.0)
+      ..pos.y = (gy - h).clamp(0.0, env.cfg.worldH - 10.0)
+      ..vel.x = vx
+      ..vel.y = vy
+      ..angle = 0.0
+      ..fuel = env.cfg.t.maxFuel;
+
+    if (predictiveIntentLabelAdaptive(env) != want) continue;
 
     final feat = fe.extract(env);
     _normUpdate(trainer.norm, feat);
     accepted++;
   }
-  print('Feature norm warmed with $accepted synthetic samples (rays-teacher).');
+  print('Feature norm warmed with $accepted synthetic samples.');
 }
 
 /* ---------------------------- intent pretrain (local) -------------------------- */
 
 class _PretrainIntentStats {
-  final double acc; final int n;
+  final double acc;
+  final int n;
   _PretrainIntentStats(this.acc, this.n);
 }
 
@@ -545,22 +512,61 @@ _PretrainIntentStats _pretrainIntentLocal({
   final xsByK = List.generate(K, (_) => <List<double>>[]);
   final ysByK = List.generate(K, (_) => <int>[]);
 
+  void _setState({required double x, required double height, required double vx, required double vy}) {
+    final gy = env.terrain.heightAt(x);
+    final y = (gy - height).clamp(0.0, env.cfg.worldH - 10.0);
+    env.lander.pos.x = x.clamp(10.0, env.cfg.worldW - 10.0);
+    env.lander.pos.y = y;
+    env.lander.vel.x = vx;
+    env.lander.vel.y = vy;
+    env.lander.angle = 0.0;
+    env.lander.fuel = env.cfg.t.maxFuel;
+  }
+
   env.reset(seed: 123456);
 
   bool _synthOneFor(int intentIdx, math.Random r) {
-    // randomize around screen (no pad/terrain dependence in features)
-    final W = env.cfg.worldW;
-    final H = env.cfg.worldH;
+    final padCx = env.terrain.padCenter.toDouble();
+    final padHalfW =
+    (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5).clamp(12.0, env.cfg.worldW.toDouble());
+    double x = padCx, h = 180, vx = 0, vy = 20;
 
-    env.lander
-      ..pos.x = (r.nextDouble() * (W - 20.0) + 10.0)
-      ..pos.y = (r.nextDouble() * (H * 0.80)).clamp(0.0, H - 10.0)
-      ..vel.x = r.nextDouble() * 160.0 - 80.0
-      ..vel.y = 10.0 + r.nextDouble() * 140.0
-      ..angle = 0.0
-      ..fuel  = env.cfg.t.maxFuel;
+    switch (intentIdx) {
+      case 1: // goLeft
+        x = (padCx - (0.22 + 0.18 * r.nextDouble()) * env.cfg.worldW).clamp(10.0, env.cfg.worldW - 10.0);
+        h = 120 + 120 * r.nextDouble();
+        vx = (r.nextDouble() * 14.0) - 7.0;
+        vy = 28.0 + 10.0 * r.nextDouble();
+        break;
+      case 2: // goRight
+        x = (padCx + (0.22 + 0.18 * r.nextDouble()) * env.cfg.worldW).clamp(10.0, env.cfg.worldW - 10.0);
+        h = 120 + 120 * r.nextDouble();
+        vx = (r.nextDouble() * 14.0) - 7.0;
+        vy = 28.0 + 10.0 * r.nextDouble();
+        break;
+      case 3: // descendSlow
+        x = padCx + (r.nextDouble() * 0.05 - 0.025) * padHalfW;
+        h = 0.55 * env.cfg.worldH + 0.20 * env.cfg.worldH * r.nextDouble();
+        vx = (r.nextDouble() * 24.0) - 12.0;
+        vy = 24.0 + 12.0 * r.nextDouble();
+        break;
+      case 4: // brakeUp
+        x = padCx + (r.nextDouble() * 0.05 - 0.025) * padHalfW;
+        h = 40.0 + 50.0 * r.nextDouble();
+        vx = (r.nextDouble() * 14.0) - 7.0;
+        vy = 120.0 + 50.0 * r.nextDouble();
+        break;
+      default: // hover
+        x = padCx + (r.nextDouble() * 0.03 - 0.015) * padHalfW;
+        h = 0.20 * env.cfg.worldH + 0.15 * env.cfg.worldH * r.nextDouble();
+        vx = (r.nextDouble() * 10.0) - 5.0;
+        vy = (r.nextDouble() * 10.0) - 5.0;
+        break;
+    }
 
-    final y = _teacherIntentFromRays(env);
+    _setState(x: x, height: h, vx: vx, vy: vy);
+
+    final y = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
     if (y != intentIdx) return false;
 
     final feat = fe.extract(env);
@@ -569,7 +575,7 @@ _PretrainIntentStats _pretrainIntentLocal({
     return true;
   }
 
-  const maxAttemptsPerClass = 30000;
+  const maxAttemptsPerClass = 20000;
   for (int k = 0; k < K; k++) {
     int attempts = 0;
     while (xsByK[k].length < targetPerClass && attempts < maxAttemptsPerClass) {
@@ -577,10 +583,8 @@ _PretrainIntentStats _pretrainIntentLocal({
       attempts++;
     }
     if (xsByK[k].isEmpty) {
-      // back-off: copy from a neighbor class
       final fallback = (k == 0 ? 3 : 0);
-      while (xsByK[k].length < math.max(16, targetPerClass ~/ 4) &&
-          xsByK[fallback].isNotEmpty) {
+      while (xsByK[k].length < math.max(16, targetPerClass ~/ 4) && xsByK[fallback].isNotEmpty) {
         xsByK[k].add(List<double>.from(xsByK[fallback][rng.nextInt(xsByK[fallback].length)]));
         ysByK[k].add(k);
       }
@@ -724,6 +728,10 @@ void main(List<String> argv) {
 
   final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
 
+  // NEW: Episode gating flags
+  final gateSeg = args.getDouble('gate_seg', def: double.negativeInfinity);
+  final gateLanded = args.getFlag('gate_landed', def: false);
+
   double bestMeanCost = double.infinity;
   int bestCostIter = -1;
 
@@ -737,14 +745,17 @@ void main(List<String> argv) {
   final env = eng.GameEngine(cfg);
 
   // Ensure rays active
-  env.rayCfg = const rc.RayConfig(
+  env.rayCfg = const RayConfig(
     rayCount: 180,
     includeFloor: false,
     forwardAligned: true,
   );
 
   // Build FE and probe actual feature length
-  final fe = FeatureExtractorRays(rayCount:180, forwardAligned:true); // rays-based FE in agent.dart
+  final fe = FeatureExtractorRays(
+    rayCount: env.rayCfg.rayCount,
+    kindsOneHot: true, // set false to use 1 channel per ray
+  ); // your agent's FE (ray-based internally)
   env.reset(seed: seed ^ 0xC0FFEE);
   env.step(1 / 60.0, const et.ControlInput(thrust: false, left: false, right: false));
 
@@ -753,17 +764,18 @@ void main(List<String> argv) {
   final inDim = x0.length;
 
   final kindsOneHot = (inDim == 6 + rayCount * 4);
-  final expected726 = 6 + rayCount * 4;
+  final expectedOH = 6 + rayCount * 4;
   final expectedScalar = 6 + rayCount;
 
   if (fe.inputSize != inDim) {
-    print('Note: FE.inputSize=${fe.inputSize} vs actual=$inDim (expected $expected726 or $expectedScalar); continuing.');
+    print('Note: FE.inputSize=${fe.inputSize} vs actual=$inDim (expected $expectedOH or $expectedScalar); continuing.');
   }
 
   final policy = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
   print('Loaded init policy. hidden=${policy.hidden} | FE(kind=rays, in=$inDim, rays=$rayCount, oneHot=$kindsOneHot)');
 
-  final useNorm = (fe.inputSize == inDim);
+  // Turn feature normalization ON only if dims match (prevents RunningNorm errors)
+  final useNorm = (fe.inputSize == inDim) && (inDim > 0);
 
   final trainer = Trainer(
     env: env,
@@ -787,7 +799,7 @@ void main(List<String> argv) {
     print('Feature norm disabled (trainer.norm dim=${fe.inputSize} != feature len=$inDim).');
   }
 
-  // Optional: load existing weights
+  // Optional load example (kept commented)
   /*
   tryLoadPolicy(
     'policy_pretrained.json',
@@ -893,8 +905,9 @@ void main(List<String> argv) {
     print('Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}');
   }
 
-  // ===== MAIN TRAIN LOOP =====
+  // ===== MAIN TRAIN LOOP (with gating + debug prints) =====
   final rnd = math.Random(seed ^ 0xDEADBEEF);
+  final bool gateOn = gateSeg.isFinite || gateLanded;
 
   for (int it = 0; it < iters; it++) {
     double lastCost = 0.0;
@@ -902,18 +915,74 @@ void main(List<String> argv) {
     bool lastLanded = false;
 
     for (int b = 0; b < batch; b++) {
-      env.reset(seed: rnd.nextInt(1 << 30));
-      final res = trainer.runEpisode(
-        train: true,
-        greedy: false,
-        scoreIsReward: false,
-        lr: lr,
-        valueBeta: valueBeta,
-        huberDelta: huberDelta,
-      );
-      lastCost = res.totalCost;
-      lastSteps = res.steps;
-      lastLanded = res.landed;
+      final epSeed = rnd.nextInt(1 << 30);
+
+      if (gateOn) {
+        // Dry run to evaluate episode quality (greedy for stable metrics)
+        env.reset(seed: epSeed);
+        final evalRes = trainer.runEpisode(
+          train: false,
+          greedy: true,
+          scoreIsReward: false,
+        );
+        final landedNow = env.status == et.GameStatus.landed;
+        final okSeg = evalRes.segMean >= gateSeg;
+        final okLand = !gateLanded || landedNow;
+        final accept = (okSeg && okLand);
+
+        print('[GATE] it=${it + 1} batch=${b + 1}'
+            ' | segMean=${evalRes.segMean.toStringAsFixed(2)}'
+            ' | landed=${landedNow ? "Y" : "N"}'
+            ' | thrSeg>=${gateSeg.isFinite ? gateSeg.toStringAsFixed(1) : "-"}'
+            ' | needLanded=${gateLanded ? "Y" : "N"}'
+            ' | accept=${accept ? "Y" : "N"}');
+
+        if (!accept) {
+          // Skip training update this slot
+          lastCost = evalRes.totalCost;
+          lastSteps = evalRes.steps;
+          lastLanded = landedNow;
+          continue;
+        }
+
+        // Re-run for training (exploration on)
+        env.reset(seed: epSeed);
+        final res = trainer.runEpisode(
+          train: true,
+          greedy: false,
+          scoreIsReward: false,
+          lr: lr,
+          valueBeta: valueBeta,
+          huberDelta: huberDelta,
+        );
+        lastCost = res.totalCost;
+        lastSteps = res.steps;
+        lastLanded = env.status == et.GameStatus.landed;
+
+        print('[TRAIN] it=${it + 1} batch=${b + 1}'
+            ' | steps=${lastSteps}'
+            ' | segMean=${res.segMean.toStringAsFixed(2)}'
+            ' | landed=${lastLanded ? "Y" : "N"}');
+      } else {
+        // No gating: standard single pass training
+        env.reset(seed: epSeed);
+        final res = trainer.runEpisode(
+          train: true,
+          greedy: false,
+          scoreIsReward: false,
+          lr: lr,
+          valueBeta: valueBeta,
+          huberDelta: huberDelta,
+        );
+        lastCost = res.totalCost;
+        lastSteps = res.steps;
+        lastLanded = env.status == et.GameStatus.landed;
+
+        print('[TRAIN] it=${it + 1} batch=${b + 1}'
+            ' | steps=${lastSteps}'
+            ' | segMean=${res.segMean.toStringAsFixed(2)}'
+            ' | landed=${lastLanded ? "Y" : "N"}');
+      }
     }
 
     print('Iter ${it + 1} | batch=$batch | last-ep steps: $lastSteps | cost: ${lastCost.toStringAsFixed(3)} | landed: ${lastLanded ? "Y" : "N"}');
@@ -976,17 +1045,16 @@ void calibrateIntentBiasToTeacher({
   final tCounts = List<int>.filled(K, 0);
 
   for (int i = 0; i < N; i++) {
-    final W = env.cfg.worldW;
-    final H = env.cfg.worldH;
-    env.lander
-      ..pos.x = (r.nextDouble() * (W - 20.0) + 10.0)
-      ..pos.y = (r.nextDouble() * (H * 0.80)).clamp(0.0, H - 10.0)
-      ..vel.x = r.nextDouble() * 180 - 90
-      ..vel.y = r.nextDouble() * 140 + 10
-      ..angle = 0.0
-      ..fuel  = env.cfg.t.maxFuel;
+    final padCx = env.terrain.padCenter.toDouble();
+    env.lander.pos.x = (padCx + (r.nextDouble() * 400 - 200)).clamp(10.0, env.cfg.worldW - 10.0);
+    final gy = env.terrain.heightAt(env.lander.pos.x);
+    env.lander.pos.y = (gy - (60 + 300 * r.nextDouble())).clamp(0.0, env.cfg.worldH - 10.0);
+    env.lander.vel.x = r.nextDouble() * 180 - 90;
+    env.lander.vel.y = r.nextDouble() * 140 + 10;
+    env.lander.angle = 0.0;
+    env.lander.fuel = env.cfg.t.maxFuel;
 
-    final y = _teacherIntentFromRays(env);
+    final y = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
     tCounts[y] += 1;
 
     xsRaw.add(fe.extract(env));
@@ -1014,7 +1082,7 @@ void calibrateIntentBiasToTeacher({
     }
   }
 
-  print('Calibrated intent biases to teacher marginals on $N snapshots (rays-teacher).');
+  print('Calibrated intent biases to teacher marginals on $N snapshots (local norm).');
 }
 
 _PretrainIntentStats _pretrainDescendSlowTargeted({
@@ -1030,61 +1098,86 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
 }) {
   final r = math.Random(seed);
   final xs = <List<double>>[];
+  final ys = <int>[];
 
   env.reset(seed: 909090);
 
   bool _tryPush() {
-    final yTeach = _teacherIntentFromRays(env);
-    if (yTeach != 3) return false; // only mine true descendSlow
+    final yTeach = predictiveIntentLabelAdaptive(env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
+    if (yTeach != 3) return false;
 
     final xRaw = fe.extract(env);
     final xN = trainer.norm?.normalize(xRaw, update: false) ?? xRaw;
     final (pred, _p, _c) = policy.actIntentGreedy(xN);
 
-    if (pred == 3) return false;            // not hard
-    // keep classic confusions: hover/brakeUp
-    if (pred != 0 && pred != 4) return false;
+    if (pred == 3) return false; // not hard
+    if (pred != 0 && pred != 4) return false; // only hover/brakeUp confusions
 
     xs.add(xRaw);
+    ys.add(3);
     return true;
   }
 
   int minedBand1 = 0, minedBand2 = 0;
 
-  // Band 1 (near-ish to anywhere on screen)
+  // Band 1
   while (minedBand1 < perBand) {
+    final padCx = env.terrain.padCenter.toDouble();
     final W = env.cfg.worldW;
     final H = env.cfg.worldH;
 
+    final sign = (r.nextBool() ? 1.0 : -1.0);
+    final dx = sign * (0.08 * W * r.nextDouble());
+    final px = (padCx + dx).clamp(10.0, W - 10.0);
+    final gy = env.terrain.heightAt(px);
+
+    final height = 130.0 + r.nextDouble() * 90.0;
+    final vy = 20.0 + r.nextDouble() * 12.0;
+    final vx = (r.nextDouble() * 16.0) - 8.0;
+
     env.lander
-      ..pos.x = (r.nextDouble() * (W - 20.0) + 10.0)
-      ..pos.y = (H * 0.25 + r.nextDouble() * H * 0.25).clamp(0.0, H - 10.0)
-      ..vel.x = r.nextDouble() * 16.0 - 8.0
-      ..vel.y = 20.0 + r.nextDouble() * 12.0
+      ..pos.x = px
+      ..pos.y = (gy - height).clamp(0.0, H - 10.0)
+      ..vel.x = vx
+      ..vel.y = vy
       ..angle = 0.0
-      ..fuel  = env.cfg.t.maxFuel;
+      ..fuel = env.cfg.t.maxFuel;
 
     if (_tryPush()) minedBand1++;
   }
 
-  // Band 2 (higher & faster)
+  // Band 2
   while (minedBand2 < perBand) {
+    final padCx = env.terrain.padCenter.toDouble();
     final W = env.cfg.worldW;
     final H = env.cfg.worldH;
 
+    final sign = (r.nextBool() ? 1.0 : -1.0);
+    final dx = sign * (0.08 * W * r.nextDouble());
+    final px = (padCx + dx).clamp(10.0, W - 10.0);
+    final gy = env.terrain.heightAt(px);
+
+    final height = 200.0 + r.nextDouble() * 120.0;
+    final vy = 36.0 + r.nextDouble() * 24.0;
+    final vx = (r.nextDouble() * 16.0) - 8.0;
+
     env.lander
-      ..pos.x = (r.nextDouble() * (W - 20.0) + 10.0)
-      ..pos.y = (H * 0.45 + r.nextDouble() * H * 0.35).clamp(0.0, H - 10.0)
-      ..vel.x = r.nextDouble() * 16.0 - 8.0
-      ..vel.y = 36.0 + r.nextDouble() * 24.0
+      ..pos.x = px
+      ..pos.y = (gy - height).clamp(0.0, H - 10.0)
+      ..vel.x = vx
+      ..vel.y = vy
       ..angle = 0.0
-      ..fuel  = env.cfg.t.maxFuel;
+      ..fuel = env.cfg.t.maxFuel;
 
     if (_tryPush()) minedBand2++;
   }
 
   for (final x in xs) {
-    try { (trainer.norm as dynamic).observe(x); } catch (_) { trainer.norm?.normalize(x, update: true); }
+    try {
+      (trainer.norm as dynamic).observe(x);
+    } catch (_) {
+      trainer.norm?.normalize(x, update: true);
+    }
   }
 
   final N = xs.length;
@@ -1102,7 +1195,7 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
         final xi = trainer.norm?.normalize(xs[idx[i]], update: false) ?? xs[idx[i]];
         final (_pred, _p, cache) = policy.actIntentGreedy(xi);
         caches.add(cache);
-        labels.add(3);            // descendSlow
+        labels.add(3);
         returns.add(cache.v);
       }
 
@@ -1112,7 +1205,7 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
         decisionReturns: returns,
         alignLabels: labels,
         alignWeight: weight,
-        lr: lr,
+        lr: 5e-4,
         entropyBeta: 0.0,
         valueBeta: 0.0,
         huberDelta: 1.0,
@@ -1133,20 +1226,15 @@ _PretrainIntentStats _pretrainDescendSlowTargeted({
 
 /* ----------------------------------- usage ------------------------------------
 
-Train (no intent pretrain, norm auto-disabled if sizes mismatch):
+Train with gating prints:
   dart run lib/ai/train_agent.dart \
-    --hidden=64,64 \
-    --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 --blend_policy=1.0
+    --hidden=96,96,64 \
+    --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 --blend_policy=1.0 \
+    --gate_seg=200 --gate_landed
 
-Intent pretrain:
+Intent pretrain only:
   dart run lib/ai/train_agent.dart \
     --hidden=64,64 \
     --pretrain_intent=10000 --pretrain_epochs=3 --pretrain_align=3.0 --pretrain_lr=0.0005 \
     --reset_action_heads --only_pretrain
-
-Full train after pretrain:
-  dart run lib/ai/train_agent.dart \
-    --hidden=96,96,64 \
-    --train_iters=200 --batch=32 --lr=0.0003 \
-    --plan_hold=1 --blend_policy=0.75 --value_beta=0.7
 -------------------------------------------------------------------------------- */
