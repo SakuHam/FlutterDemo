@@ -1,28 +1,23 @@
 // lib/engine/types.dart
 import 'dart:math' as math;
 
-/// =======================
-/// Config & basic structs
-/// =======================
-
 class Tunables {
-  double gravity;      // base gravity strength
-  double thrustAccel;  // engine acceleration (px/s^2 @ power=1)
-  double rotSpeed;     // radians per second
-  double maxFuel;      // fuel units
+  double gravity;
+  double thrustAccel;
+  double rotSpeed;
+  double maxFuel;
 
-  // Touchdown tolerances / assists
-  final bool crashOnTilt;           // if false, angle is ignored for touchdown safety
-  final double landingMaxVx;        // px/s horizontal speed allowed at contact
-  final double landingMaxVy;        // px/s downward speed allowed at contact
-  final double landingMaxOmega;     // rad/s allowed at contact (optional)
+  final bool crashOnTilt;
+  final double landingMaxVx;
+  final double landingMaxVy;
+  final double landingMaxOmega;
 
   Tunables({
     this.gravity = 0.18,
     this.thrustAccel = 0.42,
     this.rotSpeed = 1.6,
     this.maxFuel = 1000.0,
-    this.crashOnTilt = true,        // old behavior = true
+    this.crashOnTilt = true,
     this.landingMaxVx = 28.0,
     this.landingMaxVy = 38.0,
     this.landingMaxOmega = 2.0,
@@ -57,69 +52,61 @@ class EngineConfig {
   final Tunables t;
 
   final int seed;
-  final double stepScale; // multiplies dt for arcade-y tuning (60 ~ 60 FPS)
+  final double stepScale;
 
-  // Landing tolerance (training-time)
-  final double padWidthFactor;      // scales generated pad width
-  final double landingSpeedMax;     // px/s
-  final double landingAngleMaxRad;  // radians
+  final double padWidthFactor;
+  final double landingSpeedMax;
+  final double landingAngleMaxRad;
 
-  // Shaping costs (all >= 0; total cost is sum)
-  final double livingCost;   // cost/sec just for time
-  final double effortCost;   // cost/sec while burning (power-weighted)
-  final double wDx;          // cost weight for |dx| / worldW
-  final double wDy;          // cost weight for |dy| / worldH
-  final double wVyDown;      // cost weight for downward vy+ (normalized)
-  final double wVx;          // cost weight for |vx| (normalized)
-  final double wAngleDeg;    // cost weight for |angle| in degrees / 180
-  final double angleNearGroundBoost; // multiplies angle cost near ground
-  final double wAngleRate;           // penalize |d(angle)/dt| to smooth
+  final double livingCost;
+  final double effortCost;
+  final double wDx;
+  final double wDy;
+  final double wVyDown;
+  final double wVx;
+  final double wAngleDeg;
+  final double angleNearGroundBoost;
+  final double wAngleRate;
 
-  // Border punishment (compatible with wrap)
-  final double borderMargin;          // px near left/right edges
-  final double borderPenaltyPerSec;   // cost/sec at wall (ramps to 0 at margin)
-  final double wrapPenalty;           // one-off cost when actually wrapping
+  final double borderMargin;
+  final double borderPenaltyPerSec;
+  final double wrapPenalty;
 
-  // ===== Overfit/Debug controls =====
-  final bool lockTerrain;     // reuse identical terrain every reset
-  final int terrainSeed;      // seed for terrain when locked
-  final bool lockSpawn;       // fixed initial state every episode
-  final double spawnX;        // fraction of worldW (0..1)
-  final double spawnY;        // px
-  final double spawnVx;       // px/s
-  final double spawnVy;       // px/s
-  final double spawnAngle;    // radians
-  final bool hardWalls;       // if true, clamp X to [0, W] (no wrap)
+  final bool lockTerrain;
+  final int terrainSeed;
+  final bool lockSpawn;
+  final double spawnX;
+  final double spawnY;
+  final double spawnVx;
+  final double spawnVy;
+  final double spawnAngle;
+  final bool hardWalls;
 
-  // EngineConfig additions
-  final double ceilingMargin;          // px from the top where penalties start
-  final double ceilingPenaltyPerSec;   // cost/sec when fully at the top
-  final double ceilingHitPenalty;      // one-shot when clamping at the top
+  final double ceilingMargin;
+  final double ceilingPenaltyPerSec;
+  final double ceilingHitPenalty;
 
-  final bool randomSpawnX;   // if true, pick X uniformly in [spawnXMin, spawnXMax]
-  final double spawnXMin;    // fraction of worldW (0..1)
-  final double spawnXMax;    // fraction of worldW (0..1)
+  final bool randomSpawnX;
+  final double spawnXMin;
+  final double spawnXMax;
 
-  // Heuristic assists (kept; optional)
   final double wThrustAssist;
   final double wTurnAssist;
   final double wPadAlignAssist;
   final double wIdlePenalty;
 
-  // ===== Anti-hover / fuel discouragement knobs =====
-  final double fuelPenaltyPerSec;   // cost/sec while thrust is ON
-  final double upwardPenaltyPerVel; // cost per (px/s) upward velocity (vy < 0)
-  final double loiterPenaltyPerSec; // cost/sec when too high & not descending fast enough
-  final double loiterMinVyDown;     // desired minimum downward speed (px/s, vy+)
-  final double loiterAltFrac;       // start enforcing loitering above this fraction of worldH
+  final double fuelPenaltyPerSec;
+  final double upwardPenaltyPerVel;
+  final double loiterPenaltyPerSec;
+  final double loiterMinVyDown;
+  final double loiterAltFrac;
 
-  // ===== Pad-alignment shaping =====
-  final double padTurnDeadzoneFrac;     // dx/worldW tolerance before we care
-  final double padFarFrac;              // "far" when |dx| > padFarFrac * padHalfWidth
-  final double padDirTurnPenaltyPerSec; // cost/sec if turning opposite of pad direction
-  final double padIdleTurnPenaltyPerSec;// cost/sec if not turning when far from pad
-  final double padVelAwayPenaltyPerVel; // cost per (px/s) of velocity away from pad
-  final double padAngleAwayPenaltyPerRad; // cost per rad when leaning away
+  final double padTurnDeadzoneFrac;
+  final double padFarFrac;
+  final double padDirTurnPenaltyPerSec;
+  final double padIdleTurnPenaltyPerSec;
+  final double padVelAwayPenaltyPerVel;
+  final double padAngleAwayPenaltyPerRad;
 
   EngineConfig({
     required this.worldW,
@@ -161,15 +148,11 @@ class EngineConfig {
     this.wTurnAssist = 0.20,
     this.wPadAlignAssist = 0.10,
     this.wIdlePenalty = 0.10,
-
-    // Anti-hover defaults
     this.fuelPenaltyPerSec = 6.0,
     this.upwardPenaltyPerVel = 0.05,
     this.loiterPenaltyPerSec = 20.0,
     this.loiterMinVyDown = 45.0,
     this.loiterAltFrac = 0.35,
-
-    // Pad-alignment defaults
     this.padTurnDeadzoneFrac = 0.03,
     this.padFarFrac = 1.0,
     this.padDirTurnPenaltyPerSec = 6.0,
@@ -311,13 +294,12 @@ class Vector2 {
   double get length => math.sqrt(x * x + y * y);
 }
 
-/// Lander state
 class LanderState {
   final int seed = 12345;
-  Vector2 pos;   // center of mass (px)
-  Vector2 vel;   // px/s
-  double angle;  // radians (0 = up)
-  double fuel;   // 0..maxFuel
+  Vector2 pos;
+  Vector2 vel;
+  double angle;
+  double fuel;
 
   LanderState({
     required this.pos,
@@ -334,11 +316,6 @@ class LanderState {
   );
 }
 
-/// =======================
-/// Polygon terrain support
-/// =======================
-
-/// Tag polygon edges so sensors and contact can differentiate pad vs terrain.
 enum PolyEdgeKind { terrain, pad }
 
 class PolyEdge {
@@ -348,13 +325,10 @@ class PolyEdge {
   const PolyEdge(this.a, this.b, this.kind);
 }
 
-/// A polygon with an outer ring and optional hole rings (for caverns).
-/// Rings should be simple (non-self-intersecting). We normalize winding:
-/// outer CCW, holes CW (convention; only consistency matters).
 class PolyShape {
   final List<Vector2> outer;         // CCW
   final List<List<Vector2>> holes;   // CW
-  final List<PolyEdge> edges;        // derived (outer + holes)
+  final List<PolyEdge> edges;
 
   PolyShape._(this.outer, this.holes, this.edges);
 
@@ -386,8 +360,6 @@ class PolyShape {
     return PolyShape._(out, hol, edges);
   }
 
-  /// Vertical query: smallest y >= 0 where x hits the polygon boundary.
-  /// Returns +∞ if no hit in [0, worldH].
   double verticalHitY({required double x, required double worldH}) {
     double bestY = double.infinity;
     for (final e in edges) {
@@ -398,7 +370,6 @@ class PolyShape {
     return math.min(bestY, worldH);
   }
 
-  /// Raycast against all edges; returns nearest hit (t, p, kind) or null.
   (double t, Vector2 p, PolyEdgeKind kind)? raycast({
     required Vector2 origin,
     required Vector2 dir,
@@ -418,8 +389,6 @@ class PolyShape {
     if (!bestT.isFinite || bestP == null) return null;
     return (bestT, bestP, bestK);
   }
-
-  // ---- helpers ----
 
   static List<Vector2> _ensureWinding(List<Vector2> ring, {required bool ccw}) {
     double area = 0.0;
@@ -441,22 +410,20 @@ class PolyShape {
     return flatY && overlap;
   }
 
-  // Intersection of vertical line x = X with segment AB → Y or null.
   static double? _xRayHitY(Vector2 a, Vector2 b, double X) {
     if ((X < math.min(a.x, b.x)) || (X > math.max(a.x, b.x))) return null;
     final dx = (b.x - a.x);
-    if (dx.abs() < 1e-9) return math.min(a.y, b.y); // vertical seg → top endpoint
-    final t = (X - a.x) / dx; // 0..1 along AB by x
+    if (dx.abs() < 1e-9) return math.min(a.y, b.y);
+    final t = (X - a.x) / dx;
     if (t < 0.0 || t > 1.0) return null;
     return a.y + (b.y - a.y) * t;
   }
 
-  // Parametric ray/segment intersection. Returns (t,u) or null.
   static (double, double)? _raySegment(Vector2 o, Vector2 d, Vector2 a, Vector2 b) {
     final vx = d.x, vy = d.y;
     final sx = b.x - a.x, sy = b.y - a.y;
     final det = (-sx * vy + vx * sy);
-    if (det.abs() < 1e-9) return null; // parallel
+    if (det.abs() < 1e-9) return null;
 
     final oxax = o.x - a.x;
     final oway = o.y - a.y;
@@ -467,16 +434,10 @@ class PolyShape {
   }
 }
 
-/// =======================
-/// Terrain (back-compat wrapper)
-/// =======================
-/// Terrain now owns a polygon (outer + holes) but keeps the legacy fields
-/// so existing code continues to work.
 class Terrain {
   final PolyShape poly;
 
-  // Legacy fields (preserved)
-  final List<Vector2> ridge; // kept for compatibility (approx “roof” polyline)
+  final List<Vector2> ridge;
   final double padX1;
   final double padX2;
   final double padY;
@@ -491,69 +452,86 @@ class Terrain {
 
   double get padCenter => (padX1 + padX2) * 0.5;
 
-  /// Back-compat: returns the first boundary y above (>=0) at x, clamped to worldH.
-  /// For overhangs/caverns, this is the *nearest* boundary above the top of the screen,
-  /// which is what you want for landing/autolevel checks.
   double heightAt(double x, {double worldH = 100000.0}) {
     return poly.verticalHitY(x: x, worldH: worldH);
   }
 
   bool isOnPad(double x) => x >= padX1 && x <= padX2;
 
-  /// Generate a polygonal terrain with the landing pad spliced into the roof.
+  /// Higher-reaching terrain:
+  /// - Shifted band upward (smaller Y = higher on screen)
+  /// - Slightly larger amplitude + two extra harmonics for detail
+  /// - Keeps valleys tamed so gameplay stays fair
   static Terrain generate(double w, double h, int seed, double padWidthFactor) {
     final rnd = math.Random(seed);
 
-    // 1) Build the *roof* polyline (left→right), independent from bottom closure.
     final roof = <Vector2>[];
-    const int segments = 28;
+    const int segments = 36;      // more segments for smoother relief
+
+    // Screen Y grows downward. Smaller fraction => visually higher.
+    final baseFrac   = 0.56;      // was 0.66  (lift the whole terrain up)
+    final noiseFrac  = 0.10;      // was 0.06  (allow taller peaks)
+    final bandTop    = 0.34;      // was 0.54  (let peaks go higher)
+    final bandBottom = 0.70;      // was 0.76  (keep valleys reasonable)
+
+    final baseY   = h * baseFrac;
+    final topY    = h * bandTop;
+    final botY    = h * bandBottom;
+    final noiseAmp = h * noiseFrac;
+
+    // Simple fBm-ish mixture (sine layers + small jitter) for more shape variety
+    final phaseA = rnd.nextDouble() * math.pi * 2.0;
+    final phaseB = rnd.nextDouble() * math.pi * 2.0;
+    final phaseC = rnd.nextDouble() * math.pi * 2.0;
+
     for (int i = 0; i <= segments; i++) {
       final x = w * i / segments;
-      final base = h * 0.78;
-      final noise = (math.sin(i * 0.8) + rnd.nextDouble() * 0.5) * 24.0;
-      roof.add(Vector2(x, base + noise));
+      final t = i * 1.0;
+
+      // Mix multiple frequencies; keep weights summing to ~1
+      final n1 = math.sin(t * 0.55 + phaseA);      // broad undulation
+      final n2 = math.sin(t * 0.18 + phaseB);      // long swell
+      final n3 = math.sin(t * 1.10 + phaseC);      // small detail
+
+      final jitter = (rnd.nextDouble() - 0.5) * 0.35;
+      final noise = (0.55 * n1 + 0.30 * n2 + 0.15 * n3 + jitter) * noiseAmp;
+
+      double y = baseY + noise;
+
+      // Clamp inside the band (peaks high, valleys not too deep)
+      if (y < topY) y = topY;
+      if (y > botY) y = botY;
+
+      roof.add(Vector2(x, y));
     }
 
-    // 2) Choose pad span on roof.
+    // Landing pad -------------------------------------------------------------
     final rawPadWidth = w * 0.16 * padWidthFactor;
     final padWidth = rawPadWidth.clamp(36.0, w * 0.6);
     final padCenterX = w * (0.35 + rnd.nextDouble() * 0.3);
     final padX1 = math.max(10.0, math.min(padCenterX - padWidth / 2, w - padWidth - 10.0));
     final padX2 = padX1 + padWidth;
 
-    // Interpolate roof Y at pad endpoints (and mid) and pick a stable padY on/under roof.
     double interpRoofY(double x) => _interpYOnPolyline(roof, x);
     final y1 = interpRoofY(padX1);
     final y2 = interpRoofY(padX2);
     final ym = interpRoofY((padX1 + padX2) * 0.5);
-    final padY = math.min(y1, math.min(y2, ym)); // keep pad "embedded" in roof
 
-    // 3) Splice a *flat* pad edge into the roof between [padX1, padX2].
+    // Keep the pad just below the local min of the roof span for clearance
+    final padYTarget = h * 0.58; // lift pad a bit, since terrain is higher overall
+    final localMin = math.min(y1, math.min(y2, ym));
+    final padY = math.min(padYTarget, localMin);
+
     final roofWithPad = _insertPadIntoRoof(roof, padX1, padX2, padY);
 
-    // 4) Build an *outer* polygon by closing roof to the bottom corners.
+    // Close polygon; keep ends slightly deeper to form a gentle bowl at edges
+    final endsFrac = 0.78; // was 0.80; tiny lift so edges aren’t too low now that band moved up
     final outer = <Vector2>[
-      Vector2(0, h),       // bottom-left
-      ...roofWithPad,      // roof (now includes flat pad edge)
-      Vector2(w, h),       // bottom-right
+      Vector2(0, h * endsFrac),
+      ...roofWithPad,
+      Vector2(w, h * endsFrac),
     ];
 
-    // 5) Optional cavern hole (unchanged behavior).
-    final holes = <List<Vector2>>[];
-    if (rnd.nextBool()) {
-      final cx = w * (0.30 + rnd.nextDouble() * 0.4);
-      final cy = h * 0.70;
-      final rx = w * 0.10;
-      final ry = h * 0.06;
-      const k = 24;
-      final ring = List<Vector2>.generate(k, (i) {
-        final th = 2 * math.pi * i / k;
-        return Vector2(cx + rx * math.cos(th), cy + ry * math.sin(th));
-      });
-      holes.add(ring);
-    }
-
-    // 6) Build polygon with pad edges *tagged* (the flat segment we spliced).
     final poly = PolyShape.fromRings(
       outer: outer,
       holes: const [],
@@ -562,7 +540,6 @@ class Terrain {
       padY: padY,
     );
 
-    // 7) Legacy ridge for old UIs (use roofWithPad so the painter can draw a flat pad).
     final ridge = roofWithPad;
 
     return Terrain(
@@ -575,7 +552,6 @@ class Terrain {
   }
 }
 
-/// Interpolate y on a monotone-by-x polyline (assumes points are ordered by x).
 double _interpYOnPolyline(List<Vector2> line, double x) {
   for (int i = 0; i < line.length - 1; i++) {
     final a = line[i];
@@ -585,14 +561,10 @@ double _interpYOnPolyline(List<Vector2> line, double x) {
       return a.y + (b.y - a.y) * t;
     }
   }
-  // Out of range: clamp to nearest endpoint
   if (x < line.first.x) return line.first.y;
   return line.last.y;
 }
 
-/// Splice a flat segment [padX1..padX2] at y=padY into the roof polyline.
-/// Removes original roof points inside the span and inserts intersection points
-/// at the span ends + flat pad vertices.
 List<Vector2> _insertPadIntoRoof(
     List<Vector2> roof,
     double padX1,
@@ -612,38 +584,30 @@ List<Vector2> _insertPadIntoRoof(
     final a = roof[i];
     final b = roof[i + 1];
 
-    // push first point once
     if (out.isEmpty) out.add(a);
 
     bool crosses(double x) =>
         (x >= math.min(a.x, b.x)) && (x <= math.max(a.x, b.x)) && (a.x != b.x);
 
-    // Enter pad span
     if (!inside && crosses(padX1)) {
       final yEnter = lerpAt(a, b, padX1);
-      out.add(Vector2(padX1, yEnter));      // intersection on roof
-      out.add(Vector2(padX1, padY));        // drop/raise to flat pad
+      out.add(Vector2(padX1, yEnter));
+      out.add(Vector2(padX1, padY));
       inside = true;
     }
 
-    // Exit pad span
     if (inside && crosses(padX2)) {
       final yExit = lerpAt(a, b, padX2);
-      out.add(Vector2(padX2, padY));        // end of flat pad
-      out.add(Vector2(padX2, yExit));       // connect back to roof
+      out.add(Vector2(padX2, padY));
+      out.add(Vector2(padX2, yExit));
       inside = false;
-      // After reconnecting, continue with normal path from B
       out.add(b);
       continue;
     }
 
-    // While inside pad span, skip original roof points (we already inserted flat pad).
-    if (!inside) {
-      out.add(b);
-    }
+    if (!inside) out.add(b);
   }
 
-  // Edge-case: if span extended beyond last segment (unlikely), close it.
   if (inside) {
     final last = roof.last;
     out.add(Vector2(padX2, padY));
@@ -651,7 +615,6 @@ List<Vector2> _insertPadIntoRoof(
     out.add(last);
   }
 
-  // Merge tiny duplicates that can be created by numeric ties
   const eps = 1e-6;
   final compact = <Vector2>[];
   for (final p in out) {
@@ -667,14 +630,11 @@ List<Vector2> _insertPadIntoRoof(
   return compact;
 }
 
-/// Step outcome
 class StepInfo {
-  final double costDelta;   // >= 0 ; lower is better
-  final double scoreDelta;  // alias for compatibility
+  final double costDelta;
+  final double scoreDelta;
   final bool terminal;
   final bool landed;
-
-  // diagnostics
   final bool onPad;
 
   StepInfo({
