@@ -294,6 +294,18 @@ void _warmFeatureNorm({
         vx = (r.nextDouble() * 14.0) - 7.0;
         vy = 120.0 + 50.0 * r.nextDouble();
         break;
+      case 5: // brakeLeft  (moving right too fast near pad)
+        x = (padCx + (r.nextDouble() * 0.02 - 0.01) * padHalfW).clamp(10.0, padHalfW - 10.0);
+        h = 120 + 100 * r.nextDouble();
+        vx = 28.0 + 24.0 * r.nextDouble();   // +vx
+        vy = 18.0 + 18.0 * r.nextDouble();
+        break;
+      case 6: // brakeRight (moving left too fast near pad)
+        x = (padCx + (r.nextDouble() * 0.02 - 0.01) * padHalfW).clamp(10.0, padHalfW - 10.0);
+        h = 120 + 100 * r.nextDouble();
+        vx = -(28.0 + 24.0 * r.nextDouble()); // -vx
+        vy = 18.0 + 18.0 * r.nextDouble();
+        break;
       default: // hover
         x = padCx + (r.nextDouble() * 0.03 - 0.015) * padHalfW;
         h = 0.20 * env.cfg.worldH + 0.15 * env.cfg.worldH * r.nextDouble();

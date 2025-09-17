@@ -9,14 +9,16 @@ import '../engine/game_engine.dart' as eng;
 /*                                INTENT SET                                  */
 /* -------------------------------------------------------------------------- */
 
-enum Intent { hover, goLeft, goRight, descendSlow, brakeUp }
+enum Intent { hover, goLeft, goRight, descendSlow, brakeUp, brakeLeft, brakeRight }
 
 const List<String> kIntentNames = [
-  'hover',
-  'goLeft',
-  'goRight',
-  'descendSlow',
-  'brakeUp',
+  'hover',       // 0
+  'goLeft',      // 1
+  'goRight',     // 2
+  'descendSlow', // 3
+  'brakeUp',     // 4
+  'brakeLeft',   // 5
+  'brakeRight',  // 6
 ];
 
 int intentToIndex(Intent i) => i.index;
@@ -211,7 +213,6 @@ class FeatureExtractorRays {
 /* -------------------------------------------------------------------------- */
 /*                                CONTROLLERS                                  */
 /* -------------------------------------------------------------------------- */
-
 int predictiveIntentLabelAdaptive(
     eng.GameEngine env, {
       double baseTauSec = 1.0,
@@ -227,38 +228,53 @@ int predictiveIntentLabelAdaptive(
   final py = L.pos.y.toDouble();
   final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
-
   final gy = T.heightAt(px);
-  final h = (gy - py).toDouble();
+  final h  = (gy - py).toDouble();
   final dx = px - padCx;
 
+  // horizon
   final hNorm = (h / 320.0).clamp(0.0, 1.6);
   final tau = (baseTauSec * (0.7 + 0.5 * hNorm)).clamp(minTauSec, maxTauSec);
-
   final g = env.cfg.t.gravity;
-  final dxF = dx + vx * tau;
-  final vyF = vy + g * tau;
+  final dxF = dx + vx * tau;        // lateral projection
+  final vyF = vy + g * tau;         // vertical projection
 
+  // pad bands
   final padEnter = 0.08 * W;
   final padExit  = 0.14 * W;
 
+  // --- vertical emergency ---
   if (h < 50 && vyF > 45) return intentToIndex(Intent.brakeUp);
 
+  // --- lateral intent selection with braking near pad ---
+  // If we are roughly within pad band and lateral speed is large, choose a braking intent.
+  if (dx.abs() <= padEnter) {
+    if (vx > 25.0)  return intentToIndex(Intent.brakeRight);
+    if (vx < -25.0) return intentToIndex(Intent.brakeLeft);
+  }
+
+  // If projected position exits the soft band, translate to re-center
   if (dxF.abs() > padExit) {
-    return dxF > 0 ? intentToIndex(Intent.goRight) : intentToIndex(Intent.goLeft);
+    return dxF > 0 ? intentToIndex(Intent.goRight)
+        : intentToIndex(Intent.goLeft);
   }
 
+  // If we’re still inside but about to drift out or velocity points outward at height, translate inward.
   final willExitSoon = (dxF.abs() > padEnter) && (dx.abs() <= padEnter);
-  final vxIsBad = (dx.sign == vx.sign) && vx.abs() > 20.0;
-  if ((willExitSoon || vxIsBad) && h > 90) {
-    return dx >= 0 ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
+  final vxIsOutward  = (dx.sign == vx.sign) && vx.abs() > 20.0;
+  if ((willExitSoon || vxIsOutward) && h > 90) {
+    return dx >= 0 ? intentToIndex(Intent.goLeft)
+        : intentToIndex(Intent.goRight);
   }
 
+  // If comfortably inside band: descend slowly
   if (dxF.abs() <= padEnter) {
     return intentToIndex(Intent.descendSlow);
   }
 
-  return dxF > 0 ? intentToIndex(Intent.goRight) : intentToIndex(Intent.goLeft);
+  // Otherwise, gentle translate toward pad
+  return dxF > 0 ? intentToIndex(Intent.goRight)
+      : intentToIndex(Intent.goLeft);
 }
 
 et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
@@ -266,12 +282,52 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final T = env.terrain;
   final px = L.pos.x.toDouble();
   final gy = T.heightAt(px);
-  final h = (gy - L.pos.y).toDouble();
+  final h  = (gy - L.pos.y).toDouble();
+  final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
 
+  // How close to ceiling? (screen top is y=0)
+  final ceilingDist = (L.pos.y - 0.0).clamp(0.0, 1e9);
+
   switch (intent) {
-    case Intent.brakeUp:
-      return const et.ControlInput(thrust: true, left: false, right: false);
+    case Intent.brakeUp: {
+      // target a mild upward velocity, but avoid ceiling slam
+      double vTargetUp = -(0.06 * h + 6.0);         // ~ -6 .. -24 as you rise
+      vTargetUp = vTargetUp.clamp(-18.0, -8.0);
+
+      // If too close to ceiling, soften it toward 0
+      if (ceilingDist < 140) {
+        final a = (ceilingDist / 140.0).clamp(0.0, 1.0);
+        vTargetUp = a * vTargetUp;                  // fades to 0 as we approach ceiling
+      }
+
+      final need = (vy > vTargetUp);                // thrust only if not yet above target
+      // Extra guard: if basically touching ceiling and already upward, cut thrust
+      final safe = !(ceilingDist < 40 && vy < 2.0);
+      return et.ControlInput(thrust: need && safe, left: false, right: false);
+    }
+
+    case Intent.brakeLeft: {
+      // We want vx → 0 with minimal altitude gain; use thrust only when tilted,
+      // so we translate a tiny bit while bleeding speed.
+      final wantTiltRight = (vx < -4.0);            // moving left (neg), tilt right to brake
+      final allowTranslate = (h > 110 && h < 300) && (vy < 35);
+      return et.ControlInput(
+        thrust: allowTranslate && wantTiltRight,    // thrust assists braking when tilted
+        left: false,
+        right: wantTiltRight,
+      );
+    }
+
+    case Intent.brakeRight: {
+      final wantTiltLeft = (vx > 4.0);
+      final allowTranslate = (h > 110 && h < 300) && (vy < 35);
+      return et.ControlInput(
+        thrust: allowTranslate && wantTiltLeft,
+        left: wantTiltLeft,
+        right: false,
+      );
+    }
 
     case Intent.descendSlow: {
       final vTarget = (0.10 * h + 8.0).clamp(8.0, 26.0);
@@ -323,7 +379,7 @@ class ForwardCache {
 }
 
 class PolicyNetwork {
-  static const int kIntents = 5;
+  static const int kIntents = 7; // updated
 
   final int inputSize;
   final List<int> hidden;
@@ -336,7 +392,11 @@ class PolicyNetwork {
     int seed = 0,
   })  : hidden = List<int>.from(hidden),
         trunk  = nn.MLPTrunk(inputSize: inputSize, hiddenSizes: hidden, seed: seed ^ 0x7777),
-        heads  = nn.PolicyHeads(hidden.isEmpty ? inputSize : hidden.last, seed: seed ^ 0x8888);
+        heads  = nn.PolicyHeads(hidden.isEmpty ? inputSize : hidden.last,
+            intents: kIntents, seed: seed ^ 0x8888) {
+    assert(heads.intent.b.length == kIntents, 'intent head outDim mismatch');
+    assert(heads.intent.W.length == kIntents, 'intent head rows mismatch');
+  }
 
   ForwardCache _forwardFull(List<double> x) {
     final acts = trunk.forwardAll(x);
@@ -441,7 +501,13 @@ class PolicyNetwork {
         final dLog = nn.Ops.crossEntropyGrad(c.intentProbs, y); // (p - y)
 
         final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
-        trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk);
+        trunk.backwardFromTopGrad(
+          dTop: dH,
+          acts: c.acts,
+          gW: gW_trunk,
+          gb: gb_trunk,
+          x0: c.x,
+        );
       }
       final scale = lr * alignWeight / N;
       for (int i = 0; i < heads.intent.b.length; i++) {
@@ -450,7 +516,7 @@ class PolicyNetwork {
           heads.intent.W[i][j] -= _clipGrad(scale * gW_int[i][j]);
         }
       }
-      // zero accumulators (so CE and PG don't double-apply same grads)
+      // zero accumulators so CE and PG don't double-apply
       for (int i = 0; i < gb_int.length; i++) gb_int[i] = 0.0;
       for (int i = 0; i < gW_int.length; i++) {
         for (int j = 0; j < gW_int[0].length; j++) gW_int[i][j] = 0.0;
@@ -472,14 +538,20 @@ class PolicyNetwork {
         final chosen = intentChoices[n].clamp(0, kIntents - 1);
         final adv = decisionReturns[n]; // signed advantage
 
-        // dL/dlogits = -adv * (onehot(chosen) - p)  ==  adv * (p - onehot)
+        // dL/dlogits = -adv * (onehot(chosen) - p) == adv * (p - onehot)
         final dLog = List<double>.generate(
           c.intentProbs.length,
-              (i) => (c.intentProbs[i] - (i == chosen ? 1.0 : 0.0)) * (-adv), // -adv*(p-y) => gradient descent does '+' with _clip
+              (i) => (c.intentProbs[i] - (i == chosen ? 1.0 : 0.0)) * (-adv),
         );
 
         final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
-        trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk);
+        trunk.backwardFromTopGrad(
+          dTop: dH,
+          acts: c.acts,
+          gW: gW_trunk,
+          gb: gb_trunk,
+          x0: c.x,
+        );
       }
 
       final scale = lr * intentPgWeight / decisionCaches.length;
@@ -526,6 +598,7 @@ class PolicyNetwork {
           acts: c.acts,
           gW: gW_trunk,
           gb: gb_trunk,
+          x0: c.x,
         );
 
         meanThrLogit += c.thrLogit;
@@ -598,7 +671,7 @@ class Trainer {
   final bool useLearnedController;
   final double blendPolicy; // probability-space blend for thrust
   final double intentAlignWeight;
-  final double intentPgWeight;     // NEW: PG strength
+  final double intentPgWeight;     // PG strength
   final double actionAlignWeight;
   final bool normalizeFeatures;
 
@@ -618,6 +691,7 @@ class Trainer {
 
   // Telemetry helpers
   double _prevAbsDx = double.nan;
+  double _prevVxAbs = double.nan; // NEW: for rBrake
 
   // PWM thrust state
   double _pwmA = 0.0;
@@ -638,7 +712,7 @@ class Trainer {
     required this.useLearnedController,
     required this.blendPolicy,
     required this.intentAlignWeight,
-    this.intentPgWeight = 0.6,       // default PG weight
+    this.intentPgWeight = 0.6,
     required this.actionAlignWeight,
     required this.normalizeFeatures,
     bool segmentAsCost = false,
@@ -693,11 +767,23 @@ class Trainer {
     final eOver  = math.exp(-math.pow((math.max(0.0, err))/sigmaOver , 2));
     final rDescent = 0.5 * eUnder + 0.5 * eOver;
 
-    // Mild |vx| shaping as we approach pad (not only inside tight)
+    // Mild |vx| shaping as we approach pad
     double vxShaping = 0.0;
     if (dx <= soft) {
       final targ = (dx <= tight) ? 0.0 : math.max(0.0, 60.0 * (dx - tight) / (soft - tight));
       vxShaping = -((vx.abs() - targ).clamp(0.0, 60.0) / 60.0);
+    }
+
+    // NEW: reward explicit deceleration of |vx| inside soft band
+    double rBrake = 0.0;
+    if (dx <= soft) {
+      if (_prevVxAbs.isFinite) {
+        final dv = (_prevVxAbs - vx.abs()).clamp(-6.0, 6.0);
+        if (dv > 0) rBrake = dv / 6.0;
+      }
+      _prevVxAbs = vx.abs();
+    } else {
+      _prevVxAbs = double.nan;
     }
 
     // Level near ground
@@ -708,14 +794,15 @@ class Trainer {
       if (angAbs < 0.05) rLevel += 0.25;
     }
 
-    // Soft penalties
+    // Soft penalties and aggregation
     double score =
         5.0 * rCenterGlobal +
             4.0 * rDescent +
             3.0 * rCenterBand +
             2.0 * rProgress +
+            1.2 * rLevel +
             1.0 * vxShaping +
-            1.2 * rLevel;
+            0.7 * rBrake;
 
     if (dx > soft) score -= 0.4;
     if (h < 120.0 && vy > 38.0) score -= 2.5;
@@ -729,7 +816,6 @@ class Trainer {
       if (env.status == et.GameStatus.landed) {
         score += 10.0;
       } else {
-        // scale crash penalty by impact
         final spd = (L.vel.y.abs() + L.vel.x.abs()).clamp(0.0, 120.0);
         score -= 6.0 + 0.04 * spd;
       }
@@ -783,6 +869,7 @@ class Trainer {
 
     _pwmA = 0.0; _pwmCount = 0; _pwmOn = 0;
     _prevAbsDx = double.nan;
+    _prevVxAbs = double.nan;
 
     int framesLeft = 0;
     int currentIntentIdx = 0;

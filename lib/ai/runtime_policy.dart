@@ -289,8 +289,16 @@ class _RuntimeNorm {
    Intents (must mirror training)
    ========================================================================== */
 
-enum Intent { hover, goLeft, goRight, descendSlow, brakeUp }
-const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','brakeUp'];
+enum Intent { hover, goLeft, goRight, descendSlow, brakeUp, brakeLeft, brakeRight }
+const List<String> kIntentNames = [
+  'hover',
+  'goLeft',
+  'goRight',
+  'descendSlow',
+  'brakeUp',
+  'brakeLeft',
+  'brakeRight',
+];
 
 /* =============================================================================
    Low-level controller (heuristic) to execute the chosen intent
@@ -327,10 +335,12 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
   }
 
   double vxDes = switch (intent) {
-    Intent.goLeft   => -vxGoalAbs,
-    Intent.goRight  =>  vxGoalAbs,
-    Intent.hover    => -kDxHover * dx,
-    _               => 0.0,
+    Intent.goLeft     => -vxGoalAbs,
+    Intent.goRight    =>  vxGoalAbs,
+    Intent.brakeLeft  =>  0.0,           // actively reduce |vx| when moving left
+    Intent.brakeRight =>  0.0,           // actively reduce |vx| when moving right
+    Intent.hover      => -kDxHover * dx, // center over pad
+    _                 => 0.0,
   };
 
   final vxErr = (vxDes - vx);
@@ -360,7 +370,10 @@ const List<String> kIntentNames = ['hover','goLeft','goRight','descendSlow','bra
   final bool tiltAligned =
       (targetAngle >  6 * math.pi / 180 && angle >  3 * math.pi / 180) ||
           (targetAngle < -6 * math.pi / 180 && angle < -3 * math.pi / 180);
-  final bool lateralIntent = intent == Intent.goLeft || intent == Intent.goRight;
+  final bool lateralIntent = intent == Intent.goLeft
+      || intent == Intent.goRight
+      || intent == Intent.brakeLeft
+      || intent == Intent.brakeRight;
 
   if (lateralIntent &&
       tiltAligned &&
