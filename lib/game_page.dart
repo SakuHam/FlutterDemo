@@ -13,6 +13,9 @@ import 'engine/polygon_carver.dart';
 // Runtime policy (AI)
 import 'ai/runtime_policy.dart';
 
+// Potential field
+import 'ai/potential_field.dart';
+
 /// Simple UI particle for exhaust/smoke
 class Particle {
   Offset pos;
@@ -20,6 +23,8 @@ class Particle {
   double life; // 0..1
   Particle({required this.pos, required this.vel, required this.life});
 }
+
+enum DebugVisMode { rays, potential, velocity, none }
 
 class GamePage extends StatefulWidget {
   const GamePage({super.key});
@@ -42,13 +47,17 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   // UI particles
   final List<Particle> _particles = [];
 
-  // Toggles
-  bool _showRays = true;
+  // Visualization (chip cycles these)
+  DebugVisMode _visMode = DebugVisMode.rays;
+  PotentialField? _pf; // cached; rebuild when terrain changes
+
+  // AI play toggle
   bool _aiPlay = false;
 
   // Carver (brush)
   double _brushRadius = 28.0;
   bool _carveMode = true;
+  bool _terrainDirty = false;
 
   // ===== AI runtime policy =====
   RuntimeTwoStagePolicy? _policy;   // loaded async from assets
@@ -67,10 +76,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
   Future<void> _loadPolicy() async {
     try {
-      // Adjust asset path if you save with a different name
       final p = await RuntimeTwoStagePolicy.loadFromAsset(
         'assets/ai/policy.json',
-        planHold: 2, // re-plan every 2 frames for smoothness; tweak as you like
+        planHold: 2,
       );
       if (!mounted) return;
       setState(() {
@@ -78,7 +86,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       });
       _toast('AI model loaded');
     } catch (e) {
-      // Non-fatal: user can still play with manual controls
       debugPrint('Failed to load AI policy: $e');
       _toast('AI model failed to load');
     }
@@ -108,17 +115,32 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         includeFloor: false,
         forwardAligned: true,
       );
+      _rebuildPF(); // build once on init/resize
       setState(() {});
     }
   }
 
+  void _rebuildPF() {
+    final e = _engine;
+    if (e == null) return;
+    _pf = buildPotentialField(
+      e,
+      nx: 160,
+      ny: 120,
+      iters: 1200,
+      omega: 1.7,
+      tol: 1e-4,
+    );
+  }
+
   void _reset() {
     _engine?.reset();
-    _policy?.resetPlanner(); // also reset the planner
+    _policy?.resetPlanner();
     _particles.clear();
     _thrust = _left = _right = false;
     _lastIntentIdx = null;
     _lastIntentProbs = const [];
+    _rebuildPF();
     setState(() {});
   }
 
@@ -135,6 +157,23 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       }
     });
     _toast(_aiPlay ? 'AI: ON' : 'AI: OFF');
+  }
+
+  void _cycleVis() {
+    setState(() {
+      final v = DebugVisMode.values;
+      _visMode = v[(_visMode.index + 1) % v.length];
+    });
+    _toast('View: ${_visModeLabel()}');
+  }
+
+  String _visModeLabel() {
+    switch (_visMode) {
+      case DebugVisMode.rays: return 'Rays';
+      case DebugVisMode.potential: return 'Potential';
+      case DebugVisMode.velocity: return 'Velocity';
+      case DebugVisMode.none: return 'None';
+    }
   }
 
   void _toast(String msg) {
@@ -236,6 +275,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       r: _brushRadius,
     );
     e.terrain = carved;
+    _terrainDirty = true;    // mark dirty
     setState(() {});
   }
 
@@ -285,11 +325,20 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
             children: [
               // Game canvas + tap/drag carving
               Positioned.fill(
-                child: GestureDetector(
+                child:GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onTapDown: (d) => _carveAt(d.localPosition),
+                  onTapUp: (_) {
+                    if (_terrainDirty) { _rebuildPF(); _terrainDirty = false; }
+                  },
                   onPanStart: (d) => _carveAt(d.localPosition),
                   onPanUpdate: (d) => _carveAt(d.localPosition),
+                  onPanEnd: (_) {
+                    if (_terrainDirty) { _rebuildPF(); _terrainDirty = false; }
+                  },
+                  onPanCancel: () {
+                    if (_terrainDirty) { _rebuildPF(); _terrainDirty = false; }
+                  },
                   child: CustomPaint(
                     painter: GamePainter(
                       lander: engine.lander,
@@ -297,7 +346,11 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       thrusting: _thrust && engine.lander.fuel > 0 && status == GameStatus.playing,
                       status: status,
                       particles: _particles,
-                      rays: _showRays ? engine.rays : const [],
+                      // Only feed rays to painter when mode == rays
+                      rays: _visMode == DebugVisMode.rays ? engine.rays : const [],
+                      // Potential field & vis mode
+                      pf: _pf,
+                      visMode: _visMode,
                     ),
                   ),
                 ),
@@ -328,12 +381,23 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                           const SizedBox(width: 8),
                           _aiToggleIcon(),
                           const SizedBox(width: 8),
-                          FilterChip(
-                            label: const Text('Show rays'),
-                            selected: _showRays,
-                            onSelected: (v) => setState(() => _showRays = v),
+
+                          // Single chip reused to cycle Rays → Potential → Velocity → None
+                          Tooltip(
+                            message: 'Tap to cycle view • Long-press to rebuild field',
+                            child: FilterChip(
+                              label: Text(_visModeLabel()),
+                              selected: _visMode != DebugVisMode.none,
+                              onSelected: (_) => _cycleVis(),
+//                              onLongPress: () {
+//                                _rebuildPF();
+//                                _toast('Potential field rebuilt');
+//                                setState(() {});
+//                              },
+                            ),
                           ),
                           const SizedBox(width: 8),
+
                           ElevatedButton.icon(
                             onPressed: _reset,
                             icon: const Icon(Icons.refresh),
@@ -387,9 +451,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                                 width: 36,
                                 height: 36,
                                 decoration: BoxDecoration(
-                                  color: _carveMode
-                                      ? Colors.green.withOpacity(0.20)
-                                      : Colors.white10,
+                                  color: _carveMode ? Colors.green.withOpacity(0.20) : Colors.white10,
                                   borderRadius: BorderRadius.circular(10),
                                   border: Border.all(
                                     color: _carveMode ? Colors.greenAccent : Colors.white30,
@@ -528,7 +590,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 }
 
 /// Painter that draws polygon terrain (light gray), pad-highlighted edges,
-/// 360° rays, particles, and the lander triangle.
+/// rays/potential/velocity overlays, particles, and the lander triangle.
 class GamePainter extends CustomPainter {
   final et.LanderState lander;
   final et.Terrain terrain;
@@ -537,6 +599,10 @@ class GamePainter extends CustomPainter {
   final List<Particle> particles;
   final List<RayHit> rays;
 
+  // Potential field visualization
+  final PotentialField? pf;
+  final DebugVisMode visMode;
+
   GamePainter({
     required this.lander,
     required this.terrain,
@@ -544,6 +610,8 @@ class GamePainter extends CustomPainter {
     required this.status,
     required this.particles,
     required this.rays,
+    required this.pf,
+    required this.visMode,
   });
 
   @override
@@ -551,7 +619,16 @@ class GamePainter extends CustomPainter {
     _paintStars(canvas, size);
     _paintTerrainPoly(canvas, size);
     _paintEdgesOverlay(canvas);
-    _paintRays(canvas);
+
+    // Potential/Velocity overlays
+    if (visMode == DebugVisMode.potential && pf != null) {
+      _paintPotentialHeat(canvas, pf!, heatDownsample: 3, alpha: 130);
+    } else if (visMode == DebugVisMode.velocity && pf != null) {
+      _paintPotentialVectors(canvas, pf!, stride: 8, arrowScale: 36.0);
+    } else if (visMode == DebugVisMode.rays) {
+      _paintRays(canvas);
+    }
+
     _paintParticles(canvas);
     _paintLander(canvas);
   }
@@ -627,7 +704,7 @@ class GamePainter extends CustomPainter {
       ..strokeWidth = 1
       ..color = Colors.blueAccent.withOpacity(0.55);
 
-    // Terrain rays now RED for visibility
+    // Terrain rays RED for visibility
     final terrPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.2
@@ -657,6 +734,100 @@ class GamePainter extends CustomPainter {
             : (h.kind == RayHitKind.wall ? Colors.blueAccent : Colors.red);
       canvas.drawCircle(end, 1.7, dotPaint);
     }
+  }
+
+  void _paintPotentialHeat(Canvas canvas, PotentialField pf, {int heatDownsample = 3, int alpha = 160}) {
+    final paint = Paint()..style = PaintingStyle.fill;
+    final nx = pf.gridNx, ny = pf.gridNy;
+    final dx = pf.gridDx, dy = pf.gridDy;
+
+    // get φ range (downsampled)
+    double vmin = 1e9, vmax = -1e9;
+    for (int j = 0; j < ny; j += heatDownsample) {
+      for (int i = 0; i < nx; i += heatDownsample) {
+        final v = pf.phiAtIndex(i, j);
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+      }
+    }
+    final span = (vmax - vmin).abs() < 1e-9 ? 1.0 : (vmax - vmin);
+
+    for (int j = 0; j < ny - 1; j += heatDownsample) {
+      for (int i = 0; i < nx - 1; i += heatDownsample) {
+        final v = pf.phiAtIndex(i, j);
+        final t = ((v - vmin) / span).clamp(0.0, 1.0);
+        paint.color = _lerpTurbo(t).withAlpha(alpha);
+        final rect = Rect.fromLTWH(i * dx, j * dy, dx * heatDownsample, dy * heatDownsample);
+        canvas.drawRect(rect, paint);
+      }
+    }
+
+    // outline obstacles & pad
+    final obst = Paint()..style = PaintingStyle.stroke..strokeWidth = 1.0..color = const Color(0xAA000000);
+    final padP = Paint()..style = PaintingStyle.stroke..strokeWidth = 1.0..color = const Color(0xAA00FFFF);
+    for (int j = 0; j < ny; j += heatDownsample) {
+      for (int i = 0; i < nx; i += heatDownsample) {
+        final m = pf.maskAtIndex(i, j);
+        if (m == 2) {
+          canvas.drawRect(Rect.fromLTWH(i * dx, j * dy, dx * heatDownsample, dy * heatDownsample), obst);
+        } else if (m == 1) {
+          canvas.drawRect(Rect.fromLTWH(i * dx, j * dy, dx * heatDownsample, dy * heatDownsample), padP);
+        }
+      }
+    }
+  }
+
+  void _paintPotentialVectors(Canvas canvas, PotentialField pf, {int stride = 8, double arrowScale = 32.0}) {
+    final line = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.0
+      ..color = const Color(0xFF00E5FF);
+    final head = Paint()
+      ..style = PaintingStyle.fill
+      ..color = const Color(0xFF00E5FF);
+
+    final nx = pf.gridNx, ny = pf.gridNy;
+    final dx = pf.gridDx, dy = pf.gridDy;
+
+    for (int j = 1; j < ny - 1; j += stride) {
+      for (int i = 1; i < nx - 1; i += stride) {
+        if (pf.maskAtIndex(i, j) == 2) continue; // skip obstacle bodies
+        final x = i * dx;
+        final y = j * dy;
+        final flow = pf.sampleFlow(x, y);
+        final sx = x, sy = y;
+        final ex = x + flow.nx * arrowScale;
+        final ey = y + flow.ny * arrowScale;
+        canvas.drawLine(Offset(sx, sy), Offset(ex, ey), line);
+        _arrowHead(canvas, head, Offset(ex, ey), math.atan2(ey - sy, ex - sx), 7.0, 5.0);
+      }
+    }
+  }
+
+  void _arrowHead(Canvas canvas, Paint paint, Offset tip, double ang, double len, double w) {
+    final left = Offset(
+      tip.dx - len * math.cos(ang) + w * math.sin(ang),
+      tip.dy - len * math.sin(ang) - w * math.cos(ang),
+    );
+    final right = Offset(
+      tip.dx - len * math.cos(ang) - w * math.sin(ang),
+      tip.dy - len * math.sin(ang) + w * math.cos(ang),
+    );
+    final path = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(left.dx, left.dy)
+      ..lineTo(right.dx, right.dy)
+      ..close();
+    canvas.drawPath(path, paint);
+  }
+
+  Color _lerpTurbo(double t) {
+    t = t.clamp(0.0, 1.0);
+    final r = (34.61 + t * (1172.33 + t * (-10793.56 + t * (33300.12 + t * (-38394.49 + t * 14825.05)))))/255.0;
+    final g = (23.31 + t * (557.33 + t * (1225.33 + t * (-3574.96 + t * (4479.07 + t * -1930.66)))))/255.0;
+    final b = (27.2 + t * (3211.1 + t * (-15327.97 + t * (27814.0 + t * (-22569.18 + t * 6838.66)))))/255.0;
+    int c(double v) => (v.clamp(0.0, 1.0) * 255).round();
+    return Color.fromARGB(255, c(r), c(g), c(b));
   }
 
   void _paintParticles(Canvas canvas) {
@@ -737,6 +908,8 @@ class GamePainter extends CustomPainter {
         old.thrusting != thrusting ||
         old.status != status ||
         old.particles != particles ||
-        old.rays != rays;
+        old.rays != rays ||
+        old.pf != pf ||
+        old.visMode != visMode;
   }
 }

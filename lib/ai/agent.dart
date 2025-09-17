@@ -228,38 +228,50 @@ int predictiveIntentLabelAdaptive(
   final py = L.pos.y.toDouble();
   final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
+
   final gy = T.heightAt(px);
   final h  = (gy - py).toDouble();
   final dx = px - padCx;
 
-  // horizon
+  // Predict ~1 sec ahead depending on height
   final hNorm = (h / 320.0).clamp(0.0, 1.6);
   final tau = (baseTauSec * (0.7 + 0.5 * hNorm)).clamp(minTauSec, maxTauSec);
-  final g = env.cfg.t.gravity;
-  final dxF = dx + vx * tau;        // lateral projection
-  final vyF = vy + g * tau;         // vertical projection
 
-  // pad bands
+  final g = env.cfg.t.gravity;
+  final dxF = dx + vx * tau;
+  final vyF = vy + g * tau;
+
   final padEnter = 0.08 * W;
   final padExit  = 0.14 * W;
 
-  // --- vertical emergency ---
-  if (h < 50 && vyF > 45) return intentToIndex(Intent.brakeUp);
+  // --- Vertical emergency 'brakeUp' (tight window) ---
+  // Strong cap used by controller: keep label consistent with that cap.
+  final vCapStrong = (0.07 * h + 6.0).clamp(6.0, 16.0);
 
-  // --- lateral intent selection with braking near pad ---
-  // If we are roughly within pad band and lateral speed is large, choose a braking intent.
+  // Trigger only when fairly low and projected descent is hazardous.
+  final tooLow      = h < 140.0;
+  final tooFastDown = vyF > math.max(40.0, vCapStrong + 10.0);
+  final nearPadLat  = dx.abs() <= 0.18 * W;  // don’t engage far out; we should translate instead
+
+  if (tooLow && tooFastDown && nearPadLat) {
+    return intentToIndex(Intent.brakeUp);
+  }
+
+  // --- brake left/right inside pad band if lateral speed is large ---
   if (dx.abs() <= padEnter) {
     if (vx > 25.0)  return intentToIndex(Intent.brakeRight);
     if (vx < -25.0) return intentToIndex(Intent.brakeLeft);
+    // otherwise descendSlow in the band
+    return intentToIndex(Intent.descendSlow);
   }
 
-  // If projected position exits the soft band, translate to re-center
+  // Outside soft band? translate inward toward pad
   if (dxF.abs() > padExit) {
     return dxF > 0 ? intentToIndex(Intent.goRight)
         : intentToIndex(Intent.goLeft);
   }
 
-  // If we’re still inside but about to drift out or velocity points outward at height, translate inward.
+  // About to drift out or moving outward at height? translate inward
   final willExitSoon = (dxF.abs() > padEnter) && (dx.abs() <= padEnter);
   final vxIsOutward  = (dx.sign == vx.sign) && vx.abs() > 20.0;
   if ((willExitSoon || vxIsOutward) && h > 90) {
@@ -267,14 +279,8 @@ int predictiveIntentLabelAdaptive(
         : intentToIndex(Intent.goRight);
   }
 
-  // If comfortably inside band: descend slowly
-  if (dxF.abs() <= padEnter) {
-    return intentToIndex(Intent.descendSlow);
-  }
-
-  // Otherwise, gentle translate toward pad
-  return dxF > 0 ? intentToIndex(Intent.goRight)
-      : intentToIndex(Intent.goLeft);
+  // Stable over pad: descend slowly
+  return intentToIndex(Intent.descendSlow);
 }
 
 et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
@@ -286,53 +292,31 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
 
-  // How close to ceiling? (screen top is y=0)
-  final ceilingDist = (L.pos.y - 0.0).clamp(0.0, 1e9);
-
   switch (intent) {
     case Intent.brakeUp: {
-      // target a mild upward velocity, but avoid ceiling slam
-      double vTargetUp = -(0.06 * h + 6.0);         // ~ -6 .. -24 as you rise
-      vTargetUp = vTargetUp.clamp(-18.0, -8.0);
-
-      // If too close to ceiling, soften it toward 0
-      if (ceilingDist < 140) {
-        final a = (ceilingDist / 140.0).clamp(0.0, 1.0);
-        vTargetUp = a * vTargetUp;                  // fades to 0 as we approach ceiling
-      }
-
-      final need = (vy > vTargetUp);                // thrust only if not yet above target
-      // Extra guard: if basically touching ceiling and already upward, cut thrust
-      final safe = !(ceilingDist < 40 && vy < 2.0);
-      return et.ControlInput(thrust: need && safe, left: false, right: false);
-    }
-
-    case Intent.brakeLeft: {
-      // We want vx → 0 with minimal altitude gain; use thrust only when tilted,
-      // so we translate a tiny bit while bleeding speed.
-      final wantTiltRight = (vx < -4.0);            // moving left (neg), tilt right to brake
-      final allowTranslate = (h > 110 && h < 300) && (vy < 35);
-      return et.ControlInput(
-        thrust: allowTranslate && wantTiltRight,    // thrust assists braking when tilted
-        left: false,
-        right: wantTiltRight,
-      );
-    }
-
-    case Intent.brakeRight: {
-      final wantTiltLeft = (vx > 4.0);
-      final allowTranslate = (h > 110 && h < 300) && (vy < 35);
-      return et.ControlInput(
-        thrust: allowTranslate && wantTiltLeft,
-        left: wantTiltLeft,
-        right: false,
-      );
+      // STRONGER downward-speed cap than descendSlow, never aims upward.
+      final vCap = (0.07 * h + 6.0).clamp(6.0, 16.0); // tight cap
+      final need = vy > vCap;                          // thrust only to reduce descent
+      return et.ControlInput(thrust: need, left: false, right: false);
     }
 
     case Intent.descendSlow: {
-      final vTarget = (0.10 * h + 8.0).clamp(8.0, 26.0);
-      final need = (vy > vTarget) || (h < 110);
+      // gentler cap used when stable over pad
+      final vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);
+      final need = (vy > vCap) || (h < 110);
       return et.ControlInput(thrust: need, left: false, right: false);
+    }
+
+    case Intent.brakeLeft: {
+      final wantTiltRight   = (vx < -4.0); // moving left -> tilt right to bleed |vx|
+      final allowTranslate  = (h > 110 && h < 300) && (vy < 35);
+      return et.ControlInput(thrust: allowTranslate && wantTiltRight, left: false, right: wantTiltRight);
+    }
+
+    case Intent.brakeRight: {
+      final wantTiltLeft    = (vx >  4.0);
+      final allowTranslate  = (h > 110 && h < 300) && (vy < 35);
+      return et.ControlInput(thrust: allowTranslate && wantTiltLeft, left: wantTiltLeft, right: false);
     }
 
     case Intent.goLeft: {
@@ -462,6 +446,19 @@ class PolicyNetwork {
     List<bool>? actionThrustTargets,
     double actionAlignWeight = 0.0,
   }) {
+// --- sanity checks (early exit if heads aren't initialized) ---
+    final int H = trunk.layers.isEmpty ? inputSize : trunk.layers.last.b.length;
+    assert(heads.intent.b.length > 0 && heads.intent.W.isNotEmpty,
+    'intent head not initialized');
+    assert(heads.turn.b.length == 3 && heads.turn.W.length == 3,
+    'turn head must have 3 logits');
+    assert(heads.thr.b.length == 1 && heads.thr.W.length == 1,
+    'thrust head must have 1 logit');
+    assert(heads.intent.W[0].length == H &&
+        heads.turn.W[0].length   == H &&
+        heads.thr.W[0].length    == H,
+    'head input dims must match trunk output');
+
     double _clipGrad(double g, [double c = 1.0]) {
       if (!g.isFinite) return 0.0;
       if (g > c) return c;
@@ -851,6 +848,7 @@ class Trainer {
     double huberDelta = 1.0,
   }) {
     final r = math.Random(seed ^ (_epCounter++));
+    final decisionRewards = <double>[];  // per-decision reward (before discount)
 
     final actionCaches = <ForwardCache>[];
     final actionTurnTargets = <int>[];
@@ -893,19 +891,53 @@ class Trainer {
         currentIntentIdx = idx;
 
         if (train) {
-          // Advantage from delta score (EMA baseline)
           final segHere = _segmentScore(env);
           if (!_scoreEmaInit) { _scoreEma = segHere; _scoreEmaInit = true; }
           _scoreEma = 0.99 * _scoreEma + 0.01 * segHere;
-          final advantage = segHere - _scoreEma;
 
+          final r_t = segHere - _scoreEma;     // dense “delta” reward
           decisionCaches.add(cache);
           intentChoices.add(idx);
           alignLabels.add(yTeacher);
-          decisionReturns.add(advantage);
+          decisionRewards.add(r_t);            // <-- store reward, not advantage yet
         }
 
-        // adaptive plan hold
+        // --- compute discounted returns (advantages) from decisionRewards ---
+        if (train && decisionCaches.isNotEmpty) {
+          final T = decisionRewards.length;
+          if (T != decisionCaches.length ||
+              T != intentChoices.length ||
+              T != alignLabels.length) {
+            // Hard guard: keep arrays in lockstep
+            final m = 'length mismatch: dec=${decisionCaches.length} '
+                'rewards=$T intents=${intentChoices.length} labels=${alignLabels.length}';
+            throw StateError(m);
+          }
+
+          // discounted returns
+          final tmp = List<double>.filled(T, 0.0);
+          double G = 0.0;
+          for (int i = T - 1; i >= 0; i--) {
+            G = decisionRewards[i] + gamma * G;
+            tmp[i] = G;
+          }
+
+          // advantage normalization (optional but helpful)
+          double mean = 0.0;
+          for (final v in tmp) mean += v;
+          mean /= T;
+          double var0 = 0.0;
+          for (final v in tmp) { final d = v - mean; var0 += d * d; }
+          var0 = (var0 / T).clamp(1e-9, double.infinity);
+          final std = math.sqrt(var0);
+
+          decisionReturns.clear();
+          for (final v in tmp) {
+            decisionReturns.add((v - mean) / std);
+          }
+        }
+
+    // adaptive plan hold
         final padCx = env.terrain.padCenter.toDouble();
         final dxAbs = (env.lander.pos.x.toDouble() - padCx).abs();
         final vxAbs = env.lander.vel.x.toDouble().abs();
@@ -973,6 +1005,19 @@ class Trainer {
         // one-time terminal shaping
         segSum += _segmentScore(env, terminalBonus: true);
         segCount++;
+
+        // NEW: feed terminal credit into the PG
+        if (train && decisionRewards.isNotEmpty) {
+          // Recreate the same terminal bonus used in _segmentScore(..., terminalBonus: true)
+          double terminalReward = 0.0;
+          if (landed) {
+            terminalReward = 10.0;
+          } else {
+            final spd = (env.lander.vel.y.abs() + env.lander.vel.x.abs()).clamp(0.0, 120.0);
+            terminalReward = -(6.0 + 0.04 * spd);
+          }
+          decisionRewards[decisionRewards.length - 1] += terminalReward;
+        }
         break;
       }
       if (steps > 5000) break;
