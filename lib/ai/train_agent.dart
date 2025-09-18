@@ -42,8 +42,21 @@ String _feSignature({
   required bool kindsOneHot,
   required double worldW,
   required double worldH,
+  required Map<String, dynamic> physics, // NEW
 }) {
-  return 'kind=rays;in=$inputSize;rays=$rayCount;1hot=$kindsOneHot;W=${worldW.toInt()};H=${worldH.toInt()}';
+  // Keep it short & stable; include a mini-hash of physics to detect mismatches.
+  final sPhys = [
+    physics['gravity'],
+    physics['thrustAccel'],
+    physics['rotSpeed'],
+    physics['rcsEnabled'] ? 1 : 0,
+    physics['rcsAccel'],
+    physics['rcsBodyFrame'] ? 1 : 0,
+    physics['downThrEnabled'] ? 1 : 0,
+    physics['downThrAccel'],
+  ].join(',');
+  final h = sPhys.hashCode;
+  return 'kind=rays;in=$inputSize;rays=$rayCount;1hot=$kindsOneHot;W=${worldW.toInt()};H=${worldH.toInt()};phys=$h';
 }
 
 /* ------------------------------- matrix helpers -------------------------------- */
@@ -66,12 +79,26 @@ Map<String, dynamic> _policyToJson({
   required eng.GameEngine env,
   RunningNorm? norm,
 }) {
+  final physics = {
+    // NEW: embed physics/tunables so live run can mirror training
+    'gravity'        : env.cfg.t.gravity,
+    'thrustAccel'    : env.cfg.t.thrustAccel,
+    'rotSpeed'       : env.cfg.t.rotSpeed,
+    'rcsEnabled'     : (env.cfg.t as dynamic).rcsEnabled ?? false,
+    'rcsAccel'       : (env.cfg.t as dynamic).rcsAccel ?? 0.0,
+    'rcsBodyFrame'   : (env.cfg.t as dynamic).rcsBodyFrame ?? true,
+    'downThrEnabled' : (env.cfg.t as dynamic).downThrEnabled ?? false,
+    'downThrAccel'   : (env.cfg.t as dynamic).downThrAccel ?? 0.0,
+    'downThrBurn'    : (env.cfg.t as dynamic).downThrBurn ?? 0.0,
+  };
+
   final sig = _feSignature(
     inputSize: p.inputSize,
     rayCount: rayCount,
     kindsOneHot: kindsOneHot,
     worldW: env.cfg.worldW,
     worldH: env.cfg.worldH,
+    physics: physics,
   );
 
   final trunkJson = <Map<String, dynamic>>[];
@@ -102,9 +129,14 @@ Map<String, dynamic> _policyToJson({
       'rayCount': rayCount,
       'kindsOneHot': kindsOneHot,
     },
-    'env_hint': {'worldW': env.cfg.worldW, 'worldH': env.cfg.worldH},
+    'env_hint': {
+      'worldW': env.cfg.worldW,
+      'worldH': env.cfg.worldH,
+      'padWidthFactor': env.cfg.padWidthFactor,
+    },
+    'physics': physics,           // NEW: full physics bundle
     'signature': sig,
-    'format': 'v2rays',
+    'format': 'v2rays+phys',      // NEW: mark format version
   };
 
   if (norm != null && norm.inited && norm.dim == p.inputSize) {
@@ -147,6 +179,7 @@ void _savePolicy({
 
 /* --------------------------------- env config --------------------------------- */
 
+// NEW: optional side/down thrusters & gravity exposed via args.
 et.EngineConfig makeConfig({
   int seed = 42,
   bool lockTerrain = false,
@@ -156,16 +189,40 @@ et.EngineConfig makeConfig({
   double worldH = 600,
   double? maxFuel,
   bool crashOnTilt = false,
+
+  // NEW: physics knobs
+  double gravity = 0.18,
+  double thrustAccel = 0.42,
+  double rotSpeed = 1.6,
+
+  // NEW: side thrusters (RCS)
+  bool sideThrusters = false,
+  double sideAccel = 0.12,
+  bool rcsBodyFrame = true,
+
+  // NEW: downward thruster
+  bool downThr = false,
+  double downThrAccel = 0.30,
+  double downThrBurn = 10.0,
 }) {
   final t = et.Tunables(
-    gravity: 0.18,
-    thrustAccel: 0.42,
-    rotSpeed: 1.6,
+    gravity: gravity,
+    thrustAccel: thrustAccel,
+    rotSpeed: rotSpeed,
     maxFuel: maxFuel ?? 1000.0,
     crashOnTilt: crashOnTilt,
     landingMaxVx: 28.0,
     landingMaxVy: 38.0,
     landingMaxOmega: 3.5,
+
+    // NEW in Tunables
+    rcsEnabled: sideThrusters,
+    rcsAccel: sideAccel,
+    rcsBodyFrame: rcsBodyFrame,
+
+    downThrEnabled: downThr,
+    downThrAccel: downThrAccel,
+    downThrBurn: downThrBurn,
   );
   return et.EngineConfig(
     worldW: worldW,
@@ -296,13 +353,13 @@ void _warmFeatureNorm({
         vx = (r.nextDouble() * 14.0) - 7.0;
         vy = 120.0 + 50.0 * r.nextDouble();
         break;
-      case 5: // brakeLeft  (moving right too fast near pad)
+      case 5: // brakeLeft
         x = (padCx + (r.nextDouble() * 0.02 - 0.01) * padHalfW).clamp(10.0, padHalfW - 10.0);
         h = 120 + 100 * r.nextDouble();
         vx = 28.0 + 24.0 * r.nextDouble(); // +vx
         vy = 18.0 + 18.0 * r.nextDouble();
         break;
-      case 6: // brakeRight (moving left too fast near pad)
+      case 6: // brakeRight
         x = (padCx + (r.nextDouble() * 0.02 - 0.01) * padHalfW).clamp(10.0, padHalfW - 10.0);
         h = 120 + 100 * r.nextDouble();
         vx = -(28.0 + 24.0 * r.nextDouble()); // -vx
@@ -356,46 +413,36 @@ class PFShapingCfg {
 }
 
 /// Build a per-step reward hook for current episode/terrain.
-/// Requires Trainer to call `externalRewardHook(env:..., dt:..., tStep:...)` each step.
 ai.ExternalRewardHook makePFRewardHook({
   required eng.GameEngine env,
   PFShapingCfg cfg = const PFShapingCfg(),
 }) {
-  // Build PF once for this episode's terrain
   final pf = buildPotentialField(env, nx: 160, ny: 120, iters: 1200, omega: 1.7, tol: 1e-4);
-
   double prevPhi = pf.samplePhi(env.lander.pos.x, env.lander.pos.y);
 
   return ({required eng.GameEngine env, required double dt, required int tStep}) {
     final x = env.lander.pos.x;
     final y = env.lander.pos.y;
 
-    // 1) Δφ: positive when moving downhill (toward pad)
     final phi = pf.samplePhi(x, y);
     final dPhi = (prevPhi - phi);
     prevPhi = phi;
 
-    // 2) Alignment between actual velocity and −∇φ
     final vx = env.lander.vel.x;
     final vy = env.lander.vel.y;
-    final flow = pf.sampleFlow(x, y); // returns unit (nx,ny)
+    final flow = pf.sampleFlow(x, y); // unit (nx,ny)
     final vmag = math.sqrt(vx * vx + vy * vy);
     double align = 0.0;
     if (vmag > 1e-6) {
       align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny; // [-1,1]
     }
 
-    // 3) Velocity delta to PF "prediction" vector (suggested velocity)
     final sugg = pf.suggestVelocity(x, y, clampSpeed: cfg.clampSpeed);
     final dvx = vx - sugg.vx;
     final dvy = vy - sugg.vy;
     final vErr = math.sqrt(dvx * dvx + dvy * dvy) / cfg.vmax;
 
     final r = cfg.wDeltaPhi * dPhi + cfg.wAlign * align - cfg.wVelDelta * vErr;
-
-    // Optional temporal decay:
-    // return r * (1.0 - 0.0008 * tStep).clamp(0.5, 1.0);
-
     return r;
   };
 }
@@ -442,8 +489,23 @@ void main(List<String> argv) {
   final determinism = args.getFlag('determinism_probe', def: true);
   final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
 
-  // Trainer-internal gating (score is “higher is better”)
-  final gateScoreMin = args.getDouble('gate_min', def: -1e9); // e.g., try 4.0, 6.0, etc
+  // NEW: physics flags
+  final gravity = args.getDouble('gravity', def: 0.18);
+  final thrustAccel = args.getDouble('thrust_accel', def: 0.42);
+  final rotSpeed = args.getDouble('rot_speed', def: 1.6);
+
+  // NEW: side thrusters (RCS)
+  final sideThrusters = args.getFlag('side_thrusters', def: false);
+  final sideAccel = args.getDouble('side_accel', def: 0.12);
+  final rcsBodyFrame = args.getFlag('rcs_body_frame', def: true);
+
+  // NEW: downward thruster
+  final downThr = args.getFlag('down_thr', def: false);
+  final downThrAccel = args.getDouble('down_thr_accel', def: 0.30);
+  final downThrBurn = args.getDouble('down_thr_burn', def: 10.0);
+
+  // Trainer-internal gating
+  final gateScoreMin = args.getDouble('gate_min', def: -1e9);
   final gateOnlyLanded = args.getFlag('gate_landed', def: false);
   final gateVerbose = args.getFlag('gate_verbose', def: true);
 
@@ -457,6 +519,18 @@ void main(List<String> argv) {
     randomSpawnX: randomSpawnX,
     maxFuel: maxFuel,
     crashOnTilt: crashOnTilt,
+
+    gravity: gravity,
+    thrustAccel: thrustAccel,
+    rotSpeed: rotSpeed,
+
+    sideThrusters: sideThrusters,
+    sideAccel: sideAccel,
+    rcsBodyFrame: rcsBodyFrame,
+
+    downThr: downThr,
+    downThrAccel: downThrAccel,
+    downThrBurn: downThrBurn,
   );
   final env = eng.GameEngine(cfg);
 
@@ -499,12 +573,13 @@ void main(List<String> argv) {
     intentPgWeight: intentPgWeight,
     actionAlignWeight: actionAlignWeight,
     normalizeFeatures: true,
-    // gating inside trainer (prints [TRAIN] lines)
+
+    // gating inside trainer
     gateScoreMin: gateScoreMin,
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
 
-    // NEW: add dense PF reward per step
+    // add dense PF reward per step
     externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
       return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
     }),
@@ -612,18 +687,22 @@ void main(List<String> argv) {
 
 /* ----------------------------------- usage ------------------------------------
 
-Train with PF shaping + internal gating on segment score (higher is better). Example:
+Examples with new physics flags:
 
+  // Zero-g sandbox: side + down thrusters on
   dart run lib/ai/train_agent.dart \
-    --hidden=96,96,64 \
-    --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 \
-    --blend_policy=1.0 --intent_align=0.25 --intent_pg=0.6 \
-    --gate_min=4.0 --gate_landed \
-    --determinism_probe
+    --gravity=0.0 \
+    --side_thrusters --side_accel=0.12 --rcs_body_frame \
+    --down_thr --down_thr_accel=0.30 --down_thr_burn=10 \
+    --train_iters=300 --batch=1
+
+  // Heavier gravity + weaker main engine + world-frame strafing
+  dart run lib/ai/train_agent.dart \
+    --gravity=0.26 --thrust_accel=0.36 --rot_speed=1.4 \
+    --side_thrusters --side_accel=0.10 --rcs_body_frame=false \
+    --down_thr --down_thr_accel=0.22
 
 Notes:
-- Requires Trainer to support `externalRewardHook` (small change in agent.dart).
-- PF shaping terms:
-    r = wDeltaPhi * Δφ  +  wAlign * cos(v, −∇φ)  −  wVelDelta * ||v − v_pf||/vmax
-  Tune weights in PFShapingCfg if needed.
--------------------------------------------------------------------------------- */
+- The saved JSON now includes a "physics" object with all these toggles/values.
+- Your live runner can parse it and configure `EngineConfig/Tunables` accordingly.
+------------------------------------------------------------------------------- */

@@ -44,6 +44,11 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   bool _left = false;
   bool _right = false;
 
+  // NEW: extra channels (driven by AI; UI still 3 buttons)
+  bool _sideLeft = false;
+  bool _sideRight = false;
+  bool _downThrust = false;
+
   // UI particles
   final List<Particle> _particles = [];
 
@@ -81,6 +86,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         planHold: 2,
       );
       if (!mounted) return;
+
+      // Optional: try to sync engine physics with policy.physics (if engine already exists)
+      _applyPolicyPhysicsToEngine(p);
+
       setState(() {
         _policy = p;
       });
@@ -88,6 +97,33 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     } catch (e) {
       debugPrint('Failed to load AI policy: $e');
       _toast('AI model failed to load');
+    }
+  }
+
+  // Apply the physics bundle from the policy JSON to the engine tunables (if supported).
+  void _applyPolicyPhysicsToEngine(RuntimeTwoStagePolicy p) {
+    final e = _engine;
+    if (e == null) return;
+    final phys = p.phys; // RuntimePhysics
+
+    try {
+      // Assumes Tunables/EngineConfig expose copyWith for these fields (as discussed).
+      e.cfg = e.cfg.copyWith(
+        t: e.cfg.t.copyWith(
+          gravity: phys.gravity,
+          thrustAccel: phys.thrustAccel,
+          rotSpeed: phys.rotSpeed,
+          rcsEnabled: phys.rcsEnabled,
+          rcsAccel: phys.rcsAccel,
+          rcsBodyFrame: phys.rcsBodyFrame,
+          downThrEnabled: phys.downThrEnabled,
+          downThrAccel: phys.downThrAccel,
+          downThrBurn: phys.downThrBurn,
+        ),
+      );
+    } catch (_) {
+      // If your types.dart hasn't been extended yet, just ignore silently.
+      debugPrint('Note: engine Tunables missing new physics fields; skipping runtime sync.');
     }
   }
 
@@ -106,7 +142,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       final cfg = EngineConfig(
         worldW: size.width,
         worldH: size.height,
-        t: Tunables(),
+        t: Tunables(), // defaults; may be overridden below if policy already loaded
       );
 
       _engine = GameEngine(cfg);
@@ -115,6 +151,11 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         includeFloor: false,
         forwardAligned: true,
       );
+
+      // If policy is already loaded, sync physics now so sim matches training.
+      final p = _policy;
+      if (p != null) _applyPolicyPhysicsToEngine(p);
+
       _rebuildPF(); // build once on init/resize
       setState(() {});
     }
@@ -138,6 +179,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     _policy?.resetPlanner();
     _particles.clear();
     _thrust = _left = _right = false;
+    _sideLeft = _sideRight = _downThrust = false;
     _lastIntentIdx = null;
     _lastIntentProbs = const [];
     _rebuildPF();
@@ -154,6 +196,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       if (_aiPlay) {
         _policy?.resetPlanner();
         _thrust = _left = _right = false;
+        _sideLeft = _sideRight = _downThrust = false;
       }
     });
     _toast(_aiPlay ? 'AI: ON' : 'AI: OFF');
@@ -207,7 +250,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       final lander = engine.lander;     // et.LanderState
       final terr = engine.terrain;      // et.Terrain
 
-      final (th, lf, rt, idx, probs) = _policy!.actWithIntent(
+      // NEW: use the extended call (side/down thrusters)
+      final (th, lf, rt, sL, sR, dT, idx, probs) = _policy!.actWithIntentExt(
         lander: lander,
         terrain: terr,
         worldW: engine.cfg.worldW,
@@ -220,6 +264,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _thrust = th;
       _left = lf;
       _right = rt;
+      _sideLeft = sL;
+      _sideRight = sR;
+      _downThrust = dT;
 
       _lastIntentIdx = idx;
       _lastIntentProbs = probs;
@@ -227,26 +274,29 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
     final info = engine.step(
       dt,
-      ControlInput(thrust: _thrust, left: _left, right: _right),
+      // NEW: forward extra channels (requires ControlInput to have these fields)
+      ControlInput(
+        thrust: _thrust,
+        left: _left,
+        right: _right,
+        sideLeft: _sideLeft,
+        sideRight: _sideRight,
+        downThrust: _downThrust,
+      ),
     );
 
     // Exhaust particles
     final lander = engine.lander;
-    if (_thrust && lander.fuel > 0) {
-      final c = math.cos(lander.angle);
-      final s = math.sin(lander.angle);
-      const halfH = 18.0;
-      final axis = Offset(-s, c); // down in ship frame
-      final flameBase = Offset(lander.pos.x, lander.pos.y) + axis * halfH;
-      final rnd = math.Random();
-      for (int i = 0; i < 6; i++) {
-        final perp = Offset(-c, -s);
-        final spread = (rnd.nextDouble() - 0.5) * 0.35;
-        final dir = (axis + perp * spread);
-        final speed = 60 + rnd.nextDouble() * 60;
-        _particles.add(Particle(pos: flameBase, vel: dir * speed, life: 1.0));
-      }
-    }
+
+    // Main engine plume
+    _maybeEmitMainFlame(lander);
+
+    // NEW: side RCS plumes
+    _maybeEmitSideRCS(lander);
+
+    // NEW: downward (belly) thruster plume (when gravity ~ 0, this points "down" in screen)
+    _maybeEmitDownwardFlame(lander);
+
     // Update particles
     for (int i = _particles.length - 1; i >= 0; i--) {
       final p = _particles[i];
@@ -261,6 +311,75 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     }
 
     setState(() {});
+  }
+
+  void _maybeEmitMainFlame(LanderState lander) {
+    final engine = _engine!;
+    if (_thrust && lander.fuel > 0 && engine.status == GameStatus.playing) {
+      final c = math.cos(lander.angle);
+      final s = math.sin(lander.angle);
+      const halfH = 18.0;
+      final axis = Offset(-s, c); // down in ship frame
+      final flameBase = Offset(lander.pos.x, lander.pos.y) + axis * halfH;
+      final rnd = math.Random();
+      for (int i = 0; i < 6; i++) {
+        final perp = Offset(-c, -s);
+        final spread = (rnd.nextDouble() - 0.5) * 0.35;
+        final dir = (axis + perp * spread);
+        final speed = 60 + rnd.nextDouble() * 60;
+        _particles.add(Particle(pos: flameBase, vel: dir * speed, life: 1.0));
+      }
+    }
+  }
+
+  void _maybeEmitSideRCS(LanderState lander) {
+    if ((!_sideLeft && !_sideRight) || lander.fuel <= 0) return;
+
+    final c = math.cos(lander.angle);
+    final s = math.sin(lander.angle);
+    const halfH = 12.0;
+    const halfW = 14.0;
+
+    // emit from left/right belly
+    final upBody = Offset(s, -c);     // ship “up”
+    final rightBody = Offset(c, s);   // ship “right”
+    final leftPort = Offset(lander.pos.x, lander.pos.y) + upBody * 0 + rightBody * (-halfW) + upBody * halfH;
+    final rightPort = Offset(lander.pos.x, lander.pos.y) + rightBody * (halfW) + upBody * halfH;
+
+    final rnd = math.Random();
+    if (_sideLeft) {
+      // fire on left side → exhaust goes to the left (negative rightBody)
+      final dir = -rightBody;
+      for (int i = 0; i < 2; i++) {
+        final jitter = Offset((rnd.nextDouble() - 0.5) * 0.4, (rnd.nextDouble() - 0.5) * 0.2);
+        _particles.add(Particle(pos: leftPort, vel: (dir + jitter) * (70 + rnd.nextDouble() * 40), life: 0.8));
+      }
+    }
+    if (_sideRight) {
+      final dir = rightBody;
+      for (int i = 0; i < 2; i++) {
+        final jitter = Offset((rnd.nextDouble() - 0.5) * 0.4, (rnd.nextDouble() - 0.5) * 0.2);
+        _particles.add(Particle(pos: rightPort, vel: (dir + jitter) * (70 + rnd.nextDouble() * 40), life: 0.8));
+      }
+    }
+  }
+
+  void _maybeEmitDownwardFlame(LanderState lander) {
+    if (!_downThrust || lander.fuel <= 0) return;
+
+    final c = math.cos(lander.angle);
+    final s = math.sin(lander.angle);
+    const halfH = 6.0;
+
+    // “Downward thruster” mounted on belly pointing +Y in world
+    final port = Offset(lander.pos.x, lander.pos.y) + Offset(0, halfH);
+    final rnd = math.Random();
+    for (int i = 0; i < 3; i++) {
+      final spread = (rnd.nextDouble() - 0.5) * 0.4;
+      final dir = Offset(spread, 1.0); // straight down in screen space
+      final speed = 60 + rnd.nextDouble() * 50;
+      _particles.add(Particle(pos: port, vel: dir * speed, life: 0.9));
+    }
   }
 
   // ------------ Carving ------------
@@ -389,11 +508,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                               label: Text(_visModeLabel()),
                               selected: _visMode != DebugVisMode.none,
                               onSelected: (_) => _cycleVis(),
-//                              onLongPress: () {
-//                                _rebuildPF();
-//                                _toast('Potential field rebuilt');
-//                                setState(() {});
-//                              },
                             ),
                           ),
                           const SizedBox(width: 8),

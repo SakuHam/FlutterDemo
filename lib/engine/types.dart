@@ -8,9 +8,17 @@ class Tunables {
   double maxFuel;
 
   final bool crashOnTilt;
-  final double landingMaxVx;
-  final double landingMaxVy;
-  final double landingMaxOmega;
+  final double landingMaxVx, landingMaxVy, landingMaxOmega;
+
+  // RCS (already added earlier)
+  final bool rcsEnabled;
+  final double rcsAccel;
+  final bool rcsBodyFrame;
+
+  // NEW ↓↓↓ Downward thruster (to descend in low/zero-g)
+  final bool downThrEnabled;
+  final double downThrAccel;   // similar order as thrustAccel, usually smaller
+  final double downThrBurn;    // fuel/sec baseline for down thruster
 
   Tunables({
     this.gravity = 0.18,
@@ -20,7 +28,16 @@ class Tunables {
     this.crashOnTilt = true,
     this.landingMaxVx = 28.0,
     this.landingMaxVy = 38.0,
-    this.landingMaxOmega = 2.0,
+    this.landingMaxOmega = 3.5,
+
+    this.rcsEnabled = false,
+    this.rcsAccel = 0.12,
+    this.rcsBodyFrame = true,
+
+    // NEW defaults
+    this.downThrEnabled = false,
+    this.downThrAccel = 0.30,
+    this.downThrBurn = 10.0,
   });
 
   Tunables copyWith({
@@ -28,22 +45,68 @@ class Tunables {
     double? thrustAccel,
     double? rotSpeed,
     double? maxFuel,
+
     bool? crashOnTilt,
     double? landingMaxVx,
     double? landingMaxVy,
     double? landingMaxOmega,
+
+    // RCS
+    bool? rcsEnabled,
+    double? rcsAccel,
+    bool? rcsBodyFrame,
+
+    // Downward thruster
+    bool? downThrEnabled,
+    double? downThrAccel,
+    double? downThrBurn,
   }) {
     return Tunables(
       gravity: gravity ?? this.gravity,
       thrustAccel: thrustAccel ?? this.thrustAccel,
       rotSpeed: rotSpeed ?? this.rotSpeed,
       maxFuel: maxFuel ?? this.maxFuel,
+
       crashOnTilt: crashOnTilt ?? this.crashOnTilt,
       landingMaxVx: landingMaxVx ?? this.landingMaxVx,
       landingMaxVy: landingMaxVy ?? this.landingMaxVy,
       landingMaxOmega: landingMaxOmega ?? this.landingMaxOmega,
+
+      rcsEnabled: rcsEnabled ?? this.rcsEnabled,
+      rcsAccel: rcsAccel ?? this.rcsAccel,
+      rcsBodyFrame: rcsBodyFrame ?? this.rcsBodyFrame,
+
+      downThrEnabled: downThrEnabled ?? this.downThrEnabled,
+      downThrAccel: downThrAccel ?? this.downThrAccel,
+      downThrBurn: downThrBurn ?? this.downThrBurn,
     );
   }
+}
+
+class ControlInput {
+  final bool thrust;
+  final bool left;
+  final bool right;
+
+  // RCS (already added earlier)
+  final bool sideLeft;
+  final bool sideRight;
+
+  // NEW ↓↓↓ downward thruster
+  final bool downThrust;
+
+  // not new, but keep your extra fields like intentIdx etc.
+  final int intentIdx;
+
+  const ControlInput({
+    required this.thrust,
+    required this.left,
+    required this.right,
+    this.sideLeft = false,
+    this.sideRight = false,
+    this.downThrust = false,      // NEW default off
+    this.intentIdx = -1,
+  });
 }
 
 class EngineConfig {
@@ -269,20 +332,6 @@ class EngineConfig {
 }
 
 enum GameStatus { playing, landed, crashed }
-
-class ControlInput {
-  final bool thrust;
-  final bool left;
-  final bool right;
-  final int? intentIdx;
-
-  const ControlInput({
-    required this.thrust,
-    required this.left,
-    required this.right,
-    this.intentIdx,
-  });
-}
 
 class Vector2 {
   double x, y;

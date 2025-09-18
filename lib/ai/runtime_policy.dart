@@ -12,6 +12,75 @@ import '../engine/raycast.dart' show RayHit, RayHitKind; // for ray-based FE
 import 'intent_bus.dart';
 
 /* =============================================================================
+   Physics bundle loaded from policy JSON (used by runtime controls)
+   ========================================================================== */
+
+class RuntimePhysics {
+  final double gravity;
+  final double thrustAccel;
+  final double rotSpeed;
+
+  // Side thrusters (RCS)
+  final bool rcsEnabled;
+  final double rcsAccel;
+  final bool rcsBodyFrame;
+
+  // Downward (belly) thruster
+  final bool downThrEnabled;
+  final double downThrAccel;
+  final double downThrBurn;
+
+  const RuntimePhysics({
+    this.gravity = 0.18,
+    this.thrustAccel = 0.42,
+    this.rotSpeed = 1.6,
+    this.rcsEnabled = false,
+    this.rcsAccel = 0.12,
+    this.rcsBodyFrame = true,
+    this.downThrEnabled = false,
+    this.downThrAccel = 0.30,
+    this.downThrBurn = 10.0,
+  });
+
+  static RuntimePhysics fromJsonMap(Map<String, dynamic>? m) {
+    if (m == null) return const RuntimePhysics();
+    double _d(String k, double dflt) {
+      final v = m[k];
+      if (v is num) return v.toDouble();
+      return dflt;
+    }
+    bool _b(String k, bool dflt) {
+      final v = m[k];
+      if (v is bool) return v;
+      return dflt;
+    }
+    return RuntimePhysics(
+      gravity        : _d('gravity', 0.18),
+      thrustAccel    : _d('thrustAccel', 0.42),
+      rotSpeed       : _d('rotSpeed', 1.6),
+      rcsEnabled     : _b('rcsEnabled', false),
+      rcsAccel       : _d('rcsAccel', 0.12),
+      rcsBodyFrame   : _b('rcsBodyFrame', true),
+      downThrEnabled : _b('downThrEnabled', false),
+      downThrAccel   : _d('downThrAccel', 0.30),
+      downThrBurn    : _d('downThrBurn', 10.0),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'gravity'        : gravity,
+    'thrustAccel'    : thrustAccel,
+    'rotSpeed'       : rotSpeed,
+    'rcsEnabled'     : rcsEnabled,
+    'rcsAccel'       : rcsAccel,
+    'rcsBodyFrame'   : rcsBodyFrame,
+    'downThrEnabled' : downThrEnabled,
+    'downThrAccel'   : downThrAccel,
+    'downThrBurn'    : downThrBurn,
+  };
+}
+
+/* =============================================================================
    Feature extractors
    ========================================================================== */
 
@@ -139,9 +208,15 @@ class _RuntimeFE_Rays implements _RuntimeFE {
         double tTerr = 0, tPad = 0, tWall = 0;
         if (rh != null) {
           switch (rh.kind) {
-            case RayHitKind.terrain: tTerr = 1; break;
-            case RayHitKind.pad:     tPad  = 1; break;
-            case RayHitKind.wall:    tWall = 1; break;
+            case RayHitKind.terrain:
+              tTerr = 1;
+              break;
+            case RayHitKind.pad:
+              tPad = 1;
+              break;
+            case RayHitKind.wall:
+              tWall = 1;
+              break;
           }
         }
         out.addAll([dN, tTerr, tPad, tWall]);
@@ -162,9 +237,8 @@ class _RuntimeFE_Rays implements _RuntimeFE {
     if (r.kind != RayHitKind.pad) continue;
     final dx = r.p.x - px;
     final dy = r.p.y - py;
-    final d2 = dx*dx + dy*dy;
+    final d2 = dx * dx + dy * dy;
     if (d2 <= 1e-9) continue;
-    // Heavier weight when closer to the pad; clamp to avoid explosions
     final w = 1.0 / math.sqrt(d2 + 1e-6);
     sx += w * dx;
     sy += w * dy;
@@ -230,7 +304,10 @@ int _argmax(List<double> a) {
   var idx = 0;
   var best = a[0];
   for (int i = 1; i < a.length; i++) {
-    if (a[i] > best) { best = a[i]; idx = i; }
+    if (a[i] > best) {
+      best = a[i];
+      idx = i;
+    }
   }
   return idx;
 }
@@ -301,7 +378,7 @@ const List<String> kIntentNames = [
 ];
 
 /* =============================================================================
-   Low-level controller (heuristic) to execute the chosen intent
+   Low-level controllers
    ========================================================================== */
 
 ({bool thrust, bool left, bool right}) _controllerForIntentUI(
@@ -320,12 +397,12 @@ const List<String> kIntentNames = [
   bool left = false, right = false, thrust = false;
 
   final groundY = terrain.heightAt(lander.pos.x);
-  final height  = (groundY - lander.pos.y).clamp(0.0, 1e9);
+  final height = (groundY - lander.pos.y).clamp(0.0, 1e9);
   final ceilingDist = (lander.pos.y - 0.0).clamp(0.0, 1e9);
 
   const double vxGoalAbs = 80.0;
-  const double kAngV     = 0.015;
-  const double kDxHover  = 0.40;
+  const double kAngV = 0.015;
+  const double kDxHover = 0.40;
 
   double maxTilt = 20 * math.pi / 180;
   if (ceilingDist < 140) {
@@ -335,12 +412,12 @@ const List<String> kIntentNames = [
   }
 
   double vxDes = switch (intent) {
-    Intent.goLeft     => -vxGoalAbs,
-    Intent.goRight    =>  vxGoalAbs,
-    Intent.brakeLeft  =>  0.0,           // actively reduce |vx| when moving left
-    Intent.brakeRight =>  0.0,           // actively reduce |vx| when moving right
-    Intent.hover      => -kDxHover * dx, // center over pad
-    _                 => 0.0,
+    Intent.goLeft => -vxGoalAbs,
+    Intent.goRight => vxGoalAbs,
+    Intent.brakeLeft => 0.0,
+    Intent.brakeRight => 0.0,
+    Intent.hover => -kDxHover * dx,
+    _ => 0.0,
   };
 
   final vxErr = (vxDes - vx);
@@ -358,38 +435,104 @@ const List<String> kIntentNames = [
 
   double targetVy = vyCapDown;
   if (intent == Intent.descendSlow) targetVy = math.min(targetVy, 18.0);
-  if (intent == Intent.brakeUp)     targetVy = -15.0;
+  if (intent == Intent.brakeUp) targetVy = -15.0;
 
   if (height < 120) targetVy = math.min(targetVy, 18.0);
-  if (height <  60) targetVy = math.min(targetVy, 10.0);
+  if (height < 60) targetVy = math.min(targetVy, 10.0);
 
   final eVy = vy - targetVy;
   thrust = eVy > 0;
 
   const double vxErrTh = 20.0;
   final bool tiltAligned =
-      (targetAngle >  6 * math.pi / 180 && angle >  3 * math.pi / 180) ||
+      (targetAngle > 6 * math.pi / 180 && angle > 3 * math.pi / 180) ||
           (targetAngle < -6 * math.pi / 180 && angle < -3 * math.pi / 180);
-  final bool lateralIntent = intent == Intent.goLeft
-      || intent == Intent.goRight
-      || intent == Intent.brakeLeft
-      || intent == Intent.brakeRight;
+  final bool lateralIntent = intent == Intent.goLeft ||
+      intent == Intent.goRight ||
+      intent == Intent.brakeLeft ||
+      intent == Intent.brakeRight;
 
-  if (lateralIntent &&
-      tiltAligned &&
-      vxErr.abs() > vxErrTh &&
-      ceilingDist > 100 &&
-      vy > -6) {
+  if (lateralIntent && tiltAligned && vxErr.abs() > vxErrTh && ceilingDist > 100 && vy > -6) {
     thrust = true;
   }
 
-  if (ceilingDist < 40 && vy < 2) {
-    thrust = false;
-  }
-
+  if (ceilingDist < 40 && vy < 2) thrust = false;
   if (lander.pos.y < 4) thrust = false;
 
   return (thrust: thrust, left: left, right: right);
+}
+
+/// Extended controller that can also emit side/down thrusters based on physics.
+({bool thrust, bool left, bool right, bool sideLeft, bool sideRight, bool downThrust})
+_controllerForIntentExt(
+    Intent intent, {
+      required LanderState lander,
+      required Terrain terrain,
+      required double worldW,
+      required double worldH,
+      required RuntimePhysics phys,
+    }) {
+  final base = _controllerForIntentUI(
+    intent,
+    lander: lander,
+    terrain: terrain,
+    worldW: worldW,
+    worldH: worldH,
+  );
+
+  bool sideLeft = false, sideRight = false, downThrust = false;
+
+  // Simple, safe heuristics mirroring training-time teacher
+  final padCx = (terrain.padX1 + terrain.padX2) * 0.5;
+  final dx = (lander.pos.x - padCx).abs();
+  final vx = lander.vel.x;
+  final vy = lander.vel.y;
+  final groundY = terrain.heightAt(lander.pos.x);
+  final h = (groundY - lander.pos.y).toDouble();
+  final W = worldW;
+
+  // Use RCS for lateral intents when nearly level & safe
+  bool canStrafe() {
+    if (!phys.rcsEnabled) return false;
+    final maxTilt = 0.10; // rad
+    if (lander.angle.abs() > maxTilt) return false;
+    if (!(h > 110 && h < 300)) return false;
+    if (lander.vel.y.abs() >= 35.0) return false;
+    return true;
+  }
+
+  switch (intent) {
+    case Intent.goLeft:
+      if (canStrafe()) sideRight = true; // push left
+      break;
+    case Intent.goRight:
+      if (canStrafe()) sideLeft = true; // push right
+      break;
+    case Intent.brakeLeft:
+      if (canStrafe() && vx < -4.0) sideLeft = true; // push rightwards (reduce |vx|)
+      break;
+    case Intent.brakeRight:
+      if (canStrafe() && vx > 4.0) sideRight = true; // push leftwards
+      break;
+    case Intent.descendSlow:
+    // In very low/zero gravity, use belly thruster to establish descent
+      if (phys.downThrEnabled && phys.gravity.abs() < 1e-6) {
+        final vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);
+        if (vy < 0.7 * vCap) downThrust = true; // start descending
+      }
+      break;
+    default:
+      break;
+  }
+
+  return (
+  thrust: base.thrust,
+  left: base.left,
+  right: base.right,
+  sideLeft: sideLeft,
+  sideRight: sideRight,
+  downThrust: downThrust
+  );
 }
 
 /* =============================================================================
@@ -402,9 +545,9 @@ class RuntimeTwoStagePolicy {
   final _MLP trunk; // arbitrary hidden layers (tanh)
   final _Linear headIntent; // (K, Hlast)
   // Optional loaded heads (not used by planner, kept for parity)
-  final _Linear? headTurn;  // (3, Hlast)
-  final _Linear? headThr;   // (1, Hlast)
-  final _Linear? headVal;   // (1, Hlast)
+  final _Linear? headTurn; // (3, Hlast)
+  final _Linear? headThr; // (1, Hlast)
+  final _Linear? headVal; // (1, Hlast)
 
   // FE & planner config
   final _RuntimeFE fe;
@@ -414,13 +557,16 @@ class RuntimeTwoStagePolicy {
   final _RuntimeNorm? norm;
   final String? signature;
 
+  // Loaded physics (NEW)
+  final RuntimePhysics physics;
+
   // Planner state
   int _framesLeft = 0;
   int _currentIntentIdx = -1;
   List<double>? _lastReplanProbs;
 
   final bool fixPolarityWithPadRays; // swap goLeft/goRight if pad-avg disagrees
-  final bool mirrorX;                // hard flip left/right mapping (debug/safety)
+  final bool mirrorX; // hard flip left/right mapping (debug/safety)
 
   RuntimeTwoStagePolicy._({
     required this.inputSize,
@@ -433,6 +579,7 @@ class RuntimeTwoStagePolicy {
     required this.planHold,
     required this.norm,
     required this.signature,
+    required this.physics, // NEW
     this.fixPolarityWithPadRays = false,
     this.mirrorX = false,
   });
@@ -445,9 +592,8 @@ class RuntimeTwoStagePolicy {
     final Map<String, dynamic> j = json.decode(jsonString);
 
     List<List<double>> _as2d(dynamic v) =>
-        (v as List).map<List<double>>((r) => (r as List).map<double>((x)=> (x as num).toDouble()).toList()).toList();
-    List<double> _as1d(dynamic v) =>
-        (v as List).map<double>((x)=> (x as num).toDouble()).toList();
+        (v as List).map<List<double>>((r) => (r as List).map<double>((x) => (x as num).toDouble()).toList()).toList();
+    List<double> _as1d(dynamic v) => (v as List).map<double>((x) => (x as num).toDouble()).toList();
 
     _RuntimeNorm? _readNorm(Map<String, dynamic> root, int expectDim, String? expectSig) {
       final nm = (root['norm'] as Map?)?.cast<String, dynamic>();
@@ -455,9 +601,7 @@ class RuntimeTwoStagePolicy {
         final dim = (nm['dim'] as num?)?.toInt() ?? -1;
         final sig = nm['signature'] as String?;
         if (dim == expectDim && (expectSig == null || sig == expectSig)) {
-          return _RuntimeNorm(dim,
-              mean: _as1d(nm['mean']),
-              var_: _as1d(nm['var']));
+          return _RuntimeNorm(dim, mean: _as1d(nm['mean']), var_: _as1d(nm['var']));
         }
       }
       final nmv = root['norm_mean'];
@@ -493,7 +637,8 @@ class RuntimeTwoStagePolicy {
         final W = _as2d(layerObj['W']);
         final b = _as1d(layerObj['b']);
         if (W.isEmpty || W[0].length != expectIn || W.length != b.length) {
-          throw StateError('Trunk layer $li shape mismatch: got ${W.length}x${W[0].length}, bias ${b.length}, expected in=$expectIn');
+          throw StateError(
+              'Trunk layer $li shape mismatch: got ${W.length}x${W[0].length}, bias ${b.length}, expected in=$expectIn');
         }
         layers.add(_Linear(W, b));
         expectIn = b.length;
@@ -514,8 +659,8 @@ class RuntimeTwoStagePolicy {
       final headIntent = _readHead('intent');
       _Linear? headTurn, headThr, headVal;
       if (headsJ.containsKey('turn')) headTurn = _readHead('turn');
-      if (headsJ.containsKey('thr'))  headThr  = _readHead('thr');
-      if (headsJ.containsKey('val'))  headVal  = _readHead('val');
+      if (headsJ.containsKey('thr')) headThr = _readHead('thr');
+      if (headsJ.containsKey('val')) headVal = _readHead('val');
 
       // FE choice
       _RuntimeFE fe0;
@@ -537,6 +682,11 @@ class RuntimeTwoStagePolicy {
 
       final norm = _readNorm(j, inputSize, sig);
 
+      // NEW: read physics bundle (present if trained with the new saver)
+      final physics = RuntimePhysics.fromJsonMap(
+        (j['physics'] as Map?)?.cast<String, dynamic>(),
+      );
+
       return RuntimeTwoStagePolicy._(
         inputSize: inputSize,
         trunk: trunk,
@@ -548,6 +698,7 @@ class RuntimeTwoStagePolicy {
         planHold: planHold,
         norm: norm,
         signature: sig,
+        physics: physics,
         fixPolarityWithPadRays: true,
         mirrorX: false,
       );
@@ -558,9 +709,12 @@ class RuntimeTwoStagePolicy {
     List<double> _as1dReq(String k) => _as1d(j[k]);
 
     final inputSize = (j['inputSize'] as num).toInt();
-    final W1 = _as2dReq('W1'); final b1 = _as1dReq('b1');
-    final W2 = _as2dReq('W2'); final b2 = _as1dReq('b2');
-    final W_int = _as2dReq('W_intent'); final b_int = _as1dReq('b_intent');
+    final W1 = _as2dReq('W1');
+    final b1 = _as1dReq('b1');
+    final W2 = _as2dReq('W2');
+    final b2 = _as1dReq('b2');
+    final W_int = _as2dReq('W_intent');
+    final b_int = _as1dReq('b_intent');
 
     _Linear? headTurn, headThr, headVal;
     if (j.containsKey('W_turn') && j.containsKey('b_turn')) {
@@ -587,6 +741,9 @@ class RuntimeTwoStagePolicy {
     final sig = j['signature'] as String?;
     final norm = _readNorm(j, inputSize, sig);
 
+    // Legacy models have no physics block → fallbacks
+    final physics = const RuntimePhysics();
+
     return RuntimeTwoStagePolicy._(
       inputSize: inputSize,
       trunk: trunk,
@@ -598,6 +755,7 @@ class RuntimeTwoStagePolicy {
       planHold: planHold,
       norm: norm,
       signature: sig,
+      physics: physics,
     );
   }
 
@@ -609,17 +767,22 @@ class RuntimeTwoStagePolicy {
     return RuntimeTwoStagePolicy.fromJson(js, planHold: planHold);
   }
 
-  void resetPlanner() { _framesLeft = 0; _currentIntentIdx = -1; }
+  // Expose physics to the game layer (read-only)
+  RuntimePhysics get phys => physics;
 
-  /// Main runtime step: choose/hold intent, emit control, publish bus events.
-  ///
-  /// If the loaded policy expects **ray features**, you **must** pass [rays].
+  void resetPlanner() {
+    _framesLeft = 0;
+    _currentIntentIdx = -1;
+  }
+
+  /// Back-compat: original API (no side/down thrusters).
+  /// If your engine supports extra channels, call [actWithIntentExt] instead.
   (bool thrust, bool left, bool right, int intentIdx, List<double> probs) actWithIntent({
     required LanderState lander,
     required Terrain terrain,
     required double worldW,
     required double worldH,
-    List<RayHit>? rays,            // REQUIRED when FE is rays
+    List<RayHit>? rays, // REQUIRED when FE is rays
     int step = 0,
     double uiMaxFuel = 100.0,
   }) {
@@ -644,28 +807,15 @@ class RuntimeTwoStagePolicy {
       _framesLeft = planHold;
       _lastReplanProbs = probs;
 
-// Optional polarity fix using average of pad rays (more stable than nearest)
+      // Optional polarity fix using average pad vector
       if (fixPolarityWithPadRays && rays != null && rays.isNotEmpty) {
-        final av = _avgPadVector(
-          rays: rays,
-          px: lander.pos.x,
-          py: lander.pos.y,
-        );
+        final av = _avgPadVector(rays: rays, px: lander.pos.x, py: lander.pos.y);
         if (av.valid) {
-          // If pad is to the left (negative x from craft), we *expect* goLeft.
           final padIsLeft = av.x < 0.0;
-
-          // Current NN choice:
-          final isLeft  = _currentIntentIdx == Intent.goLeft.index;
+          final isLeft = _currentIntentIdx == Intent.goLeft.index;
           final isRight = _currentIntentIdx == Intent.goRight.index;
-
-          // If NN picked left but pad vector says right (or vice versa), flip.
-          if ((isLeft  && !padIsLeft) ||
-              (isRight &&  padIsLeft)) {
-            _currentIntentIdx =
-            isLeft ? Intent.goRight.index : Intent.goLeft.index;
-
-            // Optional: tiny debug pulse to confirm flips in logs
+          if ((isLeft && !padIsLeft) || (isRight && padIsLeft)) {
+            _currentIntentIdx = isLeft ? Intent.goRight.index : Intent.goLeft.index;
             IntentBus.instance.publishIntent(IntentEvent(
               intent: kIntentNames[_currentIntentIdx],
               probs: _lastReplanProbs ?? const [],
@@ -688,6 +838,7 @@ class RuntimeTwoStagePolicy {
 
     final idxNow = _currentIntentIdx < 0 ? 0 : _currentIntentIdx;
     final intent = Intent.values[idxNow];
+
     var ctrl = _controllerForIntentUI(
       intent,
       lander: lander,
@@ -698,11 +849,13 @@ class RuntimeTwoStagePolicy {
 
     // Optional global turn inversion (debug/safety)
     if (mirrorX) {
-      // Swap emitted turn commands
       final swapped = (thrust: ctrl.thrust, left: ctrl.right, right: ctrl.left);
       IntentBus.instance.publishControl(ControlEvent(
-        thrust: swapped.thrust, left: swapped.left, right: swapped.right,
-        step: step, meta: {'intent': kIntentNames[idxNow], 'mirrorX': true},
+        thrust: swapped.thrust,
+        left: swapped.left,
+        right: swapped.right,
+        step: step,
+        meta: {'intent': kIntentNames[idxNow], 'mirrorX': true},
       ));
       _framesLeft -= 1;
       return (swapped.thrust, swapped.left, swapped.right, idxNow, _lastReplanProbs ?? const []);
@@ -720,5 +873,73 @@ class RuntimeTwoStagePolicy {
 
     _framesLeft -= 1;
     return (ctrl.thrust, ctrl.left, ctrl.right, idxNow, _lastReplanProbs ?? const []);
+  }
+
+  /// NEW: Extended API that also returns side/down thrusters based on physics.
+  /// Use this in the live engine so you can pass all controls to `GameEngine.step`.
+  (bool thrust, bool left, bool right, bool sideLeft, bool sideRight, bool downThrust,
+  int intentIdx, List<double> probs) actWithIntentExt({
+    required LanderState lander,
+    required Terrain terrain,
+    required double worldW,
+    required double worldH,
+    List<RayHit>? rays, // REQUIRED when FE is rays
+    int step = 0,
+    double uiMaxFuel = 100.0,
+  }) {
+    // Reuse the planning path from the legacy method to keep behavior identical
+    final legacy = actWithIntent(
+      lander: lander,
+      terrain: terrain,
+      worldW: worldW,
+      worldH: worldH,
+      rays: rays,
+      step: step,
+      uiMaxFuel: uiMaxFuel,
+    );
+    final idxNow = legacy.$4;
+    final intent = Intent.values[idxNow];
+
+    final ext = _controllerForIntentExt(
+      intent,
+      lander: lander,
+      terrain: terrain,
+      worldW: worldW,
+      worldH: worldH,
+      phys: physics,
+    );
+
+    // Mirror left/right if requested
+    bool left = legacy.$2, right = legacy.$3;
+    bool sideLeft = ext.sideLeft, sideRight = ext.sideRight;
+    if (mirrorX) {
+      final tmp = left; left = right; right = tmp;
+      final tmp2 = sideLeft; sideLeft = sideRight; sideRight = tmp2;
+    }
+
+    // Publish extended control for debugging UIs (optional)
+    IntentBus.instance.publishControl(ControlEvent(
+      thrust: legacy.$1,
+      left: left,
+      right: right,
+      step: step,
+      meta: {
+        'intent': kIntentNames[idxNow],
+        'sideLeft': sideLeft,
+        'sideRight': sideRight,
+        'downThrust': ext.downThrust,
+      },
+    ));
+
+    return (
+    legacy.$1, // thrust (main)
+    left,
+    right,
+    sideLeft,
+    sideRight,
+    ext.downThrust,
+    idxNow,
+    legacy.$5
+    );
   }
 }

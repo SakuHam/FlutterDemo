@@ -126,7 +126,6 @@ class GameEngine {
     // Approximate maximum angular rate this frame (used only for substep count).
     double estOmega = 0.0;
     {
-      double angle = lander.angle;
       final rot = t.rotSpeed * 0.5;
       if (u.left ^ u.right) estOmega = rot; // turning
       // add a bit for auto-level assist pull
@@ -183,15 +182,53 @@ class GameEngine {
       }
 
       // ----- Acceleration & fuel burn -----
-      Vector2 accel = Vector2(0, t.gravity * 0.05);
+      // NOTE: Your original code used a 0.05 scale on accel terms; kept to preserve tuning.
+      Vector2 accel = Vector2(0, t.gravity * 0.05); // NEW: gravity can be 0.0 (optional)
       double fuel = lander.fuel;
+
+      // Main engine
       final bool thrusting = u.thrust && fuel > 0.0;
       final double power = thrusting ? 1.0 : 0.0;
-
       if (thrusting) {
         accel.x += math.sin(angle) * (t.thrustAccel * 0.05);
         accel.y += -math.cos(angle) * (t.thrustAccel * 0.05);
         fuel = (fuel - 20.0 * dtk).clamp(0.0, t.maxFuel);
+      }
+
+      // NEW: Side thrusters (RCS) — optional lateral thrust with small burn
+      if (t.rcsEnabled && fuel > 0.0) {
+        final bool l = u.sideLeft;
+        final bool r = u.sideRight;
+        if (l || r) {
+          double ax = 0.0, ay = 0.0;
+          final a = t.rcsAccel * 0.05; // keep consistent with your 0.05 accel scale
+          if (t.rcsBodyFrame) {
+            // body frame: +X is ship right, +Y is ship up
+            // sideLeft pushes +X; sideRight pushes -X
+            final axLocal = (l ? 1.0 : 0.0) * a + (r ? -1.0 : 0.0) * a;
+            final ayLocal = 0.0;
+            final c = math.cos(angle), s2 = math.sin(angle);
+            ax =  c * axLocal - s2 * ayLocal;
+            ay =  s2 * axLocal + c * ayLocal;
+          } else {
+            // world frame strafing along X only
+            ax = ((l ? 1.0 : 0.0) + (r ? -1.0 : 0.0)) * a;
+            ay = 0.0;
+          }
+          accel.x += ax;
+          accel.y += ay;
+          // very light fuel penalty for RCS pulses
+          fuel = (fuel - 2.5 * dtk).clamp(0.0, t.maxFuel);
+        }
+      }
+
+      if (t.downThrEnabled && u.downThrust && fuel > 0.0) {
+        // Opposite of main engine:
+        // main:  (+sin, -cos) * thrustAccel
+        // down:  (-sin, +cos) * downThrAccel
+        accel.x += -math.sin(angle) * (t.downThrAccel * 0.05);
+        accel.y +=  math.cos(angle) * (t.downThrAccel * 0.05);
+        fuel = (fuel - t.downThrBurn * dtk).clamp(0.0, t.maxFuel);
       }
 
       // ----- Integrate (semi-implicit Euler) -----
