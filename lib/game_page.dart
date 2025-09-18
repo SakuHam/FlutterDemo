@@ -72,6 +72,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   int? _lastIntentIdx;
   List<double> _lastIntentProbs = const [];
 
+  // === NEW: per-frame vectors to draw at the lander ===
+  Offset? _vecPF;      // raw PF suggestion
+  Offset? _vecPolicy;  // policy's preferred velocity (shaped)
+
   @override
   void initState() {
     super.initState();
@@ -87,7 +91,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       );
       if (!mounted) return;
 
-      // Optional: try to sync engine physics with policy.physics (if engine already exists)
       _applyPolicyPhysicsToEngine(p);
 
       setState(() {
@@ -107,7 +110,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final phys = p.phys; // RuntimePhysics
 
     try {
-      // Assumes Tunables/EngineConfig expose copyWith for these fields (as discussed).
       e.cfg = e.cfg.copyWith(
         t: e.cfg.t.copyWith(
           gravity: phys.gravity,
@@ -122,7 +124,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         ),
       );
     } catch (_) {
-      // If your types.dart hasn't been extended yet, just ignore silently.
       debugPrint('Note: engine Tunables missing new physics fields; skipping runtime sync.');
     }
   }
@@ -142,7 +143,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       final cfg = EngineConfig(
         worldW: size.width,
         worldH: size.height,
-        t: Tunables(), // defaults; may be overridden below if policy already loaded
+        t: Tunables(),
       );
 
       _engine = GameEngine(cfg);
@@ -152,7 +153,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         forwardAligned: true,
       );
 
-      // If policy is already loaded, sync physics now so sim matches training.
       final p = _policy;
       if (p != null) _applyPolicyPhysicsToEngine(p);
 
@@ -182,6 +182,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     _sideLeft = _sideRight = _downThrust = false;
     _lastIntentIdx = null;
     _lastIntentProbs = const [];
+    _vecPF = _vecPolicy = null;
     _rebuildPF();
     setState(() {});
   }
@@ -232,6 +233,86 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     );
   }
 
+  // --- Compute policy & PF velocity targets (mirrors training reward shaping) ---
+  void _computeBestVelVectors(GameEngine e, PotentialField pf) {
+    final L = e.lander;
+    final x = L.pos.x.toDouble();
+    final y = L.pos.y.toDouble();
+    final vx = L.vel.x.toDouble();
+    final vy = L.vel.y.toDouble();
+    final W = e.cfg.worldW.toDouble();
+
+    // PF base suggestion
+    // (Use your training defaults; tweak here if you changed the CLI.)
+    final base = pf.suggestVelocity(
+      x, y,
+      vMinClose: 8.0,
+      vMaxFar: 90.0,
+      alpha: 1.2,
+      clampSpeed: 9999.0,
+    );
+    _vecPF = Offset(base.vx, base.vy);
+
+    // --- Proximity to pad (for flare) ---
+    final padCx = e.terrain.padCenter.toDouble();
+    final dxAbs = (x - padCx).abs();
+    final gy = e.terrain.heightAt(x);
+    final h = (gy - y).toDouble().clamp(0.0, 1000.0);
+
+    final tightX = 0.10 * W;
+    final ph = math.exp(- (h * h) / (140.0 * 140.0 + 1e-6));
+    final px = math.exp(- (dxAbs * dxAbs) / (tightX * tightX + 1e-6));
+    final prox = (px * ph).clamp(0.0, 1.0);
+
+    // --- Final-approach flare (prefer killing lateral more) ---
+    final vMinTouchdown = 2.0;
+    final flareLat = (1.0 - 0.90 * prox);
+    final flareVer = (1.0 - 0.70 * prox);
+
+    double svx = base.vx * flareLat;
+    double svy = base.vy * flareVer;
+
+    final magNow = (math.sqrt(svx * svx + svy * svy) + 1e-9);
+    final magTarget = ((1.0 - prox) * magNow + prox * vMinTouchdown).clamp(0.0, magNow);
+    final kMag = (magTarget / magNow).clamp(0.0, 1.0);
+    svx *= kMag; svy *= kMag;
+
+    // --- Feasibility clamp: don’t ask more Δv than a single frame can do ---
+    final aMax = e.cfg.t.thrustAccel * 0.05 * e.cfg.stepScale; // px/s^2 per real second
+    final dt = 1 / e.cfg.stepScale; // your engine’s real seconds per step (approx)
+    final feasiness = 0.75;
+    final dvxNeed = svx - vx;
+    final dvyNeed = svy - vy;
+    final dvMag = math.sqrt(dvxNeed * dvxNeed + dvyNeed * dvyNeed);
+    final dvCap = (aMax * dt * feasiness).clamp(0.0, 1e9);
+    if (dvMag > dvCap && dvMag > 1e-9) {
+      final s = dvCap / dvMag;
+      svx = vx + dvxNeed * s;
+      svy = vy + dvyNeed * s;
+    }
+
+    // --- Wall avoidance (velocity-only blend inward) ---
+    final margin = 0.12 * W;
+    final distL = (x).clamp(0.0, margin);
+    final distR = (W - x).clamp(0.0, margin);
+    final nearL = 1.0 - (distL / margin);
+    final nearR = 1.0 - (distR / margin);
+    final borderProx = math.max(nearL, nearR);
+
+    double inwardX = 0.0;
+    if (nearL > 0.0 && nearL >= nearR) inwardX = 1.0;
+    if (nearR > 0.0 && nearR >  nearL) inwardX = -1.0;
+
+    final vInward = 40.0;           // inward target at wall
+    final blendIn = 0.60 * borderProx;
+    final vxWall = inwardX * vInward;
+
+    svx = (1.0 - blendIn) * svx + blendIn * vxWall;
+    // svy unchanged
+
+    _vecPolicy = Offset(svx, svy);
+  }
+
   // ------------ TICK ------------
   void _onTick(Duration elapsed) {
     if (!mounted) return;
@@ -245,12 +326,19 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     if (engine == null) return;
     if (engine.status != GameStatus.playing) return;
 
+    // Compute per-frame velocity vectors for debug view
+    final pf = _pf;
+    if (pf != null && _visMode == DebugVisMode.velocity) {
+      _computeBestVelVectors(engine, pf);
+    } else {
+      _vecPF = _vecPolicy = null;
+    }
+
     // If AI is on, compute controls (override manual)
     if (_aiPlay && _aiReady) {
       final lander = engine.lander;     // et.LanderState
       final terr = engine.terrain;      // et.Terrain
 
-      // NEW: use the extended call (side/down thrusters)
       final (th, lf, rt, sL, sR, dT, idx, probs) = _policy!.actWithIntentExt(
         lander: lander,
         terrain: terr,
@@ -274,7 +362,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
     final info = engine.step(
       dt,
-      // NEW: forward extra channels (requires ControlInput to have these fields)
       ControlInput(
         thrust: _thrust,
         left: _left,
@@ -288,16 +375,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     // Exhaust particles
     final lander = engine.lander;
 
-    // Main engine plume
     _maybeEmitMainFlame(lander);
-
-    // NEW: side RCS plumes
     _maybeEmitSideRCS(lander);
-
-    // NEW: downward (belly) thruster plume (when gravity ~ 0, this points "down" in screen)
     _maybeEmitDownwardFlame(lander);
 
-    // Update particles
     for (int i = _particles.length - 1; i >= 0; i--) {
       final p = _particles[i];
       p.life -= dt * 1.8;
@@ -340,7 +421,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     const halfH = 12.0;
     const halfW = 14.0;
 
-    // emit from left/right belly
     final upBody = Offset(s, -c);     // ship “up”
     final rightBody = Offset(c, s);   // ship “right”
     final leftPort = Offset(lander.pos.x, lander.pos.y) + upBody * 0 + rightBody * (-halfW) + upBody * halfH;
@@ -348,7 +428,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
     final rnd = math.Random();
     if (_sideLeft) {
-      // fire on left side → exhaust goes to the left (negative rightBody)
       final dir = -rightBody;
       for (int i = 0; i < 2; i++) {
         final jitter = Offset((rnd.nextDouble() - 0.5) * 0.4, (rnd.nextDouble() - 0.5) * 0.2);
@@ -371,7 +450,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final s = math.sin(lander.angle);
     const halfH = 6.0;
 
-    // “Downward thruster” mounted on belly pointing +Y in world
     final port = Offset(lander.pos.x, lander.pos.y) + Offset(0, halfH);
     final rnd = math.Random();
     for (int i = 0; i < 3; i++) {
@@ -470,6 +548,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       // Potential field & vis mode
                       pf: _pf,
                       visMode: _visMode,
+                      // NEW: pass vectors to draw
+                      vecPF: _vecPF,
+                      vecPolicy: _vecPolicy,
                     ),
                   ),
                 ),
@@ -482,7 +563,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      // Top row compact for phones
+                      // Top row
                       Row(
                         children: [
                           ElevatedButton.icon(
@@ -501,7 +582,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                           _aiToggleIcon(),
                           const SizedBox(width: 8),
 
-                          // Single chip reused to cycle Rays → Potential → Velocity → None
                           Tooltip(
                             message: 'Tap to cycle view • Long-press to rebuild field',
                             child: FilterChip(
@@ -521,7 +601,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       ),
                       const SizedBox(height: 10),
 
-                      // Fuel row + tiny icon-only Brush button (right side)
                       Row(
                         children: [
                           _hudBox(title: 'Fuel', value: engine.lander.fuel.toStringAsFixed(0)),
@@ -553,7 +632,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             ),
                           const Spacer(),
 
-                          // --- Icon-only Brush button ---
+                          // Brush button
                           Tooltip(
                             message: _carveMode
                                 ? 'Brush ON — tap to disable; long-press to resize'
@@ -717,6 +796,10 @@ class GamePainter extends CustomPainter {
   final PotentialField? pf;
   final DebugVisMode visMode;
 
+  // NEW: vectors to overlay at the lander
+  final Offset? vecPF;
+  final Offset? vecPolicy;
+
   GamePainter({
     required this.lander,
     required this.terrain,
@@ -726,6 +809,8 @@ class GamePainter extends CustomPainter {
     required this.rays,
     required this.pf,
     required this.visMode,
+    required this.vecPF,
+    required this.vecPolicy,
   });
 
   @override
@@ -745,6 +830,10 @@ class GamePainter extends CustomPainter {
 
     _paintParticles(canvas);
     _paintLander(canvas);
+
+    if (visMode == DebugVisMode.velocity) {
+      _paintBestVelTriplet(canvas);
+    }
   }
 
   void _paintStars(Canvas canvas, Size size) {
@@ -818,7 +907,6 @@ class GamePainter extends CustomPainter {
       ..strokeWidth = 1
       ..color = Colors.blueAccent.withOpacity(0.55);
 
-    // Terrain rays RED for visibility
     final terrPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.2
@@ -855,7 +943,6 @@ class GamePainter extends CustomPainter {
     final nx = pf.gridNx, ny = pf.gridNy;
     final dx = pf.gridDx, dy = pf.gridDy;
 
-    // get φ range (downsampled)
     double vmin = 1e9, vmax = -1e9;
     for (int j = 0; j < ny; j += heatDownsample) {
       for (int i = 0; i < nx; i += heatDownsample) {
@@ -876,7 +963,6 @@ class GamePainter extends CustomPainter {
       }
     }
 
-    // outline obstacles & pad
     final obst = Paint()..style = PaintingStyle.stroke..strokeWidth = 1.0..color = const Color(0xAA000000);
     final padP = Paint()..style = PaintingStyle.stroke..strokeWidth = 1.0..color = const Color(0xAA00FFFF);
     for (int j = 0; j < ny; j += heatDownsample) {
@@ -895,9 +981,8 @@ class GamePainter extends CustomPainter {
       Canvas canvas,
       PotentialField pf, {
         int stride = 8,
-        double arrowScale = 32.0, // base scale; we'll multiply by 5x below
+        double arrowScale = 32.0,
       }) {
-    // 1) Pre-scan to find a dynamic max gradient magnitude for normalization.
     final nx = pf.gridNx, ny = pf.gridNy;
     final dx = pf.gridDx, dy = pf.gridDy;
 
@@ -910,27 +995,21 @@ class GamePainter extends CustomPainter {
       }
     }
 
-    // 2) Draw arrows, color by speed with a floor on brightness.
-    //    Low speeds won't go near black anymore.
     for (int j = 1; j < ny - 1; j += stride) {
       for (int i = 1; i < nx - 1; i += stride) {
-        if (pf.maskAtIndex(i, j) == 2) continue; // skip obstacle bodies
+        if (pf.maskAtIndex(i, j) == 2) continue;
         final x = i * dx;
         final y = j * dy;
         final flow = pf.sampleFlow(x, y);
 
-        // Normalize speed 0..1 against the pre-scanned max
         final n = (flow.mag / maxMag).clamp(0.0, 1.0);
-
-        // Hue: cyan→yellow as speed grows; keep saturation high; clamp value >= 0.35.
         final color = HSVColor.fromAHSV(
           1.0,
-          200.0 - 160.0 * n,   // hue 200→40
-          0.90,                // saturation
-          0.35 + 0.65 * n,     // value (brightness) floor at 0.35
+          200.0 - 160.0 * n,
+          0.90,
+          0.35 + 0.65 * n,
         ).toColor();
 
-        // 5× longer arrows (multiply scale)
         final lenScale = arrowScale * 1.0;
 
         final sx = x, sy = y;
@@ -950,6 +1029,52 @@ class GamePainter extends CustomPainter {
         _arrowHead(canvas, head, Offset(ex, ey), math.atan2(ey - sy, ex - sx), 7.0, 5.0);
       }
     }
+  }
+
+  // === NEW: draw actual v, PF suggestion, and policy target at the ship ===
+  void _paintBestVelTriplet(Canvas canvas) {
+    final pos = Offset(lander.pos.x, lander.pos.y);
+
+    // Arrow scale just for on-screen visibility (px/s → px of arrow)
+    const double k = 3.0;
+
+    // Actual velocity (white)
+    final vNow = Offset(lander.vel.x, lander.vel.y);
+    if (vNow.distance > 1e-3) {
+      _drawArrow(canvas, pos, pos + vNow * k * 10.0,
+          line: Paint()..color = Colors.white..strokeWidth = 2.0,
+          head: Paint()..color = Colors.white);
+    }
+
+    // PF suggestion (cyan)
+    if (vecPF != null && vecPF!.distance > 1e-3) {
+      _drawArrow(canvas, pos, pos + vecPF! * k,
+          line: Paint()..color = Colors.cyanAccent..strokeWidth = 2.0,
+          head: Paint()..color = Colors.cyanAccent);
+    }
+
+    // Policy-preferred (magenta)
+    if (vecPolicy != null && vecPolicy!.distance > 1e-3) {
+      _drawArrow(canvas, pos, pos + vecPolicy! * k * 10.0,
+          line: Paint()..color = Colors.pinkAccent..strokeWidth = 2.4,
+          head: Paint()..color = Colors.pinkAccent);
+    }
+
+    // Tiny legend
+    final tp = TextPainter(
+      text: const TextSpan(
+        text: 'v (white), PF (cyan), policy (magenta)',
+        style: TextStyle(color: Colors.white70, fontSize: 11),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, pos + const Offset(12, -26));
+  }
+
+  void _drawArrow(Canvas canvas, Offset a, Offset b, {required Paint line, required Paint head}) {
+    canvas.drawLine(a, b, line);
+    final ang = math.atan2(b.dy - a.dy, b.dx - a.dx);
+    _arrowHead(canvas, head, b, ang, 8.0, 5.0);
   }
 
   void _arrowHead(Canvas canvas, Paint paint, Offset tip, double ang, double len, double w) {
@@ -976,12 +1101,6 @@ class GamePainter extends CustomPainter {
     final b = (27.2 + t * (3211.1 + t * (-15327.97 + t * (27814.0 + t * (-22569.18 + t * 6838.66)))))/255.0;
     int c(double v) => (v.clamp(0.0, 1.0) * 255).round();
     return Color.fromARGB(255, c(r), c(g), c(b));
-  }
-
-  Color _speedColor(double v, {double vMin = 8.0, double vMax = 90.0}) {
-    // Normalize speed 0..1 and map with the existing Turbo ramp
-    final t = ((v - vMin) / (vMax - vMin)).clamp(0.0, 1.0);
-    return _lerpTurbo(t);
   }
 
   void _paintParticles(Canvas canvas) {
@@ -1064,6 +1183,8 @@ class GamePainter extends CustomPainter {
         old.particles != particles ||
         old.rays != rays ||
         old.pf != pf ||
-        old.visMode != visMode;
+        old.visMode != visMode ||
+        old.vecPF != vecPF ||
+        old.vecPolicy != vecPolicy;
   }
 }

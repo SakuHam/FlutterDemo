@@ -419,6 +419,8 @@ class PFShapingCfg {
   // NEW: feasibility clamp (prevents unwinnable target)
   final double feasiness;    // fraction of a_max*dt allowed change in v_pf per frame (0..1)
 
+  final double xBias;
+
   const PFShapingCfg({
     this.wAlign = 1.0,
     this.wVelDelta = 0.6,
@@ -435,6 +437,8 @@ class PFShapingCfg {
     this.vMinTouchdown = 2.0,
 
     this.feasiness = 0.75,
+
+    this.xBias = 3.0,
   });
 }
 
@@ -538,21 +542,36 @@ ai.ExternalRewardHook makePFRewardHook({
     vy: sugg.vy
     );
 
-    // Error with component weighting (lateral heavier near pad)
-    final wLat = 1.0 + cfg.latBoost * prox;       // x
-    final wVer = 1.0 + 0.5 * cfg.latBoost * prox; // y (softer than lateral)
+// --- stronger emphasis on x-component matching ---
+// use prox^2 to ramp faster near the pad
+    final prox2 = prox * prox;
 
+// x (lateral) weighted by xBias and grows with proximity; y grows too but less
+    final wLat = (cfg.xBias) * (1.0 + cfg.latBoost * prox2);     // X
+    final wVer = 1.0 * (1.0 + 0.7 * cfg.latBoost * prox2);       // Y
+
+// weighted velocity error
     final dvx = (vx - sugg.vx) * wLat;
     final dvy = (vy - sugg.vy) * wVer;
     final vErr = math.sqrt(dvx*dvx + dvy*dvy) / cfg.vmax;
 
-    // proximity & wall-scaled weights
-    final wallBoost = 1.0 + 3.0 * borderProx;  // ×4 at the wall
-    final wVelEff   = cfg.wVelDelta * (1.0 + cfg.velPenaltyBoost * prox) * wallBoost;
-    final wAlignEff = cfg.wAlign    * (1.0 + cfg.alignBoost      * prox);
+// wall boost (unchanged)
+    final wallBoost = 1.0 + 6.0 * borderProx;
 
-    // Final reward
-    final r = wAlignEff * align - wVelEff * vErr;
+// make velocity-matching VERY important near pad
+    final wVelEff = cfg.wVelDelta * (1.0 + cfg.velPenaltyBoost * prox2) * wallBoost;
+
+// alignment gets a mild boost near pad
+    final wAlignEff = cfg.wAlign * (1.0 + cfg.alignBoost * prox);
+
+// touchdown-speed bonus (as you already have)
+    final speed = vmag;
+    final touchTarget = cfg.vMinTouchdown.clamp(0.5, 15.0);
+    final touchWeight = 6.0;
+    final touchBonus = touchWeight * prox2 * (touchTarget - speed) / (touchTarget + 1e-6);
+
+// final reward
+    final r = wAlignEff * align + touchBonus - wVelEff * vErr;
     return r;
   };
 }
@@ -627,6 +646,7 @@ void main(List<String> argv) {
   final gateScoreMin = args.getDouble('gate_min', def: -1e9);
   final gateOnlyLanded = args.getFlag('gate_landed', def: false);
   final gateVerbose = args.getFlag('gate_verbose', def: true);
+  final pfXBias = args.getDouble('pf_x_bias', def: 3.0);
 
   double bestMeanCost = double.infinity;
 
@@ -679,6 +699,7 @@ void main(List<String> argv) {
     vMaxFar: pfVmaxFar,
     alpha: pfAlpha,
     vmax: pfVmax,
+    xBias: pfXBias,
   );
   ai.ExternalRewardHook? pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
