@@ -255,7 +255,7 @@ EvalStats evaluate({
   required Trainer trainer,
   int episodes = 40,
   int seed = 123,
-  int attemptsPerTerrain = 1, // NEW
+  int attemptsPerTerrain = 1, // reuse terrain across N episodes
 }) {
   final rnd = math.Random(seed);
   final costs = <double>[];
@@ -419,7 +419,7 @@ class PFShapingCfg {
   // NEW: feasibility clamp (prevents unwinnable target)
   final double feasiness;    // fraction of a_max*dt allowed change in v_pf per frame (0..1)
 
-  final double xBias;
+  final double xBias;        // stronger X (lateral) weighting overall
 
   const PFShapingCfg({
     this.wAlign = 1.0,
@@ -460,7 +460,7 @@ ai.ExternalRewardHook makePFRewardHook({
     final vx = env.lander.vel.x.toDouble();
     final vy = env.lander.vel.y.toDouble();
 
-    // Proximity to pad: combine horizontal closeness and height
+    // Proximity to pad
     final padCx = env.terrain.padCenter.toDouble();
     final dxAbs = (x - padCx).abs();
     final W = env.cfg.worldW.toDouble();
@@ -468,11 +468,10 @@ ai.ExternalRewardHook makePFRewardHook({
     final gy = env.terrain.heightAt(x);
     final h  = (gy - y).toDouble().clamp(0.0, 1000.0);
 
-    // Smooth proximity 0..1 (1 = inside tight zone)
     final tightX = cfg.padTightFrac * W;
-    final px = math.exp(- (dxAbs*dxAbs) / (tightX*tightX + 1e-6));
-    final ph = math.exp(- (h*h)       / (cfg.hTight*cfg.hTight + 1e-6));
-    final prox = (px * ph).clamp(0.0, 1.0);
+    final px_ = math.exp(- (dxAbs*dxAbs) / (tightX*tightX + 1e-6));
+    final ph_ = math.exp(- (h*h)       / (cfg.hTight*cfg.hTight + 1e-6));
+    final prox = (px_ * ph_).clamp(0.0, 1.0);
 
     // Alignment (unit flow) term
     final flow = pf.sampleFlow(x, y); // unit (nx, ny)
@@ -491,25 +490,18 @@ ai.ExternalRewardHook makePFRewardHook({
       clampSpeed: 9999.0,
     );
 
-    // --- Final-approach flare: taper desired speed sharply to ~vMinTouchdown ---
-    // Stronger taper as prox→1. Lateral gets reduced more than vertical.
-    final flareLat = (1.0 - 0.90 * prox); // kill lateral speed near pad
-    final flareVer = (1.0 - 0.70 * prox); // still allow a bit of vertical
+    // Final-approach flare
+    final flareLat = (1.0 - 0.90 * prox);
+    final flareVer = (1.0 - 0.70 * prox);
     final magNow = math.sqrt(sugg.vx*sugg.vx + sugg.vy*sugg.vy) + 1e-9;
+    sugg = (vx: sugg.vx * flareLat, vy: sugg.vy * flareVer);
 
-    // Scale vector components
-    sugg = (
-    vx: sugg.vx * flareLat,
-    vy: sugg.vy * flareVer,
-    );
-
-    // Also clamp overall magnitude to approach vMinTouchdown at prox=1
     final magTarget = ((1.0 - prox) * magNow + prox * cfg.vMinTouchdown).clamp(0.0, magNow);
     final magNew = math.sqrt(sugg.vx*sugg.vx + sugg.vy*sugg.vy) + 1e-9;
     final kMag = (magTarget / magNew).clamp(0.0, 1.0);
     sugg = (vx: sugg.vx * kMag, vy: sugg.vy * kMag);
 
-    // --- Feasibility clamp: don’t ask for more delta-v than we can change this frame ---
+    // Feasibility clamp
     final dv_pf_x = sugg.vx - vx;
     final dv_pf_y = sugg.vy - vy;
     final dv_pf_mag = math.sqrt(dv_pf_x*dv_pf_x + dv_pf_y*dv_pf_y);
@@ -519,78 +511,62 @@ ai.ExternalRewardHook makePFRewardHook({
       sugg = (vx: vx + dv_pf_x * s, vy: vy + dv_pf_y * s);
     }
 
-// --- Border avoidance: speed-aware, earlier, and stronger lateral priority ---
+    // Border avoidance: speed-aware & earlier
     final wallTau = 1.2;
     final wallMarginFrac = 0.22;
     final wallBlendMax = 0.80;
     final wallVInward = 0.90;
     final wallVelPenalty = 3.0;
     final Wworld = env.cfg.worldW.toDouble();
-    final distL = x;                 // px from left wall
-    final distR = (Wworld - x);      // px from right wall
+    final distL = x;
+    final distR = (Wworld - x);
     final baseBand = wallMarginFrac * Wworld;
 
-// “Outward” vx wrt each wall (+ means heading toward that wall)
     final vxTowardL = (-vx).clamp(0.0, double.infinity);
     final vxTowardR = ( vx).clamp(0.0, double.infinity);
 
-// Dynamic warning widths grow with outward speed (sec lookahead = wallTau)
     final warnL = baseBand + wallTau * vxTowardL;
     final warnR = baseBand + wallTau * vxTowardR;
 
-// Proximity 0..1 to each wall (1 = danger, 0 = safe)
     double proxL = 1.0 - (distL / (warnL + 1e-6)).clamp(0.0, 1.0);
     double proxR = 1.0 - (distR / (warnR + 1e-6)).clamp(0.0, 1.0);
 
-// Focus on the more dangerous side
     final borderProx = math.max(proxL, proxR);
     double inwardX = 0.0;
-    if (proxL >= proxR && proxL > 0.0) inwardX =  1.0; // push right
-    if (proxR >  proxL && proxR > 0.0) inwardX = -1.0; // push left
+    if (proxL >= proxR && proxL > 0.0) inwardX =  1.0;
+    if (proxR >  proxL && proxR > 0.0) inwardX = -1.0;
 
-// Earlier & smoother blend (γ>1 sharpens near wall)
     final gamma = 1.5;
     final blendIn = wallBlendMax * math.pow(borderProx, gamma);
 
-// Target inward speed; scale with outward speed so we react harder if we’re barreling into the wall
     final vInward = (wallVInward + 0.8 * (vxTowardL + vxTowardR)).clamp(40.0, 200.0);
     final suggWallVx = inwardX * vInward;
 
-// Blend inward correction into PF suggestion
     sugg = (
     vx: (1.0 - blendIn) * sugg.vx + blendIn * suggWallVx,
-    vy: sugg.vy * (1.0 - 0.35 * borderProx) // de-emphasize vertical near walls
+    vy: sugg.vy * (1.0 - 0.35 * borderProx)
     );
 
-// Make lateral matching more important near walls
     final wallBoost = 1.0 + wallVelPenalty * borderProx;
 
-// --- stronger emphasis on x-component matching ---
-// use prox^2 to ramp faster near the pad
+    // Stronger X weighting; ramp faster near pad
     final prox2 = prox * prox;
-
-// x (lateral) weighted by xBias and grows with proximity; y grows too but less
     final wLat = (cfg.xBias) * (1.0 + cfg.latBoost * prox2);     // X
     final wVer = 1.0 * (1.0 + 0.7 * cfg.latBoost * prox2);       // Y
 
-// weighted velocity error
     final dvx = (vx - sugg.vx) * wLat;
     final dvy = (vy - sugg.vy) * wVer;
     final vErr = math.sqrt(dvx*dvx + dvy*dvy) / cfg.vmax;
 
-// make velocity-matching VERY important near pad
     final wVelEff = cfg.wVelDelta * (1.0 + cfg.velPenaltyBoost * prox2) * wallBoost;
-
-// alignment gets a mild boost near pad
     final wAlignEff = cfg.wAlign * (1.0 + cfg.alignBoost * prox);
 
-// touchdown-speed bonus (as you already have)
+    // touchdown speed bonus
     final speed = vmag;
     final touchTarget = cfg.vMinTouchdown.clamp(0.5, 15.0);
     final touchWeight = 6.0;
     final touchBonus = touchWeight * prox2 * (touchTarget - speed) / (touchTarget + 1e-6);
 
-// final reward
     final r = wAlignEff * align + touchBonus - wVelEff * vErr;
     return r;
   };
@@ -655,9 +631,12 @@ void main(List<String> argv) {
   final pfVmaxFar = args.getDouble('pf_vmax_far', def: 90.0);
   final pfAlpha = args.getDouble('pf_alpha', def: 1.2);
   final pfVmax = args.getDouble('pf_vmax', def: 140.0);
+  final pfXBias = args.getDouble('pf_x_bias', def: 3.0);
 
-  // NEW: attempts per terrain
-  final attemptsPerTerrain = args.getInt('attempts_per_terrain', def: 1);
+  // NEW: attempts per terrain + eval cadence/size
+  final attemptsPerTerrain = args.getInt('attempts_per_terrain', def: 1).clamp(1, 1000000);
+  final evalEvery = args.getInt('eval_every', def: 10).clamp(1, 1000000);
+  final evalEpisodes = args.getInt('eval_episodes', def: 80).clamp(1, 1000000);
 
   final determinism = args.getFlag('determinism_probe', def: true);
   final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
@@ -666,7 +645,6 @@ void main(List<String> argv) {
   final gateScoreMin = args.getDouble('gate_min', def: -1e9);
   final gateOnlyLanded = args.getFlag('gate_landed', def: false);
   final gateVerbose = args.getFlag('gate_verbose', def: true);
-  final pfXBias = args.getDouble('pf_x_bias', def: 3.0);
 
   double bestMeanCost = double.infinity;
 
@@ -772,14 +750,15 @@ void main(List<String> argv) {
     seed: seed ^ 0xACE,
   );
 
-  // Quick baseline eval
+  // Quick baseline eval (use half of evalEpisodes, clamped to [10, evalEpisodes])
       {
+    final baseEvalN = math.max(10, math.min(evalEpisodes, 40));
     final ev = evaluate(
       env: env,
       trainer: trainer,
-      episodes: 20,
+      episodes: baseEvalN,
       seed: seed ^ 0x999,
-      attemptsPerTerrain: attemptsPerTerrain, // NEW
+      attemptsPerTerrain: attemptsPerTerrain,
     );
     print(
         'Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}'
@@ -829,16 +808,16 @@ void main(List<String> argv) {
       lastLanded = res.landed;
     }
 
-    print('Iter ${it + 1} | batch=$batch | last-ep steps: $lastSteps | cost: ${lastCost.toStringAsFixed(3)} | landed: ${lastLanded ? "Y" : "N"}');
+    print('Iter ${it + 1} | attempts/terrain=$attemptsPerTerrain | last-ep steps: $lastSteps | cost: ${lastCost.toStringAsFixed(3)} | landed: ${lastLanded ? "Y" : "N"}');
 
-    // periodic eval + save
-    if ((it + 1) % 5 == 0) {
+    // periodic eval + save (now driven by CLI)
+    if ((it + 1) % evalEvery == 0) {
       final ev = evaluate(
         env: env,
         trainer: trainer,
-        episodes: 40,
+        episodes: evalEpisodes,
         seed: seed ^ (0x1111 * (it + 1)),
-        attemptsPerTerrain: attemptsPerTerrain, // NEW
+        attemptsPerTerrain: attemptsPerTerrain,
       );
       print(
           'Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}'
@@ -901,8 +880,11 @@ Velocity-vector–only shaping examples:
   dart run lib/ai/train_agent.dart \
     --pf_vmin_close=6 --pf_vmax_far=110 --pf_alpha=1.4
 
+Knobs added here:
+- reuse terrain within groups:      --attempts_per_terrain=20
+- eval cadence and size:            --eval_every=20 --eval_episodes=120
+
 Notes:
 - The trainer uses only this PF reward via `externalRewardHook`.
-- `segMean` in logs now reports mean PF reward (for gating).
-- Use more tries per terrain with: `--attempts_per_terrain=20`
+- `segMean` in logs reports mean PF reward (used for gating).
 ------------------------------------------------------------------------------ */
