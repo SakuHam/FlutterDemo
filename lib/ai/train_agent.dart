@@ -168,9 +168,9 @@ void _savePolicy({
 
 et.EngineConfig makeConfig({
   int seed = 42,
-  bool lockTerrain = false,
-  bool lockSpawn = false,
-  bool randomSpawnX = true,
+  bool lockTerrain = true,
+  bool lockSpawn = true,
+  bool randomSpawnX = false,
   double worldW = 800,
   double worldH = 600,
   double? maxFuel,
@@ -255,19 +255,30 @@ EvalStats evaluate({
   required Trainer trainer,
   int episodes = 40,
   int seed = 123,
+  int attemptsPerTerrain = 1, // NEW
 }) {
   final rnd = math.Random(seed);
   final costs = <double>[];
   int landed = 0, crashed = 0, stepsSum = 0;
   double absDxSum = 0.0;
 
+  int terrAttempts = 0;
+  int currentTerrainSeed = rnd.nextInt(1 << 30);
+
   for (int i = 0; i < episodes; i++) {
-    env.reset(seed: rnd.nextInt(1 << 30));
+    if (terrAttempts == 0) {
+      currentTerrainSeed = rnd.nextInt(1 << 30);
+    }
+
+    env.reset(seed: currentTerrainSeed);
     final res = trainer.runEpisode(
       train: false,
       greedy: true,
       scoreIsReward: false,
     );
+
+    terrAttempts = (terrAttempts + 1) % attemptsPerTerrain;
+
     costs.add(res.totalCost);
     stepsSum += res.steps;
     if (env.status == et.GameStatus.landed) {
@@ -504,17 +515,41 @@ ai.ExternalRewardHook makePFRewardHook({
       sugg = (vx: vx + dv_pf_x * s, vy: vy + dv_pf_y * s);
     }
 
+    // --- Border avoidance: steer inward when near side walls (velocity-only) ---
+    final Wworld = env.cfg.worldW.toDouble();
+    final margin = 0.12 * Wworld;               // start repulsion within 12% from edges
+    final distL = (x).clamp(0.0, margin);
+    final distR = (Wworld - x).clamp(0.0, margin);
+    final nearL = 1.0 - (distL / margin);
+    final nearR = 1.0 - (distR / margin);
+    final borderProx = math.max(nearL, nearR);  // 0..1
+
+    // inward unit vector (pointing to center)
+    double inwardX = 0.0;
+    if (nearL > 0.0 && nearL >= nearR) inwardX =  1.0;
+    if (nearR > 0.0 && nearR >  nearL) inwardX = -1.0;
+
+    // blend a modest inward velocity into PF suggestion, stronger the closer we are
+    final vInward = 40.0;              // px/s target inward speed at the wall
+    final blendIn = 0.60 * borderProx; // up to 60% override at the wall
+    final suggWallVx = inwardX * vInward;
+    sugg = (
+    vx: (1.0 - blendIn) * sugg.vx + blendIn * suggWallVx,
+    vy: sugg.vy
+    );
+
     // Error with component weighting (lateral heavier near pad)
-    final wLat = 1.0 + cfg.latBoost * prox;     // x
+    final wLat = 1.0 + cfg.latBoost * prox;       // x
     final wVer = 1.0 + 0.5 * cfg.latBoost * prox; // y (softer than lateral)
 
     final dvx = (vx - sugg.vx) * wLat;
     final dvy = (vy - sugg.vy) * wVer;
     final vErr = math.sqrt(dvx*dvx + dvy*dvy) / cfg.vmax;
 
-    // Proximity-scaled weights
-    final wAlignEff = cfg.wAlign * (1.0 + cfg.alignBoost * prox);
-    final wVelEff   = cfg.wVelDelta * (1.0 + cfg.velPenaltyBoost * prox);
+    // proximity & wall-scaled weights
+    final wallBoost = 1.0 + 3.0 * borderProx;  // ×4 at the wall
+    final wVelEff   = cfg.wVelDelta * (1.0 + cfg.velPenaltyBoost * prox) * wallBoost;
+    final wAlignEff = cfg.wAlign    * (1.0 + cfg.alignBoost      * prox);
 
     // Final reward
     final r = wAlignEff * align - wVelEff * vErr;
@@ -581,6 +616,9 @@ void main(List<String> argv) {
   final pfVmaxFar = args.getDouble('pf_vmax_far', def: 90.0);
   final pfAlpha = args.getDouble('pf_alpha', def: 1.2);
   final pfVmax = args.getDouble('pf_vmax', def: 140.0);
+
+  // NEW: attempts per terrain
+  final attemptsPerTerrain = args.getInt('attempts_per_terrain', def: 1);
 
   final determinism = args.getFlag('determinism_probe', def: true);
   final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
@@ -695,7 +733,13 @@ void main(List<String> argv) {
 
   // Quick baseline eval
       {
-    final ev = evaluate(env: env, trainer: trainer, episodes: 20, seed: seed ^ 0x999);
+    final ev = evaluate(
+      env: env,
+      trainer: trainer,
+      episodes: 20,
+      seed: seed ^ 0x999,
+      attemptsPerTerrain: attemptsPerTerrain, // NEW
+    );
     print(
         'Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}'
     );
@@ -705,13 +749,23 @@ void main(List<String> argv) {
   final rnd = math.Random(seed ^ 0xDEADBEEF);
   final rayCount = env.rayCfg.rayCount;
 
+  // Group multiple attempts per terrain
+  int terrAttempts = 0;
+  int currentTerrainSeed = rnd.nextInt(1 << 30);
+
   for (int it = 0; it < iters; it++) {
     double lastCost = 0.0;
     int lastSteps = 0;
     bool lastLanded = false;
 
     for (int b = 0; b < batch; b++) {
-      env.reset(seed: rnd.nextInt(1 << 30));
+      // Pick a new terrain seed when starting a new group
+      if (terrAttempts == 0) {
+        currentTerrainSeed = rnd.nextInt(1 << 30);
+      }
+
+      // Reuse terrain within the group
+      env.reset(seed: currentTerrainSeed);
 
       // Rebuild PF-based reward hook for this terrain/episode
       pfHook = makePFRewardHook(env: env, cfg: pfCfg);
@@ -725,6 +779,9 @@ void main(List<String> argv) {
         huberDelta: huberDelta,
       );
 
+      // Advance attempt counter within the group
+      terrAttempts = (terrAttempts + 1) % attemptsPerTerrain;
+
       // For iteration summary
       lastCost = res.totalCost;
       lastSteps = res.steps;
@@ -735,7 +792,13 @@ void main(List<String> argv) {
 
     // periodic eval + save
     if ((it + 1) % 5 == 0) {
-      final ev = evaluate(env: env, trainer: trainer, episodes: 40, seed: seed ^ (0x1111 * (it + 1)));
+      final ev = evaluate(
+        env: env,
+        trainer: trainer,
+        episodes: 40,
+        seed: seed ^ (0x1111 * (it + 1)),
+        attemptsPerTerrain: attemptsPerTerrain, // NEW
+      );
       print(
           'Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}'
       );
@@ -798,6 +861,7 @@ Velocity-vector–only shaping examples:
     --pf_vmin_close=6 --pf_vmax_far=110 --pf_alpha=1.4
 
 Notes:
-- The trainer already uses only this PF reward via `externalRewardHook`.
+- The trainer uses only this PF reward via `externalRewardHook`.
 - `segMean` in logs now reports mean PF reward (for gating).
+- Use more tries per terrain with: `--attempts_per_terrain=20`
 ------------------------------------------------------------------------------ */

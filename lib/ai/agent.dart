@@ -1,7 +1,7 @@
 // lib/ai/agent.dart
 import 'dart:math' as math;
 import '../engine/raycast.dart';
-import 'nn_helper.dart' as nn;                 // helper (unchanged)
+import 'nn_helper.dart' as nn;                 // MLPTrunk/PolicyHeads with silu+noise+dropout
 import '../engine/types.dart' as et;
 import '../engine/game_engine.dart' as eng;
 
@@ -59,9 +59,7 @@ class RunningNorm {
   }
 
   void observe(List<double> x) {
-    if (x.length != dim) {
-      _resizeTo(x.length);
-    }
+    if (x.length != dim) _resizeTo(x.length);
     if (!inited) {
       for (int i = 0; i < dim; i++) {
         mean[i] = x[i];
@@ -214,7 +212,7 @@ int predictiveIntentLabelAdaptive(
     eng.GameEngine env, {
       double baseTauSec = 1.0,
       double minTauSec = 0.45,
-      double maxTauSec = 2.20,
+      double maxTauSec = 1.35,
     }) {
   final L = env.lander;
   final T = env.terrain;
@@ -296,7 +294,7 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
 
-  bool rcsLeft = false, rcsRight = false, down = false;
+  bool rcsLeft = false, rcsRight = false;
 
   switch (intent) {
     case Intent.brakeUp: {
@@ -308,29 +306,27 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: false,
       );
     }
+
     case Intent.descendSlow: {
-      // Target gentle descent; use DOWN thruster if descending too slowly.
-      final vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);  // desired downward speed
+      // Target gentle descent; if gravity is tiny or we’re too slow to descend, use DOWN thruster.
+      final vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);
       final t = (env.cfg.t as dynamic);
       final downEnabled = (t.downThrEnabled ?? false) == true;
 
-      // Need more upward thrust if we’re too fast down, or we’re low without down-thr available.
-      final needUp   = (vy > vCap) || (h < 110.0 && !downEnabled);
-
-      // NEW: actively use top thruster to accelerate descent when too slow (or rising).
-      final needDown = downEnabled && (vy < 0.6 * vCap);
+      final needUp   = vy > vCap || (!downEnabled && h < 110.0);
+      final needDown = downEnabled && (vy < 0.6 * vCap); // actively push down if too slow/rising
 
       return et.ControlInput(
-        thrust: needUp,
-        left: false, right: false,
+        thrust: needUp, left: false, right: false,
         sideLeft: false, sideRight: false,
         downThrust: needDown,
       );
     }
+
     case Intent.brakeLeft: {
       final wantTiltRight   = (vx < -4.0);
       final allowTranslate  = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsLeft = true;
+      if (_canStrafe(env)) rcsLeft = true; // push right
       return et.ControlInput(
         thrust: allowTranslate && !rcsLeft && wantTiltRight,
         left: false, right: (!rcsLeft && wantTiltRight),
@@ -338,10 +334,11 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: false,
       );
     }
+
     case Intent.brakeRight: {
       final wantTiltLeft    = (vx >  4.0);
       final allowTranslate  = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsRight = true;
+      if (_canStrafe(env)) rcsRight = true; // push left
       return et.ControlInput(
         thrust: allowTranslate && !rcsRight && wantTiltLeft,
         left: (!rcsRight && wantTiltLeft), right: false,
@@ -349,9 +346,10 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: false,
       );
     }
+
     case Intent.goLeft: {
       final translate = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsRight = true;
+      if (_canStrafe(env)) rcsRight = true; // push left
       return et.ControlInput(
         thrust: translate && !rcsRight,
         left: !rcsRight, right: false,
@@ -359,9 +357,10 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: false,
       );
     }
+
     case Intent.goRight: {
       final translate = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsLeft = true;
+      if (_canStrafe(env)) rcsLeft = true; // push right
       return et.ControlInput(
         thrust: translate && !rcsLeft,
         left: false, right: !rcsLeft,
@@ -369,6 +368,7 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: false,
       );
     }
+
     case Intent.hover:
     default: {
       final vHover = (0.06 * h + 6.0).clamp(6.0, 18.0);
@@ -388,7 +388,7 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
 class ForwardCache {
   final List<double> x;
-  final List<List<double>> acts; // a0..aL (tanh outputs)
+  final List<List<double>> acts; // a0..aL (hidden activations)
   final List<double> intentLogits;
   final List<double> intentProbs;
   final List<double> turnLogits; // 3 logits
@@ -408,7 +408,7 @@ class ForwardCache {
 }
 
 class PolicyNetwork {
-  static const int kIntents = 7; // updated
+  static const int kIntents = 7;
 
   final int inputSize;
   final List<int> hidden;
@@ -420,9 +420,20 @@ class PolicyNetwork {
     List<int> hidden = const [64, 64],
     int seed = 0,
   })  : hidden = List<int>.from(hidden),
-        trunk  = nn.MLPTrunk(inputSize: inputSize, hiddenSizes: hidden, seed: seed ^ 0x7777),
-        heads  = nn.PolicyHeads(hidden.isEmpty ? inputSize : hidden.last,
-            intents: kIntents, seed: seed ^ 0x8888) {
+        trunk  = nn.MLPTrunk(
+          inputSize: inputSize,
+          hiddenSizes: hidden,
+          seed: seed ^ 0x7777,
+          activation: nn.Activation.silu, // robust under noise
+          trainNoiseStd: 0.02,            // small Gaussian noise on z (train only)
+          dropoutProb: 0.10,              // 10% dropout on a (train only)
+          trainMode: false,               // will be toggled per episode
+        ),
+        heads  = nn.PolicyHeads(
+          hidden.isEmpty ? inputSize : hidden.last,
+          intents: kIntents,
+          seed: seed ^ 0x8888,
+        ) {
     assert(heads.intent.b.length == kIntents, 'intent head outDim mismatch');
     assert(heads.intent.W.length == kIntents, 'intent head rows mismatch');
   }
@@ -476,7 +487,7 @@ class PolicyNetwork {
   void updateFromEpisode({
     required List<ForwardCache> decisionCaches,     // for intent head
     required List<int> intentChoices,              // chosen intents
-    required List<double> decisionReturns,         // advantages (can be signed)
+    required List<double> decisionReturns,         // advantages (signed)
     required List<int> alignLabels,                // teacher labels for intent
     required double alignWeight,                   // CE supervision
     required double intentPgWeight,                // PG on intent
@@ -592,7 +603,7 @@ class PolicyNetwork {
       }
     }
 
-    // ----- Action supervision (optional; unchanged) -----
+    // ----- Action supervision (optional) -----
     final hasAction = actionAlignWeight > 0.0 &&
         actionCaches != null &&
         actionTurnTargets != null &&
@@ -682,7 +693,7 @@ class EpisodeResult {
   });
 }
 
-// external dense reward hook (potential-field reward)
+// external dense reward hook (potential-field reward; velocity-only)
 typedef ExternalRewardHook = double Function({
 required eng.GameEngine env,
 required double dt,
@@ -711,6 +722,12 @@ class Trainer {
   final double gateScoreMin;       // now compares mean PF reward
   final bool gateOnlyLanded;
   final bool gateVerbose;
+
+  // NEW: accept near-pad crashes (configurable)
+  final bool gateAcceptNearPadCrashes;
+  final double gatePadFrac;            // |x - padCx| <= gatePadFrac * W
+  final double gatePadHeight;          // h (px) <= this
+  final double gateMaxImpactSpeed;     // sqrt(vx^2 + vy^2) <= this
 
   final RunningNorm? norm;
   int _epCounter = 0;
@@ -745,6 +762,12 @@ class Trainer {
     this.gateOnlyLanded = false,
     this.gateVerbose = true,
 
+    // NEW: near-pad crash acceptance
+    this.gateAcceptNearPadCrashes = false,
+    this.gatePadFrac = 0.12,
+    this.gatePadHeight = 160.0,
+    this.gateMaxImpactSpeed = 60.0,
+
     this.externalRewardHook,
   }) : norm = RunningNorm(fe.inputSize, momentum: 0.995);
 
@@ -774,6 +797,9 @@ class Trainer {
     double valueBeta = 0.5,
     double huberDelta = 1.0,
   }) {
+    // Toggle trunk noise/dropout depending on train/eval
+    policy.trunk.trainMode = train;
+
     final r = math.Random(seed ^ (_epCounter++));
     final decisionRewards = <double>[];  // per-decision reward (PF only)
 
@@ -808,7 +834,8 @@ class Trainer {
       if (framesLeft <= 0) {
         var x = fe.extract(env);
         final yTeacher = predictiveIntentLabelAdaptive(
-            env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35);
+          env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35,
+        );
 
         if (normalizeFeatures) {
           norm?.observe(x);
@@ -942,8 +969,7 @@ class Trainer {
           decisionRewards[decisionRewards.length - 1] += pfAcc;
           pfAcc = 0.0;
         }
-
-        // IMPORTANT: no terminal bonus/penalty anymore (PF-only)
+        // PF-only: no terminal bonus/penalty
         break;
       }
       if (steps > 5000) break;
@@ -951,9 +977,24 @@ class Trainer {
 
     final segMean = (segCount > 0) ? (segSum / segCount) : 0.0;
 
-    // ---- GATED UPDATE + LOGGING (PF mean) ----
+    // ---- GATED UPDATE + LOGGING ----
+    bool nearPadCrashOK = false;
+    if (!landed && env.status == et.GameStatus.crashed && gateAcceptNearPadCrashes) {
+      final L = env.lander;
+      final W = env.cfg.worldW.toDouble();
+      final padCx = env.terrain.padCenter.toDouble();
+      final dxAbs = (L.pos.x.toDouble() - padCx).abs();
+      final gy = env.terrain.heightAt(L.pos.x.toDouble());
+      final h  = (gy - L.pos.y).toDouble().clamp(0.0, double.infinity);
+      final speed = math.sqrt(L.vel.x * L.vel.x + L.vel.y * L.vel.y).toDouble();
+      nearPadCrashOK =
+          (dxAbs <= gatePadFrac * W) &&
+              (h    <= gatePadHeight) &&
+              (speed <= gateMaxImpactSpeed);
+    }
+
     bool accept = true;
-    if (gateOnlyLanded && !landed) accept = false;
+    if (gateOnlyLanded && !landed && !nearPadCrashOK) accept = false;
     if (segMean < gateScoreMin) accept = false;
 
     if (train) {
@@ -976,12 +1017,14 @@ class Trainer {
           actionAlignWeight: actionAlignWeight,
         );
         if (gateVerbose) {
-          print('[TRAIN] accepted | steps=$steps | pfMean=${segMean.toStringAsFixed(3)} | landed=${landed ? "Y" : "N"} '
+          final tag = landed ? 'Y' : (nearPadCrashOK ? 'padCrash' : 'N');
+          print('[TRAIN] accepted | steps=$steps | pfMean=${segMean.toStringAsFixed(3)} | landed=$tag '
               '| caches: dec=${decisionCaches.length}, act=${actionCaches.length}');
         }
       } else {
         if (gateVerbose) {
-          print('[TRAIN] skipped  | steps=$steps | pfMean=${segMean.toStringAsFixed(3)} | landed=${landed ? "Y" : "N"}');
+          final tag = landed ? 'Y' : (nearPadCrashOK ? 'padCrash' : 'N');
+          print('[TRAIN] skipped  | steps=$steps | pfMean=${segMean.toStringAsFixed(3)} | landed=$tag');
         }
       }
     }

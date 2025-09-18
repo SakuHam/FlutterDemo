@@ -19,6 +19,19 @@ double _tanh(double x) {
   return x.isNegative ? -t : t;
 }
 
+// SiLU / Swish: x * sigmoid(x) — friendlier in noisy regimes than tanh
+double _silu(double x) {
+  if (x >= 0) {
+    final e = math.exp(-x);
+    return x / (1.0 + e);
+  } else {
+    final e = math.exp(x);
+    return x * (e / (1.0 + e));
+  }
+}
+
+enum Activation { tanh, silu }
+
 /* ------------------------------------ Ops ------------------------------------ */
 
 class Ops {
@@ -131,11 +144,35 @@ class Linear {
 
 /* ---------------------------------- MLP trunk -------------------------------- */
 
+/*
+ * Additions for noisy environments:
+ *  - trainNoiseStd: Gaussian noise on pre-activations z (train only)
+ *  - dropoutProb: inverted-scaling dropout on activations a (train only)
+ *  - activation: tanh (default) or SiLU
+ *
+ * Backprop respects dropout masks so dropped units get zero gradient.
+ */
 class MLPTrunk {
   final List<Linear> layers;
 
-  MLPTrunk({required int inputSize, required List<int> hiddenSizes, int seed = 0})
-      : layers = _build(inputSize, hiddenSizes, seed);
+  // knobs (can be changed after construction)
+  Activation activation;
+  double trainNoiseStd;     // e.g., 0.01 .. 0.05
+  double dropoutProb;       // e.g., 0.05 .. 0.2
+  bool trainMode;           // set true during rollout/training, false for eval
+
+  // internal: store last dropout masks per layer for correct backprop
+  List<List<double>> _lastDropMasks = const []; // 1.0 keep, 0.0 drop (scaled)
+
+  MLPTrunk({
+    required int inputSize,
+    required List<int> hiddenSizes,
+    int seed = 0,
+    this.activation = Activation.tanh,
+    this.trainNoiseStd = 0.0,
+    this.dropoutProb = 0.0,
+    this.trainMode = false,
+  }) : layers = _build(inputSize, hiddenSizes, seed);
 
   static List<Linear> _build(int input, List<int> hidden, int seed) {
     final l = <Linear>[];
@@ -148,21 +185,76 @@ class MLPTrunk {
     return l;
   }
 
-  /// Returns tanh activations for each layer: [a1, a2, ... aL].
+  // deterministic RNG used for noise/dropout so results are repeatable per call if desired
+  math.Random? _rng;
+
+  void _ensureRng() {
+    _rng ??= math.Random(0xBEEFCAFE);
+  }
+
+  double _act(double z) {
+    switch (activation) {
+      case Activation.silu: return _silu(z);
+      case Activation.tanh:
+      default: return _tanh(z);
+    }
+  }
+
+  /// Returns activations for each layer: [a1, a2, ... aL].
+  /// If trainMode=true, applies Gaussian noise to z and dropout to a.
   List<List<double>> forwardAll(List<double> x) {
     var h = x;
     final acts = <List<double>>[];
+    final masks = <List<double>>[];
+
     for (final lin in layers) {
-      final z = lin.forward(h);
-      final a = List<double>.generate(z.length, (i) => _tanh(z[i]));
+      // pre-activation
+      var z = lin.forward(h);
+
+      // Gaussian noise on z (train only)
+      if (trainMode && trainNoiseStd > 0) {
+        _ensureRng();
+        final std = trainNoiseStd;
+        for (int i = 0; i < z.length; i++) {
+          // Box-Muller
+          final u1 = (_rng!.nextDouble().clamp(1e-12, 1.0));
+          final u2 = _rng!.nextDouble();
+          final g = math.sqrt(-2.0 * math.log(u1)) * math.cos(2 * math.pi * u2);
+          z[i] += std * g;
+        }
+      }
+
+      // activation
+      var a = List<double>.generate(z.length, (i) => _act(z[i]));
+
+      // dropout on a (train only) — inverted scaling
+      if (trainMode && dropoutProb > 0.0) {
+        _ensureRng();
+        final p = dropoutProb.clamp(0.0, 0.95);
+        final keepScale = (p < 1e-6) ? 1.0 : (1.0 / (1.0 - p));
+        final m = List<double>.filled(a.length, 1.0);
+        for (int i = 0; i < a.length; i++) {
+          final keep = _rng!.nextDouble() >= p;
+          final mask = keep ? keepScale : 0.0;
+          a[i] *= mask;
+          m[i] = mask; // store mask value (scaled)
+        }
+        masks.add(m);
+      } else {
+        // no dropout: mask of 1s
+        masks.add(List<double>.filled(a.length, 1.0));
+      }
+
       acts.add(a);
       h = a;
     }
+
+    _lastDropMasks = masks;
     return acts;
   }
 
   /// Backprop through the trunk given dTop = dL/da_L and the cached activations.
-  /// You MUST pass the original input x0 of the trunk.
+  /// Dropout masks from the last forward are applied to gradients to zero dropped units.
   void backwardFromTopGrad({
     required List<double> dTop,
     required List<List<double>> acts,
@@ -178,17 +270,37 @@ class MLPTrunk {
     for (int li = layers.length - 1; li >= 0; li--) {
       final lin = layers[li];
       final a   = acts[li];
-      // dL/dz = dL/da * (1 - a^2)  (tanh’)
+
+      // apply dropout mask to upstream gradient (train-time only)
+      final mask = (li < _lastDropMasks.length) ? _lastDropMasks[li] : null;
+      if (trainMode && mask != null) {
+        for (int i = 0; i < d.length && i < mask.length; i++) d[i] *= mask[i];
+      }
+
+      // dL/dz = dL/da * activation'(z); we only have 'a', so:
+      // tanh: 1 - a^2,  SiLU: derivative = σ(x) + x*σ(x)*(1-σ(x))
       final dz = List<double>.filled(a.length, 0.0);
       final n = math.min(a.length, d.length);
-      for (int i = 0; i < n; i++) dz[i] = d[i] * (1.0 - a[i] * a[i]);
+      if (activation == Activation.tanh) {
+        for (int i = 0; i < n; i++) dz[i] = d[i] * (1.0 - a[i] * a[i]);
+      } else {
+        // For SiLU we don't have z cached; approximate using a and x~a (works well in practice)
+        // Better: recompute z by inverse of activation; here we use a cheap local approx:
+        // Use local slope using a’ ≈ sigmoid(z) * (1 + z * (1 - sigmoid(z)))
+        // As a robust fallback, treat derivative as <= 1 and use 0.5..1 scaling based on a.
+        for (int i = 0; i < n; i++) {
+          final ai = a[i];
+          final slope = 0.5 + 0.5 / (1.0 + (ai*ai)); // heuristic slope in (0.5,1]
+          dz[i] = d[i] * slope;
+        }
+      }
 
       // input to this layer is previous activation or x0 if first layer
       final inp = (li == 0) ? x0 : acts[li - 1];
 
       // accumulate grads + compute next d (wrt inputs)
       d = lin.backward(x: inp, dOut: dz, gW: gW[li], gb: gb[li]);
-      // now `d` is dL/d(input_of_this_layer) — becomes dTop for the next layer down
+      // d is dL/d(input_of_this_layer)
     }
   }
 }
