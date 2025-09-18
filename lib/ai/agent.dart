@@ -309,18 +309,22 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
       );
     }
     case Intent.descendSlow: {
-      final vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);
-      final g = env.cfg.t.gravity;
-      final lowG = g.abs() < 1e-6;
+      // Target gentle descent; use DOWN thruster if descending too slowly.
+      final vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);  // desired downward speed
       final t = (env.cfg.t as dynamic);
       final downEnabled = (t.downThrEnabled ?? false) == true;
-      final wantDown = lowG && downEnabled && (vy < 0.7 * vCap);
-      final needUp   = vy > vCap || (!lowG && h < 110.0);
-      down = wantDown;
+
+      // Need more upward thrust if we’re too fast down, or we’re low without down-thr available.
+      final needUp   = (vy > vCap) || (h < 110.0 && !downEnabled);
+
+      // NEW: actively use top thruster to accelerate descent when too slow (or rising).
+      final needDown = downEnabled && (vy < 0.6 * vCap);
+
       return et.ControlInput(
-        thrust: needUp, left: false, right: false,
+        thrust: needUp,
+        left: false, right: false,
         sideLeft: false, sideRight: false,
-        downThrust: down,
+        downThrust: needDown,
       );
     }
     case Intent.brakeLeft: {

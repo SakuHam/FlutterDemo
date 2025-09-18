@@ -382,15 +382,31 @@ void _warmFeatureNorm({
 
 /* ----------------------------- PF velocity-only reward ------------------------- */
 
-class PFShapingCfg {
-  final double wAlign;      // reward per unit cos(v, flow) in [-1,1]
-  final double wVelDelta;   // penalty per unit ||v - v_pf|| / vmax
+/* -------------------- PF velocity-only reward (final approach boost) -------------------- */
 
-  // distance-shaped target-speed parameters for suggested v_pf
-  final double vMinClose;   // target |v| near sink
-  final double vMaxFar;     // target |v| far from sink
-  final double alpha;       // taper sharpness
-  final double vmax;        // normalization for velocity error
+class PFShapingCfg {
+  // base weights
+  final double wAlign;       // reward per unit cos(v, flow)
+  final double wVelDelta;    // base penalty for ||v - v_pf|| / vmax
+
+  // distance-shaped target-speed parameters
+  final double vMinClose;    // far-to-near baseline (will get tapered further near pad)
+  final double vMaxFar;
+  final double alpha;        // taper sharpness
+
+  // scaling + norms
+  final double vmax;         // normalization for velocity error
+
+  // NEW: near-pad emphasis
+  final double padTightFrac; // horizontal tight zone as fraction of worldW (e.g., 0.10)
+  final double hTight;       // vertical tight zone in px (e.g., 140)
+  final double latBoost;     // extra weight on lateral error near pad (e.g., 4.0)
+  final double velPenaltyBoost; // multiplies overall v-error near pad (e.g., 3.0)
+  final double alignBoost;      // multiplies align reward near pad (e.g., 1.5)
+  final double vMinTouchdown;   // desired |v| right at pad (e.g., 1.5..3.0)
+
+  // NEW: feasibility clamp (prevents unwinnable target)
+  final double feasiness;    // fraction of a_max*dt allowed change in v_pf per frame (0..1)
 
   const PFShapingCfg({
     this.wAlign = 1.0,
@@ -399,37 +415,60 @@ class PFShapingCfg {
     this.vMaxFar = 90.0,
     this.alpha = 1.2,
     this.vmax = 140.0,
+
+    this.padTightFrac = 0.10,
+    this.hTight = 140.0,
+    this.latBoost = 4.0,
+    this.velPenaltyBoost = 3.0,
+    this.alignBoost = 1.5,
+    this.vMinTouchdown = 2.0,
+
+    this.feasiness = 0.75,
   });
 }
 
-/// Build a per-step reward hook for current episode/terrain.
-/// Reward = wAlign * cos(v, flow) - wVelDelta * ||v - v_pf|| / vmax
+/// Reward = wAlign_eff * cos(v, flow) - wVel_eff * ||W*(v - v_pf)|| / vmax
+/// where W increases lateral weighting near the pad, and v_pf tapers to ~0 near pad.
 ai.ExternalRewardHook makePFRewardHook({
   required eng.GameEngine env,
   PFShapingCfg cfg = const PFShapingCfg(),
 }) {
   final pf = buildPotentialField(env, nx: 160, ny: 120, iters: 1200, omega: 1.7, tol: 1e-4);
 
+  // Effective max linear accel per real second (rough estimate from engine):
+  // In GameEngine: accel uses (t.thrustAccel * 0.05) then multiplied by (dt * stepScale).
+  final double aMax = env.cfg.t.thrustAccel * 0.05 * env.cfg.stepScale; // px/s^2
+
   return ({required eng.GameEngine env, required double dt, required int tStep}) {
-    final x = env.lander.pos.x;
-    final y = env.lander.pos.y;
+    final x = env.lander.pos.x.toDouble();
+    final y = env.lander.pos.y.toDouble();
+    final vx = env.lander.vel.x.toDouble();
+    final vy = env.lander.vel.y.toDouble();
 
-    // Actual velocity
-    final vx = env.lander.vel.x;
-    final vy = env.lander.vel.y;
+    // Proximity to pad: combine horizontal closeness and height
+    final padCx = env.terrain.padCenter.toDouble();
+    final dxAbs = (x - padCx).abs();
+    final W = env.cfg.worldW.toDouble();
 
-    // Unit flow direction from PF (−∇φ normalized)
-    final flow = pf.sampleFlow(x, y); // (nx, ny) already unit
+    final gy = env.terrain.heightAt(x);
+    final h  = (gy - y).toDouble().clamp(0.0, 1000.0);
 
-    // Alignment term
-    final vmag = math.sqrt(vx * vx + vy * vy);
+    // Smooth proximity 0..1 (1 = inside tight zone)
+    final tightX = cfg.padTightFrac * W;
+    final px = math.exp(- (dxAbs*dxAbs) / (tightX*tightX + 1e-6));
+    final ph = math.exp(- (h*h)       / (cfg.hTight*cfg.hTight + 1e-6));
+    final prox = (px * ph).clamp(0.0, 1.0);
+
+    // Alignment (unit flow) term
+    final flow = pf.sampleFlow(x, y); // unit (nx, ny)
+    final vmag = math.sqrt(vx*vx + vy*vy);
     double align = 0.0;
     if (vmag > 1e-6) {
-      align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny; // [-1, 1]
+      align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny; // [-1,1]
     }
 
-    // Suggested velocity magnitude based on distance taper
-    final sugg = pf.suggestVelocity(
+    // Base PF suggestion (fast far, slow near)
+    var sugg = pf.suggestVelocity(
       x, y,
       vMinClose: cfg.vMinClose,
       vMaxFar: cfg.vMaxFar,
@@ -437,13 +476,48 @@ ai.ExternalRewardHook makePFRewardHook({
       clampSpeed: 9999.0,
     );
 
-    // Velocity error term (normalize by vmax)
-    final dvx = vx - sugg.vx;
-    final dvy = vy - sugg.vy;
-    final vErr = math.sqrt(dvx * dvx + dvy * dvy) / cfg.vmax;
+    // --- Final-approach flare: taper desired speed sharply to ~vMinTouchdown ---
+    // Stronger taper as prox→1. Lateral gets reduced more than vertical.
+    final flareLat = (1.0 - 0.90 * prox); // kill lateral speed near pad
+    final flareVer = (1.0 - 0.70 * prox); // still allow a bit of vertical
+    final magNow = math.sqrt(sugg.vx*sugg.vx + sugg.vy*sugg.vy) + 1e-9;
+
+    // Scale vector components
+    sugg = (
+    vx: sugg.vx * flareLat,
+    vy: sugg.vy * flareVer,
+    );
+
+    // Also clamp overall magnitude to approach vMinTouchdown at prox=1
+    final magTarget = ((1.0 - prox) * magNow + prox * cfg.vMinTouchdown).clamp(0.0, magNow);
+    final magNew = math.sqrt(sugg.vx*sugg.vx + sugg.vy*sugg.vy) + 1e-9;
+    final kMag = (magTarget / magNew).clamp(0.0, 1.0);
+    sugg = (vx: sugg.vx * kMag, vy: sugg.vy * kMag);
+
+    // --- Feasibility clamp: don’t ask for more delta-v than we can change this frame ---
+    final dv_pf_x = sugg.vx - vx;
+    final dv_pf_y = sugg.vy - vy;
+    final dv_pf_mag = math.sqrt(dv_pf_x*dv_pf_x + dv_pf_y*dv_pf_y);
+    final dv_pf_cap = (aMax * dt * cfg.feasiness).clamp(0.0, 1e9);
+    if (dv_pf_mag > dv_pf_cap && dv_pf_mag > 1e-9) {
+      final s = dv_pf_cap / dv_pf_mag;
+      sugg = (vx: vx + dv_pf_x * s, vy: vy + dv_pf_y * s);
+    }
+
+    // Error with component weighting (lateral heavier near pad)
+    final wLat = 1.0 + cfg.latBoost * prox;     // x
+    final wVer = 1.0 + 0.5 * cfg.latBoost * prox; // y (softer than lateral)
+
+    final dvx = (vx - sugg.vx) * wLat;
+    final dvy = (vy - sugg.vy) * wVer;
+    final vErr = math.sqrt(dvx*dvx + dvy*dvy) / cfg.vmax;
+
+    // Proximity-scaled weights
+    final wAlignEff = cfg.wAlign * (1.0 + cfg.alignBoost * prox);
+    final wVelEff   = cfg.wVelDelta * (1.0 + cfg.velPenaltyBoost * prox);
 
     // Final reward
-    final r = cfg.wAlign * align - cfg.wVelDelta * vErr;
+    final r = wAlignEff * align - wVelEff * vErr;
     return r;
   };
 }
