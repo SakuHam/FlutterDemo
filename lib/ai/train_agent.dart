@@ -9,7 +9,7 @@ import '../engine/raycast.dart'; // RayConfig
 
 import 'agent.dart' as ai; // FeatureExtractorRays, PolicyNetwork, Trainer, RunningNorm, kIntentNames, predictiveIntentLabelAdaptive
 import 'agent.dart';       // bring symbols into scope (PolicyNetwork etc.)
-import 'potential_field.dart'; // <-- PF: buildPotentialField, PotentialField
+import 'potential_field.dart'; // buildPotentialField, PotentialField
 
 /* ------------------------------- tiny arg parser ------------------------------- */
 
@@ -42,21 +42,8 @@ String _feSignature({
   required bool kindsOneHot,
   required double worldW,
   required double worldH,
-  required Map<String, dynamic> physics, // NEW
 }) {
-  // Keep it short & stable; include a mini-hash of physics to detect mismatches.
-  final sPhys = [
-    physics['gravity'],
-    physics['thrustAccel'],
-    physics['rotSpeed'],
-    physics['rcsEnabled'] ? 1 : 0,
-    physics['rcsAccel'],
-    physics['rcsBodyFrame'] ? 1 : 0,
-    physics['downThrEnabled'] ? 1 : 0,
-    physics['downThrAccel'],
-  ].join(',');
-  final h = sPhys.hashCode;
-  return 'kind=rays;in=$inputSize;rays=$rayCount;1hot=$kindsOneHot;W=${worldW.toInt()};H=${worldH.toInt()};phys=$h';
+  return 'kind=rays;in=$inputSize;rays=$rayCount;1hot=$kindsOneHot;W=${worldW.toInt()};H=${worldH.toInt()}';
 }
 
 /* ------------------------------- matrix helpers -------------------------------- */
@@ -79,26 +66,12 @@ Map<String, dynamic> _policyToJson({
   required eng.GameEngine env,
   RunningNorm? norm,
 }) {
-  final physics = {
-    // NEW: embed physics/tunables so live run can mirror training
-    'gravity'        : env.cfg.t.gravity,
-    'thrustAccel'    : env.cfg.t.thrustAccel,
-    'rotSpeed'       : env.cfg.t.rotSpeed,
-    'rcsEnabled'     : (env.cfg.t as dynamic).rcsEnabled ?? false,
-    'rcsAccel'       : (env.cfg.t as dynamic).rcsAccel ?? 0.0,
-    'rcsBodyFrame'   : (env.cfg.t as dynamic).rcsBodyFrame ?? true,
-    'downThrEnabled' : (env.cfg.t as dynamic).downThrEnabled ?? false,
-    'downThrAccel'   : (env.cfg.t as dynamic).downThrAccel ?? 0.0,
-    'downThrBurn'    : (env.cfg.t as dynamic).downThrBurn ?? 0.0,
-  };
-
   final sig = _feSignature(
     inputSize: p.inputSize,
     rayCount: rayCount,
     kindsOneHot: kindsOneHot,
     worldW: env.cfg.worldW,
     worldH: env.cfg.worldH,
-    physics: physics,
   );
 
   final trunkJson = <Map<String, dynamic>>[];
@@ -110,6 +83,8 @@ Map<String, dynamic> _policyToJson({
     'W': _deepCopyMat(layer.W),
     'b': List<double>.from(layer.b),
   };
+
+  final t = env.cfg.t;
 
   final m = <String, dynamic>{
     'arch': {
@@ -129,14 +104,26 @@ Map<String, dynamic> _policyToJson({
       'rayCount': rayCount,
       'kindsOneHot': kindsOneHot,
     },
-    'env_hint': {
-      'worldW': env.cfg.worldW,
-      'worldH': env.cfg.worldH,
-      'padWidthFactor': env.cfg.padWidthFactor,
+    'env_hint': {'worldW': env.cfg.worldW, 'worldH': env.cfg.worldH},
+
+    // NEW: persist physics knobs so runtime can mirror them
+    'physics': {
+      'gravity': t.gravity,
+      'thrustAccel': t.thrustAccel,
+      'rotSpeed': t.rotSpeed,
+      'maxFuel': t.maxFuel,
+
+      'rcsEnabled': t.rcsEnabled,
+      'rcsAccel': t.rcsAccel,
+      'rcsBodyFrame': t.rcsBodyFrame,
+
+      'downThrEnabled': t.downThrEnabled,
+      'downThrAccel': t.downThrAccel,
+      'downThrBurn': t.downThrBurn,
     },
-    'physics': physics,           // NEW: full physics bundle
+
     'signature': sig,
-    'format': 'v2rays+phys',      // NEW: mark format version
+    'format': 'v2rays',
   };
 
   if (norm != null && norm.inited && norm.dim == p.inputSize) {
@@ -147,7 +134,7 @@ Map<String, dynamic> _policyToJson({
       'var': norm.var_,
       'signature': sig,
     };
-    // legacy mirror (optional)
+    // legacy mirrors
     m['norm_mean'] = norm.mean;
     m['norm_var'] = norm.var_;
     m['norm_momentum'] = norm.momentum;
@@ -179,7 +166,6 @@ void _savePolicy({
 
 /* --------------------------------- env config --------------------------------- */
 
-// NEW: optional side/down thrusters & gravity exposed via args.
 et.EngineConfig makeConfig({
   int seed = 42,
   bool lockTerrain = false,
@@ -190,18 +176,16 @@ et.EngineConfig makeConfig({
   double? maxFuel,
   bool crashOnTilt = false,
 
-  // NEW: physics knobs
+  // NEW physics flags/values
   double gravity = 0.18,
   double thrustAccel = 0.42,
   double rotSpeed = 1.6,
 
-  // NEW: side thrusters (RCS)
-  bool sideThrusters = false,
-  double sideAccel = 0.12,
+  bool rcsEnabled = false,
+  double rcsAccel = 0.12,
   bool rcsBodyFrame = true,
 
-  // NEW: downward thruster
-  bool downThr = false,
+  bool downThrEnabled = false,
   double downThrAccel = 0.30,
   double downThrBurn = 10.0,
 }) {
@@ -215,12 +199,13 @@ et.EngineConfig makeConfig({
     landingMaxVy: 38.0,
     landingMaxOmega: 3.5,
 
-    // NEW in Tunables
-    rcsEnabled: sideThrusters,
-    rcsAccel: sideAccel,
+    // RCS
+    rcsEnabled: rcsEnabled,
+    rcsAccel: rcsAccel,
     rcsBodyFrame: rcsBodyFrame,
 
-    downThrEnabled: downThr,
+    // Downward thruster
+    downThrEnabled: downThrEnabled,
     downThrAccel: downThrAccel,
     downThrBurn: downThrBurn,
   );
@@ -401,18 +386,26 @@ class PFShapingCfg {
   final double wDeltaPhi;   // reward per unit potential drop
   final double wAlign;      // reward per unit cos(v, flow)
   final double wVelDelta;   // penalty per unit ||v - v_pf|| / vmax
-  final double clampSpeed;  // suggestVelocity clamp
+
+  // distance-shaped target-speed parameters
+  final double vMinClose;   // target speed near sink
+  final double vMaxFar;     // target speed far
+  final double alpha;       // taper sharpness
+
   final double vmax;        // normalization for velocity error
   const PFShapingCfg({
     this.wDeltaPhi = 4.0,
     this.wAlign = 1.5,
-    this.wVelDelta = 0.4,
-    this.clampSpeed = 90.0,
+    this.wVelDelta = 0.5,
+    this.vMinClose = 8.0,
+    this.vMaxFar = 90.0,
+    this.alpha = 1.2,
     this.vmax = 140.0,
   });
 }
 
 /// Build a per-step reward hook for current episode/terrain.
+/// Uses shaped suggested velocity (fast far, slow near).
 ai.ExternalRewardHook makePFRewardHook({
   required eng.GameEngine env,
   PFShapingCfg cfg = const PFShapingCfg(),
@@ -424,10 +417,12 @@ ai.ExternalRewardHook makePFRewardHook({
     final x = env.lander.pos.x;
     final y = env.lander.pos.y;
 
+    // 1) Δφ: positive when moving downhill (toward pad)
     final phi = pf.samplePhi(x, y);
     final dPhi = (prevPhi - phi);
     prevPhi = phi;
 
+    // 2) Alignment between actual velocity and −∇φ (unit flow)
     final vx = env.lander.vel.x;
     final vy = env.lander.vel.y;
     final flow = pf.sampleFlow(x, y); // unit (nx,ny)
@@ -437,7 +432,14 @@ ai.ExternalRewardHook makePFRewardHook({
       align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny; // [-1,1]
     }
 
-    final sugg = pf.suggestVelocity(x, y, clampSpeed: cfg.clampSpeed);
+    // 3) Velocity delta to distance-shaped PF prediction vector
+    final sugg = pf.suggestVelocity(
+      x, y,
+      vMinClose: cfg.vMinClose,
+      vMaxFar: cfg.vMaxFar,
+      alpha: cfg.alpha,
+      clampSpeed: 9999.0,
+    );
     final dvx = vx - sugg.vx;
     final dvy = vy - sugg.vy;
     final vErr = math.sqrt(dvx * dvx + dvy * dvy) / cfg.vmax;
@@ -486,25 +488,23 @@ void main(List<String> argv) {
   final maxFuel = args.getDouble('max_fuel', def: 1000.0);
   final crashOnTilt = args.getFlag('crash_on_tilt', def: false);
 
-  final determinism = args.getFlag('determinism_probe', def: true);
-  final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
-
-  // NEW: physics flags
+  // NEW physics flags for CLI
   final gravity = args.getDouble('gravity', def: 0.18);
   final thrustAccel = args.getDouble('thrust_accel', def: 0.42);
   final rotSpeed = args.getDouble('rot_speed', def: 1.6);
 
-  // NEW: side thrusters (RCS)
-  final sideThrusters = args.getFlag('side_thrusters', def: false);
-  final sideAccel = args.getDouble('side_accel', def: 0.12);
-  final rcsBodyFrame = args.getFlag('rcs_body_frame', def: true);
+  final rcsEnabled = args.getFlag('rcs_enabled', def: false);
+  final rcsAccel = args.getDouble('rcs_accel', def: 0.12);
+  final rcsBodyFrame = !args.getFlag('rcs_world_frame', def: false); // default body frame
 
-  // NEW: downward thruster
-  final downThr = args.getFlag('down_thr', def: false);
+  final downThrEnabled = args.getFlag('down_thr_enabled', def: false);
   final downThrAccel = args.getDouble('down_thr_accel', def: 0.30);
   final downThrBurn = args.getDouble('down_thr_burn', def: 10.0);
 
-  // Trainer-internal gating
+  final determinism = args.getFlag('determinism_probe', def: true);
+  final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
+
+  // Trainer-internal gating (score is “higher is better”)
   final gateScoreMin = args.getDouble('gate_min', def: -1e9);
   final gateOnlyLanded = args.getFlag('gate_landed', def: false);
   final gateVerbose = args.getFlag('gate_verbose', def: true);
@@ -524,11 +524,11 @@ void main(List<String> argv) {
     thrustAccel: thrustAccel,
     rotSpeed: rotSpeed,
 
-    sideThrusters: sideThrusters,
-    sideAccel: sideAccel,
+    rcsEnabled: rcsEnabled,
+    rcsAccel: rcsAccel,
     rcsBodyFrame: rcsBodyFrame,
 
-    downThr: downThr,
+    downThrEnabled: downThrEnabled,
     downThrAccel: downThrAccel,
     downThrBurn: downThrBurn,
   );
@@ -573,8 +573,7 @@ void main(List<String> argv) {
     intentPgWeight: intentPgWeight,
     actionAlignWeight: actionAlignWeight,
     normalizeFeatures: true,
-
-    // gating inside trainer
+    // gating inside trainer (prints [TRAIN] lines)
     gateScoreMin: gateScoreMin,
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
@@ -687,22 +686,34 @@ void main(List<String> argv) {
 
 /* ----------------------------------- usage ------------------------------------
 
-Examples with new physics flags:
+Examples:
 
-  // Zero-g sandbox: side + down thrusters on
-  dart run lib/ai/train_agent.dart \
-    --gravity=0.0 \
-    --side_thrusters --side_accel=0.12 --rcs_body_frame \
-    --down_thr --down_thr_accel=0.30 --down_thr_burn=10 \
-    --train_iters=300 --batch=1
+1) Baseline PF shaping + internal gating + default physics:
 
-  // Heavier gravity + weaker main engine + world-frame strafing
   dart run lib/ai/train_agent.dart \
-    --gravity=0.26 --thrust_accel=0.36 --rot_speed=1.4 \
-    --side_thrusters --side_accel=0.10 --rcs_body_frame=false \
-    --down_thr --down_thr_accel=0.22
+    --hidden=96,96,64 \
+    --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 \
+    --blend_policy=1.0 --intent_align=0.25 --intent_pg=0.6 \
+    --gate_min=4.0 --gate_landed \
+    --determinism_probe
+
+2) Zero gravity + RCS side thrusters + downward thruster (for deorbit/landing):
+
+  dart run lib/ai/train_agent.dart \
+    --gravity=0 \
+    --rcs_enabled --rcs_accel=0.16 \
+    --down_thr_enabled --down_thr_accel=0.30 --down_thr_burn=10 \
+    --train_iters=400 --batch=1 --lr=3e-4 \
+    --plan_hold=1 --intent_pg=0.6 --intent_align=0.25
+
+3) Make main engine gentler and allow more rotation:
+
+  dart run lib/ai/train_agent.dart \
+    --thrust_accel=0.32 --rot_speed=2.2
 
 Notes:
-- The saved JSON now includes a "physics" object with all these toggles/values.
-- Your live runner can parse it and configure `EngineConfig/Tunables` accordingly.
-------------------------------------------------------------------------------- */
+- Physics flags get embedded in the exported JSON under "physics" so runtime
+  can configure the engine consistently for live play.
+- PF shaping uses a distance-shaped target |v_pf|: fast when far from the pad,
+  gentle near the sink line, with optional vertical slowdown near padY.
+-------------------------------------------------------------------------------- */

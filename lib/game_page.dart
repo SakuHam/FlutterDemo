@@ -738,7 +738,7 @@ class GamePainter extends CustomPainter {
     if (visMode == DebugVisMode.potential && pf != null) {
       _paintPotentialHeat(canvas, pf!, heatDownsample: 3, alpha: 130);
     } else if (visMode == DebugVisMode.velocity && pf != null) {
-      _paintPotentialVectors(canvas, pf!, stride: 8, arrowScale: 36.0);
+      _paintPotentialVectors(canvas, pf!, stride: 8);
     } else if (visMode == DebugVisMode.rays) {
       _paintRays(canvas);
     }
@@ -891,27 +891,61 @@ class GamePainter extends CustomPainter {
     }
   }
 
-  void _paintPotentialVectors(Canvas canvas, PotentialField pf, {int stride = 8, double arrowScale = 32.0}) {
-    final line = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.0
-      ..color = const Color(0xFF00E5FF);
-    final head = Paint()
-      ..style = PaintingStyle.fill
-      ..color = const Color(0xFF00E5FF);
-
+  void _paintPotentialVectors(
+      Canvas canvas,
+      PotentialField pf, {
+        int stride = 8,
+        double arrowScale = 32.0, // base scale; we'll multiply by 5x below
+      }) {
+    // 1) Pre-scan to find a dynamic max gradient magnitude for normalization.
     final nx = pf.gridNx, ny = pf.gridNy;
     final dx = pf.gridDx, dy = pf.gridDy;
 
+    double maxMag = 1e-9;
+    for (int j = 1; j < ny - 1; j += stride) {
+      for (int i = 1; i < nx - 1; i += stride) {
+        if (pf.maskAtIndex(i, j) == 2) continue; // obstacle
+        final flow = pf.sampleFlow(i * dx, j * dy);
+        if (flow.mag > maxMag) maxMag = flow.mag;
+      }
+    }
+
+    // 2) Draw arrows, color by speed with a floor on brightness.
+    //    Low speeds won't go near black anymore.
     for (int j = 1; j < ny - 1; j += stride) {
       for (int i = 1; i < nx - 1; i += stride) {
         if (pf.maskAtIndex(i, j) == 2) continue; // skip obstacle bodies
         final x = i * dx;
         final y = j * dy;
         final flow = pf.sampleFlow(x, y);
+
+        // Normalize speed 0..1 against the pre-scanned max
+        final n = (flow.mag / maxMag).clamp(0.0, 1.0);
+
+        // Hue: cyan→yellow as speed grows; keep saturation high; clamp value >= 0.35.
+        final color = HSVColor.fromAHSV(
+          1.0,
+          200.0 - 160.0 * n,   // hue 200→40
+          0.90,                // saturation
+          0.35 + 0.65 * n,     // value (brightness) floor at 0.35
+        ).toColor();
+
+        // 5× longer arrows (multiply scale)
+        final lenScale = arrowScale * 1.0;
+
         final sx = x, sy = y;
-        final ex = x + flow.nx * arrowScale;
-        final ey = y + flow.ny * arrowScale;
+        final ex = x + flow.nx * lenScale;
+        final ey = y + flow.ny * lenScale;
+
+        final line = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.0
+          ..color = color;
+
+        final head = Paint()
+          ..style = PaintingStyle.fill
+          ..color = color;
+
         canvas.drawLine(Offset(sx, sy), Offset(ex, ey), line);
         _arrowHead(canvas, head, Offset(ex, ey), math.atan2(ey - sy, ex - sx), 7.0, 5.0);
       }
@@ -942,6 +976,12 @@ class GamePainter extends CustomPainter {
     final b = (27.2 + t * (3211.1 + t * (-15327.97 + t * (27814.0 + t * (-22569.18 + t * 6838.66)))))/255.0;
     int c(double v) => (v.clamp(0.0, 1.0) * 255).round();
     return Color.fromARGB(255, c(r), c(g), c(b));
+  }
+
+  Color _speedColor(double v, {double vMin = 8.0, double vMax = 90.0}) {
+    // Normalize speed 0..1 and map with the existing Turbo ramp
+    final t = ((v - vMin) / (vMax - vMin)).clamp(0.0, 1.0);
+    return _lerpTurbo(t);
   }
 
   void _paintParticles(Canvas canvas) {

@@ -20,6 +20,11 @@ class PotentialField {
   double _padPhi = 0.0;
   double _farPhi = 1.0;
 
+  // NEW: for speed shaping (fast far away, slow near sink)
+  final double padCx;
+  final double padY;
+  final double worldDiag;
+
   PotentialField({
     required this.nx,
     required this.ny,
@@ -28,6 +33,11 @@ class PotentialField {
     this.maxIters = 2000,
     this.tol = 1e-4,
     this.omega = 1.7,
+
+    // new
+    required this.padCx,
+    required this.padY,
+    required this.worldDiag,
   })  : dx = worldW / (nx - 1),
         dy = worldH / (ny - 1),
         _phi = List<double>.filled(nx * ny, 1.0),
@@ -241,10 +251,65 @@ class PotentialField {
     return (fx: fx, fy: fy, nx: fx / mag, ny: fy / mag, mag: mag);
   }
 
-  ({double vx, double vy}) suggestVelocity(double x, double y, {double clampSpeed = 90.0}) {
-    final flow = sampleFlow(x, y);
-    final phi = samplePhi(x, y);
-    final speed = (12.0 + 80.0 * phi).clamp(10.0, clampSpeed);
+  // ---- NEW: distance-shaped target speed (fast far, slow near) ----
+
+  /// Euclidean distance to sink (pad center).
+  double distanceToSink(double x, double y) {
+    final dx_ = x - padCx;
+    final dy_ = y - padY;
+    return math.sqrt(dx_ * dx_ + dy_ * dy_);
+  }
+
+  /// Speed profile HIGH when far and LOW near the sink.
+  /// p = normalized distance in [0,1]; alpha>1 tapers more near sink.
+  double _shapedSpeed({
+    required double dist,
+    double vMinClose = 8.0,
+    double vMaxFar = 90.0,
+    double alpha = 1.2,
+  }) {
+    final p = (dist / worldDiag).clamp(0.0, 1.0);
+    final w = math.pow(p, alpha).toDouble(); // ~0 near sink, ~1 far
+    return vMinClose + (vMaxFar - vMinClose) * w;
+  }
+
+  /// Suggested velocity along -∇φ with distance/altitude-shaped magnitude.
+  ///
+  /// - vMinClose / vMaxFar / alpha: distance taper
+  /// - heightSlowdownH / heightSlowdownMin: extra softening as we approach padY
+  /// - clampSpeed: final protection cap (kept for back-compat with old callsites)
+  ({double vx, double vy}) suggestVelocity(
+      double x,
+      double y, {
+        double vMinClose = 8.0,
+        double vMaxFar = 90.0,
+        double alpha = 1.2,
+        double heightSlowdownH = 120.0,
+        double heightSlowdownMin = 0.45,
+        double clampSpeed = 9999.0, // very high by default; legacy callers can still cap
+      }) {
+    final flow = sampleFlow(x, y); // unit downhill
+    final dist = distanceToSink(x, y);
+
+    // base speed from distance
+    double speed = _shapedSpeed(
+      dist: dist,
+      vMinClose: vMinClose,
+      vMaxFar: vMaxFar,
+      alpha: alpha,
+    );
+
+    // Optional extra taper based on absolute vertical offset to pad line
+    final dyFromPad = (y - padY).abs();
+    if (dyFromPad < heightSlowdownH) {
+      final a = (dyFromPad / heightSlowdownH).clamp(0.0, 1.0);
+      final k = heightSlowdownMin + (1.0 - heightSlowdownMin) * a; // [min,1]
+      speed *= k;
+    }
+
+    // Final cap (legacy safety)
+    if (clampSpeed.isFinite) speed = math.min(speed, clampSpeed);
+
     return (vx: flow.nx * speed, vy: flow.ny * speed);
   }
 
@@ -256,13 +321,14 @@ class PotentialField {
 }
 
 /// Convenience builder that creates & solves a field for the current env.
-PotentialField buildPotentialField(eng.GameEngine env, {
-  int nx = 160,
-  int ny = 120,
-  int iters = 1200,
-  double omega = 1.7,
-  double tol = 1e-4,
-}) {
+PotentialField buildPotentialField(
+    eng.GameEngine env, {
+      int nx = 160,
+      int ny = 120,
+      int iters = 1200,
+      double omega = 1.7,
+      double tol = 1e-4,
+    }) {
   final pf = PotentialField(
     nx: nx,
     ny: ny,
@@ -271,6 +337,13 @@ PotentialField buildPotentialField(eng.GameEngine env, {
     maxIters: iters,
     tol: tol,
     omega: omega,
+
+    // NEW: provide sink + scale for speed shaping
+    padCx: env.terrain.padCenter.toDouble(),
+    padY: env.terrain.padY.toDouble(),
+    worldDiag: math.sqrt(
+      env.cfg.worldW * env.cfg.worldW + env.cfg.worldH * env.cfg.worldH,
+    ),
   );
   pf.rasterizeFromEnv(env, padInflateX: 0.0);
   pf.solve();
