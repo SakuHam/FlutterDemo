@@ -3,27 +3,36 @@ import 'dart:math' as math;
 import '../engine/game_engine.dart' as eng;
 import '../engine/types.dart' as et;
 
-/// Potential field: pad is sink (phi ≈ 0), far field is 1.0.
+/// Potential field: pad is φ≈0, far field is φ=1.0.
 /// Obstacles (terrain/walls) enforce a no-flux boundary by mirroring the cell value.
-/// Solve: ∇²φ = 0 on free space, Dirichlet on pad, Neumann (no-flux) at obstacles.
+/// Solve: ∇²φ = 0 on free space, Dirichlet on pad (+ optional lifted sink band),
+/// Neumann (no-flux) at obstacles; outer boundary Dirichlet (far field).
 class PotentialField {
   final int nx, ny;
-  final double dx, dy;
   final double worldW, worldH;
-
   final int maxIters;
   final double tol;
   final double omega;
 
-  final List<double> _phi;   // nx*ny
-  final List<int> _mask;     // 0=free, 1=pad Dirichlet, 2=obstacle, 3=outer Dirichlet
+  // Derived grid step
+  late final double dx = worldW / (nx - 1);
+  late final double dy = worldH / (ny - 1);
+
+  // Storage
+  final List<double> _phi; // nx*ny
+  final List<int> _mask;   // 0=free, 1=Dirichlet (pad/sink), 2=obstacle, 3=outer Dirichlet
   double _padPhi = 0.0;
   double _farPhi = 1.0;
 
-  // NEW: for speed shaping (fast far away, slow near sink)
-  final double padCx;
-  final double padY;
-  final double worldDiag;
+  // Geometry for shaping
+  final double padCx;      // pad center x (for ref)
+  final double padY;       // pad y line
+  final double worldDiag;  // for distance normalization
+
+  // NEW: lifted sink parameters (for geometry + speed shaping)
+  final double sinkY;        // typically (padY - sinkLiftPx)
+  final double sinkLiftPx;   // how far above pad we put the sink
+  final double sinkBandH;    // thickness of the extra Dirichlet band
 
   PotentialField({
     required this.nx,
@@ -34,13 +43,16 @@ class PotentialField {
     this.tol = 1e-4,
     this.omega = 1.7,
 
-    // new
+    // shaping refs
     required this.padCx,
     required this.padY,
     required this.worldDiag,
-  })  : dx = worldW / (nx - 1),
-        dy = worldH / (ny - 1),
-        _phi = List<double>.filled(nx * ny, 1.0),
+
+    // lifted sink
+    required this.sinkY,
+    this.sinkLiftPx = 0.0,
+    this.sinkBandH = 0.0,
+  })  : _phi = List<double>.filled(nx * ny, 1.0),
         _mask = List<int>.filled(nx * ny, 0);
 
   int _idx(int i, int j) => j * nx + i;
@@ -65,9 +77,9 @@ class PotentialField {
     return _mask[_idx(ii, jj)];
   }
 
-  /// --- Geometry helpers ---
+  /* --------------------------- Geometry helpers --------------------------- */
+
   static bool _pointInRing(List<et.Vector2> ring, double x, double y) {
-    // Ray crossing test
     bool inside = false;
     for (int a = 0, b = ring.length - 1; a < ring.length; b = a++) {
       final ax = ring[a].x.toDouble(), ay = ring[a].y.toDouble();
@@ -88,15 +100,16 @@ class PotentialField {
     if (outer.isEmpty) return false;
     if (!_pointInRing(outer, x, y)) return false;
     for (final h in holes) {
-      if (h.isNotEmpty && _pointInRing(h, x, y)) return false; // inside a hole → not in solid
+      if (h.isNotEmpty && _pointInRing(h, x, y)) return false;
     }
-    return true; // inside outer and not in any hole → solid
+    return true;
   }
 
   /// Build masks from env with polygon-aware rasterization:
-  /// - pad line → Dirichlet (phi=0) snapped to nearest grid row
-  /// - obstacle where point (cell center) ∈ outer AND ∉ any hole
-  /// - outer boundary → far-field Dirichlet (phi=1)
+  /// - pad line → Dirichlet (φ=0) snapped to nearest grid row
+  /// - optional **lifted sink band** above pad as Dirichlet (φ=0)
+  /// - obstacle where (cell center) ∈ outer AND ∉ any hole
+  /// - outer boundary → far-field Dirichlet (φ=1)
   /// - hard walls -> mark as obstacle (no-flux)
   void rasterizeFromEnv(eng.GameEngine env, {double padInflateX = 0.0}) {
     // Clear
@@ -118,27 +131,24 @@ class PotentialField {
     final outer = env.terrain.poly.outer;
     final holes = env.terrain.poly.holes;
 
-    // --- Terrain as obstacle: polygon fill (outer minus holes) ---
-    // Use cell centers to classify.
+    // Terrain as obstacle (outer minus holes)
     for (int j = 0; j < ny; j++) {
       final y = j * dy;
       for (int i = 0; i < nx; i++) {
         final x = i * dx;
         if (_pointInPolyWithHoles(outer: outer, holes: holes, x: x, y: y)) {
-          final k = _idx(i, j);
-          _mask[k] = 2; // obstacle
+          _mask[_idx(i, j)] = 2; // obstacle
         }
       }
     }
 
-    // --- Pad as Dirichlet (phi=0) exactly on the nearest grid row to padY ---
+    // --- Pad as Dirichlet (φ=0) on the closest grid row(s) to padY ---
     final padX1 = env.terrain.padX1.toDouble() - padInflateX;
     final padX2 = env.terrain.padX2.toDouble() + padInflateX;
-    final padY  = env.terrain.padY.toDouble();
+    final padY_ = env.terrain.padY.toDouble();
 
-    final jPad = (padY / dy).round().clamp(0, ny - 1);
-    // also include a 1-row fallback if coarse grid (band of up to 2 rows)
-    final jPad2 = ((padY + 0.45 * dy) / dy).round().clamp(0, ny - 1);
+    final jPad  = (padY_ / dy).round().clamp(0, ny - 1);
+    final jPad2 = ((padY_ + 0.45 * dy) / dy).round().clamp(0, ny - 1);
     final jMin = math.min(jPad, jPad2);
     final jMax = math.max(jPad, jPad2);
 
@@ -147,8 +157,35 @@ class PotentialField {
         final x = i * dx;
         if (x >= padX1 && x <= padX2) {
           final k = _idx(i, j);
-          _mask[k] = 1;       // Dirichlet (pad overrides obstacle)
-          _phi[k] = _padPhi;  // 0.0
+          _mask[k] = 1;      // Dirichlet
+          _phi[k]  = _padPhi; // 0.0
+        }
+      }
+    }
+
+    // --- NEW: lifted sink band (narrow Dirichlet strip) above the pad ---
+    if (sinkLiftPx > 1.0 && sinkBandH > 0.0) {
+      // place a centered band around sinkY, narrower than pad span to pull to center
+      final yTop = (sinkY - 0.5 * sinkBandH).clamp(0.0, worldH);
+      final yBot = (sinkY + 0.5 * sinkBandH).clamp(0.0, worldH);
+      final jTop = (yTop / dy).floor().clamp(0, ny - 1);
+      final jBot = (yBot / dy).ceil().clamp(0, ny - 1);
+
+      final padSpan = (padX2 - padX1).abs();
+      final shrink  = 0.15 * padSpan; // keep it slightly narrower than pad
+      final x1 = math.max(padX1 + shrink, 0.0);
+      final x2 = math.min(padX2 - shrink, worldW);
+
+      if (x2 > x1 && jBot >= jTop) {
+        for (int j = jTop; j <= jBot; j++) {
+          for (int i = 0; i < nx; i++) {
+            final x = i * dx;
+            if (x >= x1 && x <= x2) {
+              final k = _idx(i, j);
+              _mask[k] = 1;       // Dirichlet
+              _phi[k]  = _padPhi; // 0.0
+            }
+          }
         }
       }
     }
@@ -168,14 +205,13 @@ class PotentialField {
     final invDy2 = 1.0 / (dy * dy);
     final denom = 2.0 * (invDx2 + invDy2);
 
-    double maxDelta;
     for (int it = 0; it < maxIters; it++) {
-      maxDelta = 0.0;
+      double maxDelta = 0.0;
       for (int j = 1; j < ny - 1; j++) {
         for (int i = 1; i < nx - 1; i++) {
           final k = _idx(i, j);
           final tag = _mask[k];
-          if (tag == 1) { _phi[k] = _padPhi; continue; } // pad
+          if (tag == 1) { _phi[k] = _padPhi; continue; } // Dirichlet
           if (tag == 3) { _phi[k] = _farPhi; continue; } // outer
           if (tag == 2) { continue; }                    // obstacle: keep value
 
@@ -190,7 +226,7 @@ class PotentialField {
           if (_mask[_idx(i, j + 1)] == 2) phiU = _phi[k];
 
           final rhs = (phiL + phiR) * invDx2 + (phiD + phiU) * invDy2;
-          final gs = rhs / denom;
+          final gs  = rhs / denom;
           final newVal = (1.0 - omega) * _phi[k] + omega * gs;
 
           final d = (newVal - _phi[k]).abs();
@@ -202,7 +238,8 @@ class PotentialField {
     }
   }
 
-  // --- Sampling utilities ---
+  /* ----------------------------- Sampling utils ----------------------------- */
+
   double samplePhi(double x, double y) {
     final gx = (x / dx).clamp(0.0, nx - 1.0);
     final gy = (y / dy).clamp(0.0, ny - 1.0);
@@ -233,7 +270,7 @@ class PotentialField {
 
     double safePhi(int ii, int jj, int ci, int cj) {
       final m = _mask[_idx(ii, jj)];
-      if (m == 2) return _phi[_idx(ci, cj)]; // mirror for obstacles
+      if (m == 2) return _phi[_idx(ci, cj)]; // mirror for obstacles (no-flux)
       return _phi[_idx(ii, jj)];
     }
 
@@ -251,12 +288,12 @@ class PotentialField {
     return (fx: fx, fy: fy, nx: fx / mag, ny: fy / mag, mag: mag);
   }
 
-  // ---- NEW: distance-shaped target speed (fast far, slow near) ----
+  /* ---------------------- Distance-shaped target speed ---------------------- */
 
-  /// Euclidean distance to sink (pad center).
+  /// Euclidean distance to **lifted sink**, not the pad line.
   double distanceToSink(double x, double y) {
     final dx_ = x - padCx;
-    final dy_ = y - padY;
+    final dy_ = y - sinkY; // use lifted sink
     return math.sqrt(dx_ * dx_ + dy_ * dy_);
   }
 
@@ -275,9 +312,9 @@ class PotentialField {
 
   /// Suggested velocity along -∇φ with distance/altitude-shaped magnitude.
   ///
-  /// - vMinClose / vMaxFar / alpha: distance taper
+  /// - vMinClose / vMaxFar / alpha: distance taper (to **lifted sink**)
   /// - heightSlowdownH / heightSlowdownMin: extra softening as we approach padY
-  /// - clampSpeed: final protection cap (kept for back-compat with old callsites)
+  /// - clampSpeed: final protection cap
   ({double vx, double vy}) suggestVelocity(
       double x,
       double y, {
@@ -286,10 +323,10 @@ class PotentialField {
         double alpha = 1.2,
         double heightSlowdownH = 120.0,
         double heightSlowdownMin = 0.45,
-        double clampSpeed = 9999.0, // very high by default; legacy callers can still cap
+        double clampSpeed = 9999.0,
       }) {
     final flow = sampleFlow(x, y); // unit downhill
-    final dist = distanceToSink(x, y);
+    final dist = distanceToSink(x, y); // to lifted sink
 
     // base speed from distance
     double speed = _shapedSpeed(
@@ -299,7 +336,8 @@ class PotentialField {
       alpha: alpha,
     );
 
-    // Optional extra taper based on absolute vertical offset to pad line
+    // Optional extra taper based on absolute vertical offset to the **pad line**
+    // (kept for legacy behavior; this just softens as we approach pad altitude)
     final dyFromPad = (y - padY).abs();
     if (dyFromPad < heightSlowdownH) {
       final a = (dyFromPad / heightSlowdownH).clamp(0.0, 1.0);
@@ -307,7 +345,6 @@ class PotentialField {
       speed *= k;
     }
 
-    // Final cap (legacy safety)
     if (clampSpeed.isFinite) speed = math.min(speed, clampSpeed);
 
     return (vx: flow.nx * speed, vy: flow.ny * speed);
@@ -328,24 +365,38 @@ PotentialField buildPotentialField(
       int iters = 1200,
       double omega = 1.7,
       double tol = 1e-4,
+
+      // NEW knobs
+      double sinkLiftPx = 40.0,  // how far above pad to put the sink
+      double sinkBandH  = 12.0,  // thickness of Dirichlet band (keep small)
+      double padInflateX = 0.0,  // still supported for pad widening if needed
     }) {
+  final worldW = env.cfg.worldW.toDouble();
+  final worldH = env.cfg.worldH.toDouble();
+  final padCx  = env.terrain.padCenter.toDouble();
+  final padY   = env.terrain.padY.toDouble();
+
   final pf = PotentialField(
     nx: nx,
     ny: ny,
-    worldW: env.cfg.worldW.toDouble(),
-    worldH: env.cfg.worldH.toDouble(),
+    worldW: worldW,
+    worldH: worldH,
     maxIters: iters,
     tol: tol,
     omega: omega,
 
-    // NEW: provide sink + scale for speed shaping
-    padCx: env.terrain.padCenter.toDouble(),
-    padY: env.terrain.padY.toDouble(),
-    worldDiag: math.sqrt(
-      env.cfg.worldW * env.cfg.worldW + env.cfg.worldH * env.cfg.worldH,
-    ),
+    // refs
+    padCx: padCx,
+    padY: padY,
+    worldDiag: math.sqrt(worldW * worldW + worldH * worldH),
+
+    // lifted sink params
+    sinkLiftPx: sinkLiftPx,
+    sinkBandH : sinkBandH,
+    sinkY     : (padY - sinkLiftPx).clamp(0.0, worldH - 1.0),
   );
-  pf.rasterizeFromEnv(env, padInflateX: 0.0);
+
+  pf.rasterizeFromEnv(env, padInflateX: padInflateX);
   pf.solve();
   return pf;
 }

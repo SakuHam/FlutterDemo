@@ -519,28 +519,51 @@ ai.ExternalRewardHook makePFRewardHook({
       sugg = (vx: vx + dv_pf_x * s, vy: vy + dv_pf_y * s);
     }
 
-    // --- Border avoidance: steer inward when near side walls (velocity-only) ---
+// --- Border avoidance: speed-aware, earlier, and stronger lateral priority ---
+    final wallTau = 1.2;
+    final wallMarginFrac = 0.22;
+    final wallBlendMax = 0.80;
+    final wallVInward = 0.90;
+    final wallVelPenalty = 3.0;
     final Wworld = env.cfg.worldW.toDouble();
-    final margin = 0.12 * Wworld;               // start repulsion within 12% from edges
-    final distL = (x).clamp(0.0, margin);
-    final distR = (Wworld - x).clamp(0.0, margin);
-    final nearL = 1.0 - (distL / margin);
-    final nearR = 1.0 - (distR / margin);
-    final borderProx = math.max(nearL, nearR);  // 0..1
+    final distL = x;                 // px from left wall
+    final distR = (Wworld - x);      // px from right wall
+    final baseBand = wallMarginFrac * Wworld;
 
-    // inward unit vector (pointing to center)
+// “Outward” vx wrt each wall (+ means heading toward that wall)
+    final vxTowardL = (-vx).clamp(0.0, double.infinity);
+    final vxTowardR = ( vx).clamp(0.0, double.infinity);
+
+// Dynamic warning widths grow with outward speed (sec lookahead = wallTau)
+    final warnL = baseBand + wallTau * vxTowardL;
+    final warnR = baseBand + wallTau * vxTowardR;
+
+// Proximity 0..1 to each wall (1 = danger, 0 = safe)
+    double proxL = 1.0 - (distL / (warnL + 1e-6)).clamp(0.0, 1.0);
+    double proxR = 1.0 - (distR / (warnR + 1e-6)).clamp(0.0, 1.0);
+
+// Focus on the more dangerous side
+    final borderProx = math.max(proxL, proxR);
     double inwardX = 0.0;
-    if (nearL > 0.0 && nearL >= nearR) inwardX =  1.0;
-    if (nearR > 0.0 && nearR >  nearL) inwardX = -1.0;
+    if (proxL >= proxR && proxL > 0.0) inwardX =  1.0; // push right
+    if (proxR >  proxL && proxR > 0.0) inwardX = -1.0; // push left
 
-    // blend a modest inward velocity into PF suggestion, stronger the closer we are
-    final vInward = 40.0;              // px/s target inward speed at the wall
-    final blendIn = 0.60 * borderProx; // up to 60% override at the wall
+// Earlier & smoother blend (γ>1 sharpens near wall)
+    final gamma = 1.5;
+    final blendIn = wallBlendMax * math.pow(borderProx, gamma);
+
+// Target inward speed; scale with outward speed so we react harder if we’re barreling into the wall
+    final vInward = (wallVInward + 0.8 * (vxTowardL + vxTowardR)).clamp(40.0, 200.0);
     final suggWallVx = inwardX * vInward;
+
+// Blend inward correction into PF suggestion
     sugg = (
     vx: (1.0 - blendIn) * sugg.vx + blendIn * suggWallVx,
-    vy: sugg.vy
+    vy: sugg.vy * (1.0 - 0.35 * borderProx) // de-emphasize vertical near walls
     );
+
+// Make lateral matching more important near walls
+    final wallBoost = 1.0 + wallVelPenalty * borderProx;
 
 // --- stronger emphasis on x-component matching ---
 // use prox^2 to ramp faster near the pad
@@ -554,9 +577,6 @@ ai.ExternalRewardHook makePFRewardHook({
     final dvx = (vx - sugg.vx) * wLat;
     final dvy = (vy - sugg.vy) * wVer;
     final vErr = math.sqrt(dvx*dvx + dvy*dvy) / cfg.vmax;
-
-// wall boost (unchanged)
-    final wallBoost = 1.0 + 6.0 * borderProx;
 
 // make velocity-matching VERY important near pad
     final wVelEff = cfg.wVelDelta * (1.0 + cfg.velPenaltyBoost * prox2) * wallBoost;
