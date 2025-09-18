@@ -123,7 +123,6 @@ class GameEngine {
     final t = cfg.t;
 
     // ----- Controls -> target angular change estimate (for substep sizing) -----
-    // Approximate maximum angular rate this frame (used only for substep count).
     double estOmega = 0.0;
     {
       final rot = t.rotSpeed * 0.5;
@@ -135,12 +134,12 @@ class GameEngine {
       if (hNow < _flareBelow)     estOmega += _flareGain * (dt.clamp(0.0, 0.05));
     }
 
-    // Estimate max vertex travel this frame (rough upper bound): ship center speed +  angular envelope.
+    // Estimate max vertex travel this frame
     final s = cfg.stepScale;
     final vx = lander.vel.x * dt * s;
     final vy = lander.vel.y * dt * s;
     final centerTravel = math.sqrt(vx*vx + vy*vy);
-    const shipRadius = 24.0; // conservative bound from center to any vertex
+    const shipRadius = 24.0;
     final rotTravel  = estOmega * shipRadius * dt;
     final maxTravel  = centerTravel + rotTravel;
 
@@ -169,7 +168,7 @@ class GameEngine {
         if (pull > 0.0) angle -= angle * pull.clamp(0.0, 0.5);
       }
 
-      // ----- Auto-level & flare assists (using current altitude) -----
+      // ----- Auto-level & flare assists -----
       final gyNow = terrain.heightAt(lander.pos.x);
       final hNow  = (gyNow - lander.pos.y).toDouble();
       if (hNow < _autoLevelBelow) {
@@ -182,53 +181,52 @@ class GameEngine {
       }
 
       // ----- Acceleration & fuel burn -----
-      // NOTE: Your original code used a 0.05 scale on accel terms; kept to preserve tuning.
-      Vector2 accel = Vector2(0, t.gravity * 0.05); // NEW: gravity can be 0.0 (optional)
+      // Keep your global accel scale.
+      final double thrustA = t.thrustAccel * 0.05; // EQUALIZED THRUST POWER
+      Vector2 accel = Vector2(0, t.gravity * 0.05);
       double fuel = lander.fuel;
 
       // Main engine
-      final bool thrusting = u.thrust && fuel > 0.0;
-      final double power = thrusting ? 1.0 : 0.0;
-      if (thrusting) {
-        accel.x += math.sin(angle) * (t.thrustAccel * 0.05);
-        accel.y += -math.cos(angle) * (t.thrustAccel * 0.05);
+      final bool mainOn = u.thrust && fuel > 0.0;
+      final double power = mainOn ? 1.0 : 0.0;
+      if (mainOn) {
+        accel.x += math.sin(angle) * thrustA;
+        accel.y += -math.cos(angle) * thrustA;
         fuel = (fuel - 20.0 * dtk).clamp(0.0, t.maxFuel);
       }
 
-      // NEW: Side thrusters (RCS) — optional lateral thrust with small burn
+      // Side thrusters (equal power to main, per-thruster fuel)
       if (t.rcsEnabled && fuel > 0.0) {
         final bool l = u.sideLeft;
         final bool r = u.sideRight;
         if (l || r) {
           double ax = 0.0, ay = 0.0;
-          final a = t.rcsAccel * 0.05; // keep consistent with your 0.05 accel scale
           if (t.rcsBodyFrame) {
-            // body frame: +X is ship right, +Y is ship up
-            // sideLeft pushes +X; sideRight pushes -X
-            final axLocal = (l ? 1.0 : 0.0) * a + (r ? -1.0 : 0.0) * a;
-            final ayLocal = 0.0;
+            // body-frame: +X is ship right
+            final axLocal = (l ? 1.0 : 0.0) * thrustA + (r ? -1.0 : 0.0) * thrustA;
             final c = math.cos(angle), s2 = math.sin(angle);
-            ax =  c * axLocal - s2 * ayLocal;
-            ay =  s2 * axLocal + c * ayLocal;
+            ax =  c * axLocal;
+            ay =  s2 * axLocal;
           } else {
-            // world frame strafing along X only
-            ax = ((l ? 1.0 : 0.0) + (r ? -1.0 : 0.0)) * a;
+            // world-frame strafing
+            ax = ((l ? 1.0 : 0.0) + (r ? -1.0 : 0.0)) * thrustA;
             ay = 0.0;
           }
           accel.x += ax;
           accel.y += ay;
-          // very light fuel penalty for RCS pulses
-          fuel = (fuel - 2.5 * dtk).clamp(0.0, t.maxFuel);
+
+          // Burn per active side thruster (so both pressed = 2x burn)
+          final int activeSides = (l ? 1 : 0) + (r ? 1 : 0);
+          fuel = (fuel - (20.0 * activeSides) * dtk).clamp(0.0, t.maxFuel);
         }
       }
 
+      // "Top" thruster (pushes downward) — equal power & equal burn to main
       if (t.downThrEnabled && u.downThrust && fuel > 0.0) {
-        // Opposite of main engine:
-        // main:  (+sin, -cos) * thrustAccel
-        // down:  (-sin, +cos) * downThrAccel
-        accel.x += -math.sin(angle) * (t.downThrAccel * 0.05);
-        accel.y +=  math.cos(angle) * (t.downThrAccel * 0.05);
-        fuel = (fuel - t.downThrBurn * dtk).clamp(0.0, t.maxFuel);
+        // opposite vector to main engine
+        accel.x += -math.sin(angle) * thrustA;
+        accel.y +=  math.cos(angle) * thrustA;
+        fuel = (fuel - 20.0 * dtk).clamp(0.0, t.maxFuel);
       }
 
       // ----- Integrate (semi-implicit Euler) -----
@@ -291,7 +289,7 @@ class GameEngine {
         break;
       }
 
-      // ----- Effort + shaping cost for this substep (no collision authority here) -----
+      // ----- Effort + shaping cost for this substep -----
       double stepCost = 0.0;
       if (power > 0) stepCost += cfg.effortCost * power * dtk;
 
@@ -306,14 +304,13 @@ class GameEngine {
         u: u,
         intentIdx: u.intentIdx,
       );
-      stepCost += score.cost; // cost only
+      stepCost += score.cost;
 
       // Commit microstep physics
       lander = LanderState(pos: pos, vel: vel, angle: angle, fuel: fuel);
       _lastAngle = angle;
 
       stepCostAcc += stepCost;
-      // Continue to next microstep
     }
 
     // Sensors update (once per frame)
@@ -324,7 +321,6 @@ class GameEngine {
       angle: lander.angle,
     );
 
-    // If we ended early due to contact, return terminal StepInfo now
     if (terminal) {
       return StepInfo(
         costDelta: stepCostAcc,
@@ -334,7 +330,6 @@ class GameEngine {
       );
     }
 
-    // Otherwise still playing
     return StepInfo(
       costDelta: stepCostAcc,
       terminal: false,

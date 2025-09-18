@@ -151,10 +151,6 @@ class FeatureExtractor {
 }
 
 /// Ray-based features: lander scalars + per-ray channels.
-/// Scalars (6): [px/W, py/H, vx/200, vy/200, ang/pi, fuel/maxFuel]
-/// Per-ray:
-///   kindsOneHot=false -> [distNorm]
-///   kindsOneHot=true  -> [distNorm, isTerrain, isPad, isWall]
 class FeatureExtractorRays {
   final int rayCount;
   final bool kindsOneHot;
@@ -214,7 +210,6 @@ class FeatureExtractorRays {
 /*                                CONTROLLERS                                  */
 /* -------------------------------------------------------------------------- */
 
-/// Heuristic teacher → intent labeler used for alignment + planning horizon.
 int predictiveIntentLabelAdaptive(
     eng.GameEngine env, {
       double baseTauSec = 1.0,
@@ -256,21 +251,17 @@ int predictiveIntentLabelAdaptive(
     return intentToIndex(Intent.brakeUp);
   }
 
-  // --- brake left/right inside pad band if lateral speed is large ---
   if (dx.abs() <= padEnter) {
     if (vx > 25.0)  return intentToIndex(Intent.brakeRight);
     if (vx < -25.0) return intentToIndex(Intent.brakeLeft);
-    // otherwise descendSlow in the band
     return intentToIndex(Intent.descendSlow);
   }
 
-  // Outside soft band? translate inward toward pad
   if (dxF.abs() > padExit) {
     return dxF > 0 ? intentToIndex(Intent.goRight)
         : intentToIndex(Intent.goLeft);
   }
 
-  // About to drift out or moving outward at height? translate inward
   final willExitSoon = (dxF.abs() > padEnter) && (dx.abs() <= padEnter);
   final vxIsOutward  = (dx.sign == vx.sign) && vx.abs() > 20.0;
   if ((willExitSoon || vxIsOutward) && h > 90) {
@@ -278,14 +269,11 @@ int predictiveIntentLabelAdaptive(
         : intentToIndex(Intent.goRight);
   }
 
-  // Stable over pad: descend slowly
   return intentToIndex(Intent.descendSlow);
 }
 
-// RCS gating for teacher — prefer strafing when nearly level & safe
 bool _canStrafe(eng.GameEngine env, {double maxTilt = 0.10, double minH = 110.0, double maxVy = 35.0}) {
   final t = env.cfg.t;
-  // If Tunables doesn't have RCS fields (older build), treat as off.
   final hasRcs = (t as dynamic);
   final enabled = (hasRcs as dynamic).rcsEnabled ?? false;
   if (!enabled) return false;
@@ -295,7 +283,7 @@ bool _canStrafe(eng.GameEngine env, {double maxTilt = 0.10, double minH = 110.0,
   final h  = (gy - L.pos.y).toDouble();
   if (h <= minH) return false;
   if (L.vel.y.abs() >= maxVy) return false;
-  if (L.angle.abs() > maxTilt) return false;    // keep RCS for level flight
+  if (L.angle.abs() > maxTilt) return false;
   return true;
 }
 
@@ -308,12 +296,10 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
 
-  // Defaults (no RCS, no down-thrust)
   bool rcsLeft = false, rcsRight = false, down = false;
 
   switch (intent) {
     case Intent.brakeUp: {
-      // STRONGER downward-speed cap than descendSlow, never aims upward.
       final vCap = (0.07 * h + 6.0).clamp(6.0, 16.0);
       final needUp = vy > vCap;
       return et.ControlInput(
@@ -322,20 +308,14 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: false,
       );
     }
-
     case Intent.descendSlow: {
-      // Target gentle descent; if gravity is tiny and we aren't descending, use DOWN thruster.
       final vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);
       final g = env.cfg.t.gravity;
       final lowG = g.abs() < 1e-6;
-
-      // only use down thruster if tunable present & enabled
       final t = (env.cfg.t as dynamic);
       final downEnabled = (t.downThrEnabled ?? false) == true;
-
       final wantDown = lowG && downEnabled && (vy < 0.7 * vCap);
-      final needUp   = vy > vCap || (!lowG && h < 110.0); // old logic for normal gravity
-
+      final needUp   = vy > vCap || (!lowG && h < 110.0);
       down = wantDown;
       return et.ControlInput(
         thrust: needUp, left: false, right: false,
@@ -343,12 +323,10 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: down,
       );
     }
-
     case Intent.brakeLeft: {
-      // moving LEFT (vx<0): want +ax to reduce |vx|
       final wantTiltRight   = (vx < -4.0);
       final allowTranslate  = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsLeft = true; // push right
+      if (_canStrafe(env)) rcsLeft = true;
       return et.ControlInput(
         thrust: allowTranslate && !rcsLeft && wantTiltRight,
         left: false, right: (!rcsLeft && wantTiltRight),
@@ -356,12 +334,10 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: false,
       );
     }
-
     case Intent.brakeRight: {
-      // moving RIGHT (vx>0): want −ax
       final wantTiltLeft    = (vx >  4.0);
       final allowTranslate  = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsRight = true; // push left
+      if (_canStrafe(env)) rcsRight = true;
       return et.ControlInput(
         thrust: allowTranslate && !rcsRight && wantTiltLeft,
         left: (!rcsRight && wantTiltLeft), right: false,
@@ -369,10 +345,9 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: false,
       );
     }
-
     case Intent.goLeft: {
       final translate = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsRight = true; // push left
+      if (_canStrafe(env)) rcsRight = true;
       return et.ControlInput(
         thrust: translate && !rcsRight,
         left: !rcsRight, right: false,
@@ -380,10 +355,9 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: false,
       );
     }
-
     case Intent.goRight: {
       final translate = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsLeft = true; // push right
+      if (_canStrafe(env)) rcsLeft = true;
       return et.ControlInput(
         thrust: translate && !rcsLeft,
         left: false, right: !rcsLeft,
@@ -391,7 +365,6 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
         downThrust: false,
       );
     }
-
     case Intent.hover:
     default: {
       final vHover = (0.06 * h + 6.0).clamp(6.0, 18.0);
@@ -514,7 +487,6 @@ class PolicyNetwork {
     List<bool>? actionThrustTargets,
     double actionAlignWeight = 0.0,
   }) {
-// --- sanity checks ---
     final int H = trunk.layers.isEmpty ? inputSize : trunk.layers.last.b.length;
     assert(heads.intent.b.length > 0 && heads.intent.W.isNotEmpty,
     'intent head not initialized');
@@ -616,7 +588,7 @@ class PolicyNetwork {
       }
     }
 
-    // ----- Action supervision (turn CE + thrust BCE) -----
+    // ----- Action supervision (optional; unchanged) -----
     final hasAction = actionAlignWeight > 0.0 &&
         actionCaches != null &&
         actionTurnTargets != null &&
@@ -674,7 +646,7 @@ class PolicyNetwork {
     }
 
     // ----- Apply trunk update (shared grads) -----
-    final trunkScale = lr; // same step
+    final trunkScale = lr;
     for (int li = 0; li < trunk.layers.length; li++) {
       final L = trunk.layers[li];
       final gb = gb_trunk[li];
@@ -697,7 +669,7 @@ class EpisodeResult {
   final int steps;
   final double totalCost;
   final bool landed;
-  final double segMean; // mean per-frame segment score (higher is better)
+  final double segMean; // here: mean PF reward (for logging/gating)
   EpisodeResult({
     required this.steps,
     required this.totalCost,
@@ -706,7 +678,7 @@ class EpisodeResult {
   });
 }
 
-// external dense reward hook (e.g., potential-field shaping)
+// external dense reward hook (potential-field reward)
 typedef ExternalRewardHook = double Function({
 required eng.GameEngine env,
 required double dt,
@@ -731,30 +703,20 @@ class Trainer {
   final double actionAlignWeight;
   final bool normalizeFeatures;
 
-  final bool segmentAsCost;        // kept for compatibility
-
-  // --- Gating & logging (inside Trainer) ---
-  final double gateScoreMin;       // accept only if segMean >= gateScoreMin
-  final bool gateOnlyLanded;       // accept only landed episodes
-  final bool gateVerbose;          // print [TRAIN] accepted/skipped
+  // gating/logging
+  final double gateScoreMin;       // now compares mean PF reward
+  final bool gateOnlyLanded;
+  final bool gateVerbose;
 
   final RunningNorm? norm;
   int _epCounter = 0;
-
-  // Advantage baseline (EMA of per-frame scores)
-  double _scoreEma = 0.0;
-  bool _scoreEmaInit = false;
-
-  // Telemetry helpers
-  double _prevAbsDx = double.nan;
-  double _prevVxAbs = double.nan; // for rBrake
 
   // PWM thrust state
   double _pwmA = 0.0;
   int _pwmCount = 0;
   int _pwmOn = 0;
 
-  // external per-step reward hook
+  // external per-step reward hook (PF)
   final ExternalRewardHook? externalRewardHook;
 
   Trainer({
@@ -774,117 +736,13 @@ class Trainer {
     this.intentPgWeight = 0.6,
     required this.actionAlignWeight,
     required this.normalizeFeatures,
-    bool segmentAsCost = false,
 
-    // gating
     this.gateScoreMin = -double.infinity,
     this.gateOnlyLanded = false,
     this.gateVerbose = true,
 
-    // external
     this.externalRewardHook,
-  })  : segmentAsCost = segmentAsCost,
-        norm = RunningNorm(fe.inputSize, momentum: 0.995);
-
-  // --------- Segment score (dense reward; higher is better) ----------
-  double _segmentScore(eng.GameEngine env, {bool terminalBonus = false}) {
-    final L = env.lander;
-    final W = env.cfg.worldW.toDouble();
-    final padCx = env.terrain.padCenter.toDouble();
-
-    final gy = env.terrain.heightAt(L.pos.x);
-    final h  = (gy - L.pos.y).toDouble();
-    final dx = (L.pos.x - padCx).abs();
-    final vx = L.vel.x.toDouble();
-    final vy = L.vel.y.toDouble();
-    final ang = L.angle.toDouble();
-
-    // Centering
-    final dxNorm = (dx / (0.5 * W)).clamp(0.0, 1.0);
-    final rCenterGlobal = 1.0 - dxNorm;
-
-    final tight = 0.08 * W;
-    final soft  = 0.14 * W;
-    double rCenterBand;
-    if (dx <= tight) rCenterBand = 1.0;
-    else if (dx <= soft) {
-      final t = (dx - tight) / (soft - tight);
-      rCenterBand = math.max(0.0, 1.0 - t * t);
-    } else rCenterBand = 0.0;
-
-    // Progress (deadband + forward only)
-    double rProgress = 0.0;
-    const epsPx = 3.0;
-    if (_prevAbsDx.isFinite) {
-      final d = _prevAbsDx - dx;
-      if (d > epsPx) rProgress = (d.clamp(0.0, 30.0) / 30.0);
-    }
-    _prevAbsDx = dx;
-
-    // Descent shaping (asymmetric)
-    final vyTarget = (0.10 * h + 8.0).clamp(8.0, 28.0);
-    final err = vy - vyTarget;
-    final sigmaUnder = 7.0, sigmaOver = 5.0;
-    final eUnder = math.exp(-math.pow((math.min(0.0, err))/sigmaUnder, 2));
-    final eOver  = math.exp(-math.pow((math.max(0.0, err))/sigmaOver , 2));
-    final rDescent = 0.5 * eUnder + 0.5 * eOver;
-
-    // Mild |vx| shaping as we approach pad
-    double vxShaping = 0.0;
-    if (dx <= soft) {
-      final targ = (dx <= tight) ? 0.0 : math.max(0.0, 60.0 * (dx - tight) / (soft - tight));
-      vxShaping = -((vx.abs() - targ).clamp(0.0, 60.0) / 60.0);
-    }
-
-    // reward explicit deceleration of |vx| inside soft band
-    double rBrake = 0.0;
-    if (dx <= soft) {
-      if (_prevVxAbs.isFinite) {
-        final dv = (_prevVxAbs - vx.abs()).clamp(-6.0, 6.0);
-        if (dv > 0) rBrake = dv / 6.0;
-      }
-      _prevVxAbs = vx.abs();
-    } else {
-      _prevVxAbs = double.nan;
-    }
-
-    // Level near ground
-    double rLevel = 0.0;
-    if (h < 160.0) {
-      final angAbs = ang.abs().clamp(0.0, 0.35);
-      rLevel = - 2.0 * (angAbs / 0.35);
-      if (angAbs < 0.05) rLevel += 0.25;
-    }
-
-    // Soft penalties and aggregation
-    double score =
-        5.0 * rCenterGlobal +
-            4.0 * rDescent +
-            3.0 * rCenterBand +
-            2.0 * rProgress +
-            1.2 * rLevel +
-            1.0 * vxShaping +
-            0.7 * rBrake;
-
-    if (dx > soft) score -= 0.4;
-    if (h < 120.0 && vy > 38.0) score -= 2.5;
-
-    // Small fuel efficiency pressure
-    final fuelFrac = env.lander.fuel / env.cfg.t.maxFuel;
-    score += -0.10 * (1.0 - fuelFrac);
-
-    // Optional terminal shaping (called once at terminal)
-    if (terminalBonus) {
-      if (env.status == et.GameStatus.landed) {
-        score += 10.0;
-      } else {
-        final spd = (L.vel.y.abs() + L.vel.x.abs()).clamp(0.0, 120.0);
-        score -= 6.0 + 0.04 * spd;
-      }
-    }
-
-    return score;
-  }
+  }) : norm = RunningNorm(fe.inputSize, momentum: 0.995);
 
   int _sampleCategorical(List<double> probs, math.Random r, double temp) {
     if (temp <= 1e-6) {
@@ -907,13 +765,13 @@ class Trainer {
   EpisodeResult runEpisode({
     required bool train,
     required bool greedy,
-    required bool scoreIsReward,   // kept for API compat; unused (we use score as advantage)
+    required bool scoreIsReward,   // kept for API compat; unused
     double lr = 3e-4,
     double valueBeta = 0.5,
     double huberDelta = 1.0,
   }) {
     final r = math.Random(seed ^ (_epCounter++));
-    final decisionRewards = <double>[];  // per-decision reward (before discount)
+    final decisionRewards = <double>[];  // per-decision reward (PF only)
 
     final actionCaches = <ForwardCache>[];
     final actionTurnTargets = <int>[];
@@ -927,12 +785,11 @@ class Trainer {
     env.reset(seed: r.nextInt(1 << 30));
     double totalCost = 0.0;
 
+    // PF logging (use seg* names to keep CLI the same)
     double segSum = 0.0;
     int segCount = 0;
 
     _pwmA = 0.0; _pwmCount = 0; _pwmOn = 0;
-    _prevAbsDx = double.nan;
-    _prevVxAbs = double.nan;
 
     int framesLeft = 0;
     int currentIntentIdx = 0;
@@ -940,7 +797,7 @@ class Trainer {
     int steps = 0;
     bool landed = false;
 
-    // accumulate external per-step reward until next decision boundary
+    // accumulate PF reward until next decision boundary
     double pfAcc = 0.0;
 
     while (true) {
@@ -959,16 +816,12 @@ class Trainer {
         currentIntentIdx = idx;
 
         if (train) {
-          final segHere = _segmentScore(env);
-          if (!_scoreEmaInit) { _scoreEma = segHere; _scoreEmaInit = true; }
-          _scoreEma = 0.99 * _scoreEma + 0.01 * segHere;
-
-          final r_t = segHere - _scoreEma;     // dense “delta” reward
+          // PF-only: push the accumulated PF reward for the last window
           decisionCaches.add(cache);
           intentChoices.add(idx);
           alignLabels.add(yTeacher);
-          decisionRewards.add(r_t + pfAcc);    // include accumulated external reward
-          pfAcc = 0.0;                         // reset for next decision window
+          decisionRewards.add(pfAcc);
+          pfAcc = 0.0;
         }
 
         // compute discounted returns (advantages)
@@ -1000,7 +853,7 @@ class Trainer {
           for (final v in tmp) decisionReturns.add((v - mean) / std);
         }
 
-        // adaptive plan hold
+        // adaptive plan hold (unchanged)
         final padCx = env.terrain.padCenter.toDouble();
         final dxAbs = (env.lander.pos.x.toDouble() - padCx).abs();
         final vxAbs = env.lander.vel.x.toDouble().abs();
@@ -1049,8 +902,11 @@ class Trainer {
       final execSideRight = uTeacher.sideRight;
       final execDown      = uTeacher.downThrust;
 
-      final seg = _segmentScore(env);
-      segSum += seg; segCount++;
+      // ----- PF-only reward accumulation -----
+      final r_pf = externalRewardHook?.call(env: env, dt: dt, tStep: steps) ?? 0.0;
+      pfAcc += r_pf;
+      segSum += r_pf; // for logging/gating
+      segCount++;
 
       actionCaches.add(cAct);
       actionTurnTargets.add(uTeacher.left ? 0 : (uTeacher.right ? 2 : 1));
@@ -1059,11 +915,6 @@ class Trainer {
       _pwmCount++; if (execThrust) _pwmOn++;
       if ((_pwmCount % 240) == 0) {
         _pwmCount = 0; _pwmOn = 0;
-      }
-
-      // accumulate external per-step reward (e.g. PF shaping)
-      if (externalRewardHook != null) {
-        pfAcc += externalRewardHook!(env: env, dt: dt, tStep: steps);
       }
 
       final info = env.step(dt, et.ControlInput(
@@ -1081,27 +932,14 @@ class Trainer {
 
       if (info.terminal) {
         landed = env.status == et.GameStatus.landed;
-        // one-time terminal shaping
-        segSum += _segmentScore(env, terminalBonus: true);
-        segCount++;
 
-        // push any remaining external reward into the final decision
+        // push any remaining PF reward into the final decision window
         if (train && decisionRewards.isNotEmpty && pfAcc.abs() > 0) {
           decisionRewards[decisionRewards.length - 1] += pfAcc;
           pfAcc = 0.0;
         }
 
-        // feed terminal credit into the PG
-        if (train && decisionRewards.isNotEmpty) {
-          double terminalReward = 0.0;
-          if (landed) {
-            terminalReward = 10.0;
-          } else {
-            final spd = (env.lander.vel.y.abs() + env.lander.vel.x.abs()).clamp(0.0, 120.0);
-            terminalReward = -(6.0 + 0.04 * spd);
-          }
-          decisionRewards[decisionRewards.length - 1] += terminalReward;
-        }
+        // IMPORTANT: no terminal bonus/penalty anymore (PF-only)
         break;
       }
       if (steps > 5000) break;
@@ -1109,17 +947,17 @@ class Trainer {
 
     final segMean = (segCount > 0) ? (segSum / segCount) : 0.0;
 
-    // ---- GATED UPDATE + LOGGING (inside Trainer) ----
+    // ---- GATED UPDATE + LOGGING (PF mean) ----
     bool accept = true;
     if (gateOnlyLanded && !landed) accept = false;
-    if (segMean < gateScoreMin) accept = false;   // score is "higher is better"
+    if (segMean < gateScoreMin) accept = false;
 
     if (train) {
       if (accept && (decisionCaches.isNotEmpty || actionCaches.isNotEmpty)) {
         policy.updateFromEpisode(
           decisionCaches: decisionCaches,
           intentChoices: intentChoices,
-          decisionReturns: decisionReturns,   // advantages
+          decisionReturns: decisionReturns,   // advantages from PF-only rewards
           alignLabels: alignLabels,
           alignWeight: intentAlignWeight,
           intentPgWeight: intentPgWeight,
@@ -1134,12 +972,12 @@ class Trainer {
           actionAlignWeight: actionAlignWeight,
         );
         if (gateVerbose) {
-          print('[TRAIN] accepted | steps=$steps | segMean=${segMean.toStringAsFixed(2)} | landed=${landed ? "Y" : "N"} '
+          print('[TRAIN] accepted | steps=$steps | pfMean=${segMean.toStringAsFixed(3)} | landed=${landed ? "Y" : "N"} '
               '| caches: dec=${decisionCaches.length}, act=${actionCaches.length}');
         }
       } else {
         if (gateVerbose) {
-          print('[TRAIN] skipped  | steps=$steps | segMean=${segMean.toStringAsFixed(2)} | landed=${landed ? "Y" : "N"}');
+          print('[TRAIN] skipped  | steps=$steps | pfMean=${segMean.toStringAsFixed(3)} | landed=${landed ? "Y" : "N"}');
         }
       }
     }

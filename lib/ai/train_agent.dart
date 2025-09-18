@@ -106,7 +106,7 @@ Map<String, dynamic> _policyToJson({
     },
     'env_hint': {'worldW': env.cfg.worldW, 'worldH': env.cfg.worldH},
 
-    // NEW: persist physics knobs so runtime can mirror them
+    // Persist physics knobs so runtime can mirror them
     'physics': {
       'gravity': t.gravity,
       'thrustAccel': t.thrustAccel,
@@ -176,7 +176,7 @@ et.EngineConfig makeConfig({
   double? maxFuel,
   bool crashOnTilt = false,
 
-  // NEW physics flags/values
+  // physics flags/values
   double gravity = 0.18,
   double thrustAccel = 0.42,
   double rotSpeed = 1.6,
@@ -380,23 +380,21 @@ void _warmFeatureNorm({
   print('Feature norm warmed with $accepted synthetic samples.');
 }
 
-/* ----------------------------- PF shaping helpers ------------------------------ */
+/* ----------------------------- PF velocity-only reward ------------------------- */
 
 class PFShapingCfg {
-  final double wDeltaPhi;   // reward per unit potential drop
-  final double wAlign;      // reward per unit cos(v, flow)
+  final double wAlign;      // reward per unit cos(v, flow) in [-1,1]
   final double wVelDelta;   // penalty per unit ||v - v_pf|| / vmax
 
-  // distance-shaped target-speed parameters
-  final double vMinClose;   // target speed near sink
-  final double vMaxFar;     // target speed far
+  // distance-shaped target-speed parameters for suggested v_pf
+  final double vMinClose;   // target |v| near sink
+  final double vMaxFar;     // target |v| far from sink
   final double alpha;       // taper sharpness
-
   final double vmax;        // normalization for velocity error
+
   const PFShapingCfg({
-    this.wDeltaPhi = 4.0,
-    this.wAlign = 1.5,
-    this.wVelDelta = 0.5,
+    this.wAlign = 1.0,
+    this.wVelDelta = 0.6,
     this.vMinClose = 8.0,
     this.vMaxFar = 90.0,
     this.alpha = 1.2,
@@ -405,34 +403,32 @@ class PFShapingCfg {
 }
 
 /// Build a per-step reward hook for current episode/terrain.
-/// Uses shaped suggested velocity (fast far, slow near).
+/// Reward = wAlign * cos(v, flow) - wVelDelta * ||v - v_pf|| / vmax
 ai.ExternalRewardHook makePFRewardHook({
   required eng.GameEngine env,
   PFShapingCfg cfg = const PFShapingCfg(),
 }) {
   final pf = buildPotentialField(env, nx: 160, ny: 120, iters: 1200, omega: 1.7, tol: 1e-4);
-  double prevPhi = pf.samplePhi(env.lander.pos.x, env.lander.pos.y);
 
   return ({required eng.GameEngine env, required double dt, required int tStep}) {
     final x = env.lander.pos.x;
     final y = env.lander.pos.y;
 
-    // 1) Δφ: positive when moving downhill (toward pad)
-    final phi = pf.samplePhi(x, y);
-    final dPhi = (prevPhi - phi);
-    prevPhi = phi;
-
-    // 2) Alignment between actual velocity and −∇φ (unit flow)
+    // Actual velocity
     final vx = env.lander.vel.x;
     final vy = env.lander.vel.y;
-    final flow = pf.sampleFlow(x, y); // unit (nx,ny)
+
+    // Unit flow direction from PF (−∇φ normalized)
+    final flow = pf.sampleFlow(x, y); // (nx, ny) already unit
+
+    // Alignment term
     final vmag = math.sqrt(vx * vx + vy * vy);
     double align = 0.0;
     if (vmag > 1e-6) {
-      align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny; // [-1,1]
+      align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny; // [-1, 1]
     }
 
-    // 3) Velocity delta to distance-shaped PF prediction vector
+    // Suggested velocity magnitude based on distance taper
     final sugg = pf.suggestVelocity(
       x, y,
       vMinClose: cfg.vMinClose,
@@ -440,11 +436,14 @@ ai.ExternalRewardHook makePFRewardHook({
       alpha: cfg.alpha,
       clampSpeed: 9999.0,
     );
+
+    // Velocity error term (normalize by vmax)
     final dvx = vx - sugg.vx;
     final dvy = vy - sugg.vy;
     final vErr = math.sqrt(dvx * dvx + dvy * dvy) / cfg.vmax;
 
-    final r = cfg.wDeltaPhi * dPhi + cfg.wAlign * align - cfg.wVelDelta * vErr;
+    // Final reward
+    final r = cfg.wAlign * align - cfg.wVelDelta * vErr;
     return r;
   };
 }
@@ -488,7 +487,7 @@ void main(List<String> argv) {
   final maxFuel = args.getDouble('max_fuel', def: 1000.0);
   final crashOnTilt = args.getFlag('crash_on_tilt', def: false);
 
-  // NEW physics flags for CLI
+  // physics flags for CLI
   final gravity = args.getDouble('gravity', def: 0.18);
   final thrustAccel = args.getDouble('thrust_accel', def: 0.42);
   final rotSpeed = args.getDouble('rot_speed', def: 1.6);
@@ -501,10 +500,18 @@ void main(List<String> argv) {
   final downThrAccel = args.getDouble('down_thr_accel', def: 0.30);
   final downThrBurn = args.getDouble('down_thr_burn', def: 10.0);
 
+  // PF velocity-only reward CLI knobs
+  final pfAlign = args.getDouble('pf_align', def: 1.0);
+  final pfVelDelta = args.getDouble('pf_vel_delta', def: 0.6);
+  final pfVminClose = args.getDouble('pf_vmin_close', def: 8.0);
+  final pfVmaxFar = args.getDouble('pf_vmax_far', def: 90.0);
+  final pfAlpha = args.getDouble('pf_alpha', def: 1.2);
+  final pfVmax = args.getDouble('pf_vmax', def: 140.0);
+
   final determinism = args.getFlag('determinism_probe', def: true);
   final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
 
-  // Trainer-internal gating (score is “higher is better”)
+  // Trainer-internal gating (now gating uses mean PF reward; higher is better)
   final gateScoreMin = args.getDouble('gate_min', def: -1e9);
   final gateOnlyLanded = args.getFlag('gate_landed', def: false);
   final gateVerbose = args.getFlag('gate_verbose', def: true);
@@ -552,8 +559,16 @@ void main(List<String> argv) {
   final policy = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
   print('Loaded init policy. hidden=${policy.hidden} | FE(kind=rays, in=$inDim, rays=${env.rayCfg.rayCount}, oneHot=$kindsOneHot)');
 
-  // ===== PF shaping hook (mutable; rebuilt per episode) =====
-  ai.ExternalRewardHook? pfHook = makePFRewardHook(env: env);
+  // ===== PF velocity-only reward hook (rebuilt per episode) =====
+  PFShapingCfg pfCfg = PFShapingCfg(
+    wAlign: pfAlign,
+    wVelDelta: pfVelDelta,
+    vMinClose: pfVminClose,
+    vMaxFar: pfVmaxFar,
+    alpha: pfAlpha,
+    vmax: pfVmax,
+  );
+  ai.ExternalRewardHook? pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
   // ----- Trainer -----
   final trainer = Trainer(
@@ -578,7 +593,7 @@ void main(List<String> argv) {
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
 
-    // add dense PF reward per step
+    // add dense PF reward per step (velocity-only)
     externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
       return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
     }),
@@ -608,7 +623,8 @@ void main(List<String> argv) {
       {
     final ev = evaluate(env: env, trainer: trainer, episodes: 20, seed: seed ^ 0x999);
     print(
-        'Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}');
+        'Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}'
+    );
   }
 
   // ===== MAIN TRAIN LOOP =====
@@ -624,7 +640,7 @@ void main(List<String> argv) {
       env.reset(seed: rnd.nextInt(1 << 30));
 
       // Rebuild PF-based reward hook for this terrain/episode
-      pfHook = makePFRewardHook(env: env);
+      pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
       final res = trainer.runEpisode(
         train: true, // Trainer handles gating internally & prints [TRAIN] lines
@@ -647,7 +663,8 @@ void main(List<String> argv) {
     if ((it + 1) % 5 == 0) {
       final ev = evaluate(env: env, trainer: trainer, episodes: 40, seed: seed ^ (0x1111 * (it + 1)));
       print(
-          'Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}');
+          'Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}'
+      );
 
       if (ev.meanCost < bestMeanCost) {
         bestMeanCost = ev.meanCost;
@@ -686,34 +703,27 @@ void main(List<String> argv) {
 
 /* ----------------------------------- usage ------------------------------------
 
-Examples:
+Velocity-vector–only shaping examples:
 
-1) Baseline PF shaping + internal gating + default physics:
+1) Defaults:
 
   dart run lib/ai/train_agent.dart \
     --hidden=96,96,64 \
     --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 \
     --blend_policy=1.0 --intent_align=0.25 --intent_pg=0.6 \
-    --gate_min=4.0 --gate_landed \
-    --determinism_probe
+    --gate_min=0.0 --gate_landed
 
-2) Zero gravity + RCS side thrusters + downward thruster (for deorbit/landing):
-
-  dart run lib/ai/train_agent.dart \
-    --gravity=0 \
-    --rcs_enabled --rcs_accel=0.16 \
-    --down_thr_enabled --down_thr_accel=0.30 --down_thr_burn=10 \
-    --train_iters=400 --batch=1 --lr=3e-4 \
-    --plan_hold=1 --intent_pg=0.6 --intent_align=0.25
-
-3) Make main engine gentler and allow more rotation:
+2) Stronger alignment, weaker velocity error:
 
   dart run lib/ai/train_agent.dart \
-    --thrust_accel=0.32 --rot_speed=2.2
+    --pf_align=1.5 --pf_vel_delta=0.4
+
+3) Faster far, gentler near the pad:
+
+  dart run lib/ai/train_agent.dart \
+    --pf_vmin_close=6 --pf_vmax_far=110 --pf_alpha=1.4
 
 Notes:
-- Physics flags get embedded in the exported JSON under "physics" so runtime
-  can configure the engine consistently for live play.
-- PF shaping uses a distance-shaped target |v_pf|: fast when far from the pad,
-  gentle near the sink line, with optional vertical slowdown near padY.
--------------------------------------------------------------------------------- */
+- The trainer already uses only this PF reward via `externalRewardHook`.
+- `segMean` in logs now reports mean PF reward (for gating).
+------------------------------------------------------------------------------ */
