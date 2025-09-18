@@ -1016,16 +1016,22 @@ class Trainer {
           actionThrustTargets: actionThrustTargets,
           actionAlignWeight: actionAlignWeight,
         );
+        /*
         if (gateVerbose) {
           final tag = landed ? 'Y' : (nearPadCrashOK ? 'padCrash' : 'N');
           print('[TRAIN] accepted | steps=$steps | pfMean=${segMean.toStringAsFixed(3)} | landed=$tag '
               '| caches: dec=${decisionCaches.length}, act=${actionCaches.length}');
         }
+
+         */
       } else {
+        /*
         if (gateVerbose) {
           final tag = landed ? 'Y' : (nearPadCrashOK ? 'padCrash' : 'N');
           print('[TRAIN] skipped  | steps=$steps | pfMean=${segMean.toStringAsFixed(3)} | landed=$tag');
         }
+
+         */
       }
     }
 
