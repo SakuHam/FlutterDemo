@@ -10,6 +10,7 @@ import '../engine/raycast.dart'; // RayConfig
 
 import 'agent.dart' as ai; // FeatureExtractorRays, PolicyNetwork, Trainer, RunningNorm, kIntentNames, predictiveIntentLabelAdaptive
 import 'agent.dart';       // bring symbols into scope (PolicyNetwork etc.)
+import 'nn_helper.dart' as nn;
 import 'potential_field.dart'; // buildPotentialField, PotentialField
 
 /* ------------------------------- tiny arg parser ------------------------------- */
@@ -173,6 +174,96 @@ void _savePolicy({
   print('Saved policy → $path');
 }
 
+/* ------------------------------ policy LOADER (v2) ----------------------------- */
+
+void _loadPolicyIntoNetwork({
+  required String path,
+  required PolicyNetwork target,
+  required eng.GameEngine env,
+  RunningNorm? norm,
+}) {
+  final raw = File(path).readAsStringSync();
+  final j = json.decode(raw) as Map<String, dynamic>;
+
+  // Expect v2 format
+  final arch = (j['arch'] as Map?)?.cast<String, dynamic>();
+  final trunkJ = (j['trunk'] as List?)?.cast<dynamic>();
+  final headsJ = (j['heads'] as Map?)?.cast<String, dynamic>();
+  if (arch == null || trunkJ == null || headsJ == null) {
+    throw StateError('Loaded policy is not in v2 format (missing arch/trunk/heads).');
+  }
+
+  List<List<double>> _as2d(dynamic v) =>
+      (v as List).map<List<double>>((r) => (r as List).map<double>((x) => (x as num).toDouble()).toList()).toList();
+  List<double> _as1d(dynamic v) => (v as List).map<double>((x) => (x as num).toDouble()).toList();
+
+  final inDim = (arch['input'] as num).toInt();
+  if (inDim != target.inputSize) {
+    throw StateError('Loaded policy input dim $inDim != runtime input ${target.inputSize}');
+  }
+
+  // Check hidden sizes match
+  final hiddenLoad = ((arch['hidden'] as List?) ?? const []).map((e) => (e as num).toInt()).toList();
+  if (hiddenLoad.length != target.hidden.length ||
+      !List.generate(hiddenLoad.length, (i) => hiddenLoad[i] == target.hidden[i]).every((x) => x)) {
+    throw StateError('Loaded hidden sizes $hiddenLoad != runtime ${target.hidden}');
+  }
+
+  // Fill trunk
+  if (trunkJ.length != target.trunk.layers.length) {
+    throw StateError('Loaded trunk layers=${trunkJ.length} != runtime ${target.trunk.layers.length}');
+  }
+  for (int li = 0; li < trunkJ.length; li++) {
+    final obj = (trunkJ[li] as Map).cast<String, dynamic>();
+    final W = _as2d(obj['W']);
+    final B = _as1d(obj['b']);
+    final L = target.trunk.layers[li];
+    if (W.length != L.W.length || W[0].length != L.W[0].length || B.length != L.b.length) {
+      throw StateError('Trunk layer $li shape mismatch.');
+    }
+    for (int i = 0; i < L.W.length; i++) {
+      for (int j2 = 0; j2 < L.W[0].length; j2++) L.W[i][j2] = W[i][j2];
+    }
+    for (int i = 0; i < L.b.length; i++) L.b[i] = B[i];
+  }
+
+  // Heads
+  void _loadHead(String name, var head) {
+    final hj = (headsJ[name] as Map).cast<String, dynamic>();
+    final W = _as2d(hj['W']);
+    final B = _as1d(hj['b']);
+    if (W.length != head.W.length || W[0].length != head.W[0].length || B.length != head.b.length) {
+      throw StateError('Head "$name" shape mismatch.');
+    }
+    for (int i = 0; i < head.W.length; i++) {
+      for (int j2 = 0; j2 < head.W[0].length; j2++) head.W[i][j2] = W[i][j2];
+    }
+    for (int i = 0; i < head.b.length; i++) head.b[i] = B[i];
+  }
+
+  _loadHead('intent', target.heads.intent);
+  _loadHead('turn', target.heads.turn);
+  _loadHead('thr', target.heads.thr);
+  _loadHead('val', target.heads.val);
+
+  // Norm (optional)
+  final nm = (j['norm'] as Map?)?.cast<String, dynamic>();
+  if (nm != null && norm != null) {
+    final dim = (nm['dim'] as num?)?.toInt() ?? -1;
+    if (dim == norm.dim) {
+      final mean = (nm['mean'] as List).map((e) => (e as num).toDouble()).toList();
+      final var_ = (nm['var'] as List).map((e) => (e as num).toDouble()).toList();
+      if (mean.length == norm.dim && var_.length == norm.dim) {
+        norm.mean = mean;
+        norm.var_ = var_;
+        norm.inited = true;
+      }
+    }
+  }
+
+  print('Loaded policy from $path (hidden=$hiddenLoad, inDim=$inDim).');
+}
+
 /* --------------------------------- env config --------------------------------- */
 
 et.EngineConfig makeConfig({
@@ -268,8 +359,6 @@ class _EvalChunkResult {
   _EvalChunkResult(this.costs, this.landed, this.crashed, this.stepsSum, this.absDxSum);
 }
 
-// Wilson 95% CI for a proportion (land%)
-// (returns percent bounds)
 ({double lo, double hi}) _wilson95(int success, int n) {
   if (n <= 0) return (lo: 0, hi: 0);
   const z = 1.96;
@@ -323,7 +412,6 @@ _EvalChunkResult _evalChunk({
     externalRewardHook: null,
   );
 
-  // One-time debug header per worker
   if (evalDebug) {
     final t = env.cfg.t;
     print('[EVAL DBG] worker seed=$seed '
@@ -349,7 +437,7 @@ _EvalChunkResult _evalChunk({
       currentTerrainSeed = rnd.nextInt(1 << 30);
     }
     env.reset(seed: currentTerrainSeed);
-    final res = trainer.runEpisode(train: false, greedy: true, scoreIsReward: false);
+    final res = trainer.runEpisode(train: false, greedy: false, scoreIsReward: false);
     terrAttempts = (terrAttempts + 1) % attemptsPerTerrain;
 
     costs.add(res.totalCost);
@@ -451,7 +539,6 @@ Future<EvalStats> evaluateParallel({
           evalDebugFailN: evalDebugFailN,
         );
       } catch (e, st) {
-        // Bubble up as an empty chunk but print a clear message
         stderr.writeln('[EVAL WORKER ERROR] $e\n$st');
         return _EvalChunkResult(const [], 0, 0, 0, 0.0);
       }
@@ -533,7 +620,7 @@ EvalStats evaluateSequential({
     env.reset(seed: currentTerrainSeed);
     final res = trainer.runEpisode(
       train: false,
-      greedy: true,
+      greedy: false,
       scoreIsReward: false,
     );
 
@@ -950,62 +1037,93 @@ ai.ExternalRewardHook makePFRewardHook({
   };
 }
 
-/* --------------------------- CURRICULUM: speed kill --------------------------- */
+/* ----------------------- CURRICULUM STAGE 1 (speed-min) ------------------------ */
 
-/// Simple dense reward to **minimize speed**, with mild angle & wall penalties.
-/// Keeps sign positive for “better” (less speed) → we’ll use it directly.
-/// We’ll frame it as `r = v0 - v_now` (encourage speed drop), plus small upright bonus.
-/// If v0 is unknown on the first step, we fall back to `-speed`.
-ai.ExternalRewardHook makeSpeedKillReward({
-  required eng.GameEngine env,
-  double vmax = 180.0,      // normalization
-  double uprightK = 0.04,   // mild bonus to being upright (angle→0)
-  double wallK = 0.02,      // mild penalty near walls
-}) {
-  double? v0;
-  return ({required eng.GameEngine env, required double dt, required int tStep}) {
-    final vx = env.lander.vel.x.toDouble();
-    final vy = env.lander.vel.y.toDouble();
-    final v = math.sqrt(vx*vx + vy*vy);
-    v0 ??= v;
+class _CurriculumCfg {
+  final int iters;
+  final int batch;
+  final double lr;
+  final double intentAlign;
+  final double intentPg;
+  final double actionAlign;
+  final double gamma;
+  final int planHold;
+  final double tempIntent;
 
-    // Primary term: reduce speed from the initial speed
-    final base = ((v0! - v) / vmax).clamp(-2.0, 2.0);
-
-    // Upright encouragement (small)
-    final upright = 1.0 - (env.lander.angle.abs() / (math.pi)).clamp(0.0, 1.0);
-
-    // Wall proximity (penalize being close to hard walls)
-    final W = env.cfg.worldW.toDouble();
-    final x = env.lander.pos.x.toDouble();
-    final wallProx = 1.0 - ((x / W).clamp(0.0, 1.0));
-    final edgeCost = (x < W * 0.5)
-        ? (1.0 - (x / (0.22 * W)).clamp(0.0, 1.0))
-        : (1.0 - ((W - x) / (0.22 * W)).clamp(0.0, 1.0));
-
-    return base + uprightK * upright - wallK * edgeCost;
-  };
+  const _CurriculumCfg({
+    required this.iters,
+    required this.batch,
+    required this.lr,
+    required this.intentAlign,
+    required this.intentPg,
+    required this.actionAlign,
+    required this.gamma,
+    required this.planHold,
+    required this.tempIntent,
+  });
 }
 
-/// Applies a “fixed vector” spawn: height/x near pad, angle 0, chosen (vx, vy).
-void _applyFixedVectorSpawn({
-  required eng.GameEngine env,
-  required math.Random rnd,
-  required double vx,
-  required double vy,
-  double hMin = 80,
-  double hMax = 320,
-  double xFrac = 0.20, // fraction of worldW around pad center
-}) {
-  final T = env.terrain;
-  final padCx = T.padCenter.toDouble();
-  final W = env.cfg.worldW.toDouble();
-  final x = (padCx + (rnd.nextDouble() * 2 - 1) * (xFrac * W)).clamp(10.0, W - 10.0);
-  final h = (hMin + rnd.nextDouble() * (hMax - hMin)).clamp(20.0, env.cfg.worldH - 40.0);
+/// Simple dense reward that penalizes speed (and gently encourages speed reduction).
+double _speedMinReward({required eng.GameEngine env, required double dt, required int tStep}) {
+  final vx = env.lander.vel.x.toDouble();
+  final vy = env.lander.vel.y.toDouble();
+  final v = math.sqrt(vx * vx + vy * vy);
+  // small shaping: reward drop in speed compared to a 1s EMA (tracked externally if needed)
+  return -0.01 * v;
+}
 
-  final gy = T.heightAt(x);
+/// Randomize a "hard-set flight vector" start.
+void _initCurriculumStart(eng.GameEngine env, math.Random r) {
+  final padCx = env.terrain.padCenter.toDouble();
+  final padHalfW = (((env.terrain.padX2 - env.terrain.padX1).abs()) * 0.5).clamp(12.0, env.cfg.worldW.toDouble());
+
+  // Sample families of challenging vectors
+  final families = <int>[0, 1, 2, 3, 4, 5];
+  final f = families[r.nextInt(families.length)];
+
+  double x = padCx, h = 140, vx = 0, vy = 0;
+  switch (f) {
+    case 0: // fast downward
+      x = padCx + (r.nextDouble() * 0.10 - 0.05) * padHalfW;
+      h = 200 + 200 * r.nextDouble();
+      vx = (r.nextDouble() * 30.0) - 15.0;
+      vy = 110.0 + 50.0 * r.nextDouble();
+      break;
+    case 1: // strong lateral + modest down
+      x = padCx + (r.nextDouble() < 0.5 ? -1 : 1) * (0.18 + 0.18 * r.nextDouble()) * env.cfg.worldW;
+      h = 140 + 120 * r.nextDouble();
+      vx = (r.nextDouble() < 0.5 ? -1 : 1) * (70.0 + 40.0 * r.nextDouble());
+      vy = 25.0 + 20.0 * r.nextDouble();
+      break;
+    case 2: // rising with lateral drift
+      x = padCx + (r.nextDouble() * 0.20 - 0.10) * env.cfg.worldW;
+      h = 80 + 120 * r.nextDouble();
+      vx = (r.nextDouble() * 40.0) - 20.0;
+      vy = -60.0 - 40.0 * r.nextDouble(); // going up
+      break;
+    case 3: // near ground, high lateral
+      x = padCx + (r.nextDouble() * 0.25 - 0.125) * env.cfg.worldW;
+      h = 70 + 40 * r.nextDouble();
+      vx = (r.nextDouble() < 0.5 ? -1 : 1) * (80.0 + 30.0 * r.nextDouble());
+      vy = 10.0 + 10.0 * r.nextDouble();
+      break;
+    case 4: // ceiling approach
+      x = (0.1 + 0.8 * r.nextDouble()) * env.cfg.worldW;
+      h = 0.80 * env.cfg.worldH + 0.18 * env.cfg.worldH * r.nextDouble();
+      vx = (r.nextDouble() * 30.0) - 15.0;
+      vy = -80.0 - 20.0 * r.nextDouble();
+      break;
+    case 5: // diagonal inbounds from wall
+      x = (r.nextDouble() < 0.5) ? 30.0 : (env.cfg.worldW - 30.0);
+      h = 180 + 120 * r.nextDouble();
+      vx = (x < env.cfg.worldW * 0.5) ? (80.0 + 40.0 * r.nextDouble()) : -(80.0 + 40.0 * r.nextDouble());
+      vy = 40.0 + 40.0 * r.nextDouble();
+      break;
+  }
+
+  final gy = env.terrain.heightAt(x);
   env.lander
-    ..pos.x = x
+    ..pos.x = x.clamp(10.0, env.cfg.worldW - 10.0)
     ..pos.y = (gy - h).clamp(0.0, env.cfg.worldH - 10.0)
     ..vel.x = vx
     ..vel.y = vy
@@ -1013,17 +1131,154 @@ void _applyFixedVectorSpawn({
     ..fuel = env.cfg.t.maxFuel;
 }
 
-class _CurVec {
-  final double vx, vy;
-  const _CurVec(this.vx, this.vy);
-}
+/// Minimal inner loop reproducing the essentials of Trainer.runEpisode but with:
+/// - our curriculum init (hard-set vectors)
+/// - speed-min reward
+EpisodeResult _runCurriculumEpisode({
+  required eng.GameEngine env,
+  required FeatureExtractorRays fe,
+  required PolicyNetwork policy,
+  required RunningNorm? norm,
+  required math.Random rnd,
+  required int planHold,
+  required double tempIntent,
+  required double gamma,
+  required double lr,
+  required double intentAlignWeight,
+  required double intentPgWeight,
+  required double actionAlignWeight,
+}) {
+  policy.trunk.trainMode = true;
 
-List<_CurVec> _defaultCurVectors(double scale) => <_CurVec>[
-  _CurVec(-60, 0), _CurVec(60, 0),   // left/right
-  _CurVec(0, -120), _CurVec(0, 120), // down/up
-  _CurVec(-80, 80), _CurVec(80, 80), // up-left / up-right
-  _CurVec(-90, -60), _CurVec(90, -60), // down-left / down-right
-].map((v) => _CurVec(v.vx * scale, v.vy * scale)).toList();
+  // Per-episode containers
+  final decisionRewards = <double>[];
+  final decisionCaches = <ForwardCache>[];
+  final intentChoices = <int>[];
+  final decisionReturns = <double>[];
+  final alignLabels = <int>[];
+
+  final actionCaches = <ForwardCache>[];
+  final actionTurnTargets = <int>[];
+  final actionThrustTargets = <bool>[];
+
+  // Reset env & initialize synthetic start
+  env.reset(seed: rnd.nextInt(1 << 30));
+  _initCurriculumStart(env, rnd);
+
+  int framesLeft = 0;
+  int currentIntentIdx = 0;
+  double pfAcc = 0.0; // here: speed-min reward accumulator between decisions
+
+  int steps = 0;
+  double totalCost = 0.0;
+  bool landed = false;
+
+  while (true) {
+    if (framesLeft <= 0) {
+      var x = fe.extract(env);
+      final yTeacher = predictiveIntentLabelAdaptive(env);
+      if (norm != null) {
+        norm.observe(x);
+        x = norm.normalize(x, update: false);
+      }
+      final (idxGreedy, p, cache) = policy.actIntentGreedy(x);
+      // sample with temperature (encourage exploration during curriculum)
+      int pick;
+      if (tempIntent <= 1e-6) {
+        pick = idxGreedy;
+      } else {
+        // softmax(log p / T)
+        final z = p.map((pp) => math.log(pp.clamp(1e-12, 1.0))).toList();
+        for (int i = 0; i < z.length; i++) z[i] /= tempIntent;
+        final sm = nn.Ops.softmax(z);
+        final u = rnd.nextDouble();
+        double acc = 0.0; pick = sm.length - 1;
+        for (int i = 0; i < sm.length; i++) { acc += sm[i]; if (u <= acc) { pick = i; break; } }
+      }
+      currentIntentIdx = pick;
+
+      // book-keeping for intent head
+      decisionCaches.add(cache);
+      intentChoices.add(pick);
+      alignLabels.add(yTeacher);
+      decisionRewards.add(pfAcc); // push accumulated reward so far
+      pfAcc = 0.0;
+
+      // compute decision-window advantages
+      final T = decisionRewards.length;
+      final tmp = List<double>.filled(T, 0.0);
+      double G = 0.0;
+      for (int i = T - 1; i >= 0; i--) { G = decisionRewards[i] + gamma * G; tmp[i] = G; }
+      double mean = 0.0; for (final v in tmp) mean += v; mean /= math.max(1, T);
+      double var0 = 0.0; for (final v in tmp) { final d = v - mean; var0 += d * d; }
+      var0 = (var0 / math.max(1, T)).clamp(1e-9, double.infinity);
+      final std = math.sqrt(var0);
+      decisionReturns
+        ..clear()
+        ..addAll(tmp.map((v) => (v - mean) / std));
+      framesLeft = planHold;
+    }
+
+    final intent = indexToIntent(currentIntentIdx);
+    final uTeacher = controllerForIntent(intent, env);
+
+    // Action head cache (supervise with teacher)
+    var xAct = fe.extract(env);
+    if (norm != null) xAct = norm.normalize(xAct, update: false);
+    final (thBool, lf, rt, probs, cAct) = policy.actGreedy(xAct);
+    actionCaches.add(cAct);
+    actionTurnTargets.add(uTeacher.left ? 0 : (uTeacher.right ? 2 : 1));
+    actionThrustTargets.add(uTeacher.thrust);
+
+    // Execute teacher controls (safe for curriculum)
+    final info = env.step(1 / 60.0, et.ControlInput(
+      thrust: uTeacher.thrust,
+      left: uTeacher.left,
+      right: uTeacher.right,
+      sideLeft: uTeacher.sideLeft,
+      sideRight: uTeacher.sideRight,
+      downThrust: uTeacher.downThrust,
+      intentIdx: currentIntentIdx,
+    ));
+
+    // Dense speed-min reward
+    pfAcc += _speedMinReward(env: env, dt: 1 / 60.0, tStep: steps);
+
+    totalCost += info.costDelta;
+    steps++;
+    framesLeft--;
+
+    if (info.terminal || steps > 900) {
+      landed = env.status == et.GameStatus.landed;
+      if (decisionRewards.isNotEmpty && pfAcc.abs() > 0) {
+        decisionRewards[decisionRewards.length - 1] += pfAcc;
+        pfAcc = 0.0;
+      }
+      break;
+    }
+  }
+
+  // Single update from this episode
+  policy.updateFromEpisode(
+    decisionCaches: decisionCaches,
+    intentChoices: intentChoices,
+    decisionReturns: decisionReturns,
+    alignLabels: alignLabels,
+    alignWeight: intentAlignWeight,
+    intentPgWeight: intentPgWeight,
+    lr: lr,
+    entropyBeta: 0.0,
+    valueBeta: 0.0,
+    huberDelta: 1.0,
+    intentMode: true,
+    actionCaches: actionCaches,
+    actionTurnTargets: actionTurnTargets,
+    actionThrustTargets: actionThrustTargets,
+    actionAlignWeight: actionAlignWeight,
+  );
+
+  return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: 0.0);
+}
 
 /* ------------------------------------ main ------------------------------------ */
 
@@ -1043,6 +1298,15 @@ void main(List<String> argv) async {
 
   final seed = args.getInt('seed', def: 7);
 
+  // ---- NEW: optional load ----
+  final loadPath = args.getStr('load_policy');
+
+  // ---- Curriculum knobs (Stage 1) ----
+  final curIters = args.getInt('curriculum_iters', def: 0);
+  final curBatch = args.getInt('curriculum_batch', def: 1);
+  final warmAfterCurr = args.getFlag('warm_norm_after_curriculum', def: true);
+
+  // ---- Stage 2 (PF) knobs ----
   final iters = args.getInt('train_iters', def: args.getInt('iters', def: 200));
   final batch = args.getInt('batch', def: 1);
   final lr = args.getDouble('lr', def: 3e-4);
@@ -1103,24 +1367,10 @@ void main(List<String> argv) async {
   final determinism = args.getFlag('determinism_probe', def: true);
   final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
 
-  // Trainer-internal gating (now compares mean PF reward; higher is better)
+  // Trainer-internal gating (now gating uses mean PF reward; higher is better)
   final gateScoreMin = args.getDouble('gate_min', def: -1e9);
   final gateOnlyLanded = args.getFlag('gate_landed', def: false);
   final gateVerbose = args.getFlag('gate_verbose', def: true);
-
-  // ------------------------- Curriculum CLI knobs -------------------------
-  final useCurriculum = args.getFlag('curriculum', def: false);
-  final curIters = args.getInt('cur_iters', def: 2000);
-  final curBatch = args.getInt('cur_batch', def: 1);
-  final curHmin = args.getDouble('cur_hmin', def: 80.0);
-  final curHmax = args.getDouble('cur_hmax', def: 320.0);
-  final curXFrac = args.getDouble('cur_x_frac', def: 0.20);
-  final curVScale = args.getDouble('cur_v_scale', def: 1.0);
-  final curVJitter = args.getDouble('cur_v_jitter', def: 0.15); // ±15%
-  final curVmaxNorm = args.getDouble('cur_vmax_norm', def: 180.0);
-  final curUprightK = args.getDouble('cur_upright_k', def: 0.04);
-  final curWallK = args.getDouble('cur_wall_k', def: 0.02);
-  final curriculumPath = args.getStr('curriculum_path', def: 'policy_curriculum.json')!;
 
   double bestMeanCost = double.infinity;
 
@@ -1165,122 +1415,17 @@ void main(List<String> argv) async {
   final policy = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
   print('Loaded init policy. hidden=${policy.hidden} | FE(kind=rays, in=$inDim, rays=${env.rayCfg.rayCount}, oneHot=$kindsOneHot)');
 
-  // Determinism probe (physics)
-  if (determinism) {
-    env.reset(seed: 1234);
-    final a = _probeDeterminism(env, maxSteps: 165);
-    env.reset(seed: 1234);
-    final b = _probeDeterminism(env, maxSteps: 165);
-    final ok = (a.steps == b.steps) && ((a.cost - b.cost).abs() < 1e-6);
-    print('Determinism probe: steps ${a.steps} vs ${b.steps} | cost ${a.cost.toStringAsFixed(6)} vs ${b.cost.toStringAsFixed(6)} => ${ok ? "OK" : "MISMATCH"}');
+  // ===== Optional: LOAD existing policy weights =====
+  if (loadPath != null && loadPath.trim().isNotEmpty) {
+    _loadPolicyIntoNetwork(
+      path: loadPath,
+      target: policy,
+      env: env,
+      norm: null, // we'll set trainer.norm after trainer creation below
+    );
   }
 
-  // ============================== CURRICULUM (optional) ==============================
-  if (useCurriculum) {
-    print('--- Curriculum phase: speed-kill on fixed vectors ---');
-    final rnd = math.Random(seed ^ 0xC11C);
-    final vectors = _defaultCurVectors(curVScale);
-
-    // build speed-kill reward hook (curriculum only)
-    ai.ExternalRewardHook curHook = makeSpeedKillReward(
-      env: env,
-      vmax: curVmaxNorm,
-      uprightK: curUprightK,
-      wallK: curWallK,
-    );
-
-    // Trainer for curriculum (separate instance so main trainer can keep PF hook)
-    final trainerCur = Trainer(
-      env: env,
-      fe: fe,
-      policy: policy,
-      dt: 1 / 60.0,
-      gamma: 0.99,
-      seed: seed ^ 0xC9C9,
-      twoStage: true,
-      planHold: 1,                // short horizon for simple skill
-      tempIntent: tempIntent,
-      intentEntropyBeta: intentEntropy,
-      useLearnedController: useLearned,
-      blendPolicy: blendPolicy.clamp(0.0, 1.0),
-      intentAlignWeight: intentAlignWeight,
-      intentPgWeight: intentPgWeight,
-      actionAlignWeight: actionAlignWeight,
-      normalizeFeatures: true,
-      gateScoreMin: -1e9,
-      gateOnlyLanded: false,
-      gateVerbose: false,
-      externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
-        return curHook(env: env, dt: dt, tStep: tStep);
-      }),
-    );
-
-    // Warm norm for the curriculum trainer
-    _warmFeatureNorm(
-      norm: trainerCur.norm,
-      trainer: trainerCur,
-      fe: fe,
-      env: env,
-      perClass: 300, // a bit less; curriculum is simple
-      seed: seed ^ 0xACE1,
-    );
-
-    // Run curriculum iterations
-    int terrAttempts = 0;
-    int currentTerrainSeed = rnd.nextInt(1 << 30);
-    for (int it = 0; it < curIters; it++) {
-      double lastSeg = 0.0;
-      for (int b = 0; b < curBatch; b++) {
-        // reuse same terrain for a few attempts
-        if (terrAttempts == 0) currentTerrainSeed = rnd.nextInt(1 << 30);
-        env.reset(seed: currentTerrainSeed);
-
-        // pick a vector and apply jitter
-        final v = vectors[rnd.nextInt(vectors.length)];
-        final j = 1.0 + curVJitter * (rnd.nextDouble() * 2 - 1);
-        _applyFixedVectorSpawn(
-          env: env,
-          rnd: rnd,
-          vx: v.vx * j,
-          vy: v.vy * j,
-          hMin: curHmin,
-          hMax: curHmax,
-          xFrac: curXFrac,
-        );
-
-        final res = trainerCur.runEpisode(
-          train: true,
-          greedy: false,
-          scoreIsReward: false,
-          lr: lr,
-          valueBeta: valueBeta,
-          huberDelta: huberDelta,
-        );
-
-        lastSeg = res.segMean;
-        terrAttempts = (terrAttempts + 1) % 1; // 1 attempt/terrain in curriculum
-      }
-
-      if (gateVerbose && ((it + 1) % 200 == 0)) {
-        print('[CUR] iter=${it + 1} | segMean=${lastSeg.toStringAsFixed(3)}');
-      }
-    }
-
-    // Save snapshot *after* curriculum
-    _savePolicy(
-      path: curriculumPath,
-      p: policy,
-      rayCount: env.rayCfg.rayCount,
-      kindsOneHot: kindsOneHot,
-      env: env,
-      norm: null, // leave null → next trainer will save its own norm
-    );
-    print('Saved policy snapshot after curriculum → $curriculumPath');
-  }
-
-  // ============================== MAIN PF TRAINING ==============================
-
-  // Build PF reward hook (rebuilt per episode)
+  // ===== PF reward hook (rebuilt per episode) =====
   PFShapingCfg pfCfg = PFShapingCfg(
     wAlign: pfAlign,
     wVelDelta: pfVelDelta,
@@ -1296,7 +1441,7 @@ void main(List<String> argv) async {
   );
   ai.ExternalRewardHook? pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
-  // Main trainer (PF-based)
+  // ----- Trainer (Stage 2 runtime) -----
   final trainer = Trainer(
     env: env,
     fe: fe,
@@ -1314,26 +1459,101 @@ void main(List<String> argv) async {
     intentPgWeight: intentPgWeight,
     actionAlignWeight: actionAlignWeight,
     normalizeFeatures: true,
-    // gating inside trainer (prints [TRAIN] lines if you re-enable in agent.dart)
+    // gating inside trainer
     gateScoreMin: gateScoreMin,
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
 
-    // add dense PF reward per step
+    // dense PF reward per step
     externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
       return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
     }),
   );
 
-  // Optional: warm the feature norm for main trainer (fresh norm instance)
-  _warmFeatureNorm(
-    norm: trainer.norm,
-    trainer: trainer,
-    fe: fe,
-    env: env,
-    perClass: 500,
-    seed: seed ^ 0xACE,
-  );
+  // If we loaded a policy and it had a norm, apply it now (second pass)
+  if (loadPath != null && loadPath.trim().isNotEmpty) {
+    try {
+      final raw = File(loadPath).readAsStringSync();
+      final j = json.decode(raw) as Map<String, dynamic>;
+      final nm = (j['norm'] as Map?)?.cast<String, dynamic>();
+      if (nm != null && trainer.norm != null) {
+        final dim = (nm['dim'] as num?)?.toInt() ?? -1;
+        if (dim == trainer.norm!.dim) {
+          final mean = (nm['mean'] as List).map((e) => (e as num).toDouble()).toList();
+          final var_ = (nm['var'] as List).map((e) => (e as num).toDouble()).toList();
+          trainer.norm!
+            ..mean = mean
+            ..var_ = var_
+            ..inited = true;
+          print('Applied saved feature norm from loaded policy.');
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Determinism probe (physics)
+  if (determinism) {
+    env.reset(seed: 1234);
+    final a = _probeDeterminism(env, maxSteps: 165);
+    env.reset(seed: 1234);
+    final b = _probeDeterminism(env, maxSteps: 165);
+    final ok = (a.steps == b.steps) && ((a.cost - b.cost).abs() < 1e-6);
+    print('Determinism probe: steps ${a.steps} vs ${b.steps} | cost ${a.cost.toStringAsFixed(6)} vs ${b.cost.toStringAsFixed(6)} => ${ok ? "OK" : "MISMATCH"}');
+  }
+
+  // ----- CURRICULUM STAGE 1 (optional) -----
+  if (curIters > 0) {
+    print('=== Curriculum Stage 1: speed-min on hard-set vectors ===');
+    final rnd = math.Random(seed ^ 0xABCDEF);
+    for (int it = 0; it < curIters; it++) {
+      for (int b = 0; b < math.max(1, curBatch); b++) {
+        final res = _runCurriculumEpisode(
+          env: env,
+          fe: fe,
+          policy: policy,
+          norm: trainer.norm,
+          rnd: rnd,
+          planHold: planHold,
+          tempIntent: tempIntent, // exploration is useful here
+          gamma: 0.99,
+          lr: lr,
+          intentAlignWeight: intentAlignWeight,
+          intentPgWeight: intentPgWeight,
+          actionAlignWeight: actionAlignWeight,
+        );
+        if (gateVerbose && (b == 0)) {
+          final v = math.sqrt(env.lander.vel.x * env.lander.vel.x + env.lander.vel.y * env.lander.vel.y);
+          print('[CUR] iter=${it + 1} | lastSpeed=${v.toStringAsFixed(1)} | steps=${res.steps}');
+        }
+      }
+      if (gateVerbose && ((it + 1) % 100 == 0)) {
+        print('[TRAIN/CUR] iter=${it + 1}');
+      }
+    }
+
+    // Save intermediate policy snapshot for clarity
+    _savePolicy(
+      path: 'policy_curriculum.json',
+      p: policy,
+      rayCount: env.rayCfg.rayCount,
+      kindsOneHot: kindsOneHot,
+      env: env,
+      norm: trainer.norm,
+    );
+    print('★ Curriculum Stage 1 complete → saved policy_curriculum.json');
+
+    // Optional: re-warm norm after new behavior is learned
+    if (warmAfterCurr) {
+      _warmFeatureNorm(
+        norm: trainer.norm,
+        trainer: trainer,
+        fe: fe,
+        env: env,
+        perClass: 400,
+        seed: seed ^ 0xACE,
+      );
+    }
+  }
 
   // ===== Baseline eval (honors --eval_episodes exactly) =====
       {
@@ -1366,11 +1586,10 @@ void main(List<String> argv) async {
     }
   }
 
-  // ===== MAIN TRAIN LOOP =====
+  // ===== MAIN TRAIN LOOP (Stage 2: PF reward) =====
   final rnd = math.Random(seed ^ 0xDEADBEEF);
   final rayCount = env.rayCfg.rayCount;
 
-  // Group multiple attempts per terrain
   int terrAttempts = 0;
   int currentTerrainSeed = rnd.nextInt(1 << 30);
 
@@ -1381,15 +1600,10 @@ void main(List<String> argv) async {
     double lastSegMean = 0.0;
 
     for (int b = 0; b < batch; b++) {
-      // Pick a new terrain seed when starting a new group
       if (terrAttempts == 0) {
         currentTerrainSeed = rnd.nextInt(1 << 30);
       }
-
-      // Reuse terrain within the group
       env.reset(seed: currentTerrainSeed);
-
-      // Rebuild PF-based reward hook for this terrain/episode
       pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
       final res = trainer.runEpisode(
@@ -1401,10 +1615,8 @@ void main(List<String> argv) async {
         huberDelta: huberDelta,
       );
 
-      // Advance attempt counter within the group
       terrAttempts = (terrAttempts + 1) % attemptsPerTerrain;
 
-      // For iteration summary
       lastCost = res.totalCost;
       lastSteps = res.steps;
       lastLanded = res.landed;
@@ -1486,24 +1698,25 @@ void main(List<String> argv) async {
 
 Examples:
 
+1) Resume from a saved policy and run PF training (stage 2 only):
   dart run lib/ai/train_agent.dart \
+    --load_policy=policy_curriculum.json \
     --hidden=96,96,64 \
     --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 \
     --blend_policy=1.0 --intent_align=0.25 --intent_pg=0.6 \
     --gate_min=0.0 --gate_landed \
     --eval_every=20 --eval_episodes=120 \
-    --eval_parallel --eval_workers=20 \
-    --pf_acc_align=2.0 --pf_acc_err=1.0 --pf_acc_ema=0.2 --pf_debug
+    --eval_parallel --eval_workers=20
 
-Curriculum flags (optional):
-  --curriculum \
-  --cur_iters=2000 --cur_batch=1 \
-  --cur_hmin=80 --cur_hmax=320 --cur_x_frac=0.20 \
-  --cur_v_scale=1.0 --cur_v_jitter=0.15 \
-  --cur_vmax_norm=180 --cur_upright_k=0.04 --cur_wall_k=0.02 \
-  --curriculum_path=policy_curriculum.json
+2) Run curriculum stage 1 then stage 2:
+  dart run lib/ai/train_agent.dart \
+    --curriculum_iters=3000 --curriculum_batch=1 \
+    --train_iters=400 --batch=1 --lr=0.0003 \
+    --plan_hold=1 --intent_temp=1.0 \
+    --intent_align=0.25 --intent_pg=0.6 --action_align=0.0
 
 Notes:
-- Curriculum runs **before** PF training and saves a snapshot to `policy_curriculum.json`.
-- Main PF training (and its norm) proceeds as before and writes periodic checkpoints.
+- Stage 1 (curriculum) saves an intermediate snapshot as policy_curriculum.json.
+- Pass --warm_norm_after_curriculum=false if you prefer to skip post-curriculum norm warming.
+- You can still use all PF knobs (--pf_*) and evaluation flags exactly as before.
 ------------------------------------------------------------------------------ */
