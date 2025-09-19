@@ -1,5 +1,4 @@
 // lib/ai/train_agent.dart
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -11,7 +10,6 @@ import '../engine/raycast.dart'; // RayConfig
 
 import 'agent.dart' as ai; // FeatureExtractorRays, PolicyNetwork, Trainer, RunningNorm, kIntentNames, predictiveIntentLabelAdaptive
 import 'agent.dart';       // bring symbols into scope (PolicyNetwork etc.)
-import 'nn_helper.dart';
 import 'potential_field.dart'; // buildPotentialField, PotentialField
 
 /* ------------------------------- tiny arg parser ------------------------------- */
@@ -34,8 +32,16 @@ class _Args {
   String? getStr(String k, {String? def}) => _kv[k] ?? def;
   int getInt(String k, {int def = 0}) => int.tryParse(_kv[k] ?? '') ?? def;
   double getDouble(String k, {double def = 0.0}) => double.tryParse(_kv[k] ?? '') ?? def;
-  bool getFlag(String k, {bool def = false}) => _flags.contains(k) ? true : def;
+  bool getFlag(String k, {bool def = false}) {
+    if (_flags.contains(k)) return true;            // --flag
+    final v = _kv[k];                                // --flag=true / --flag=false
+    if (v == null) return def;
+    final s = v.toLowerCase();
+    return s == '1' || s == 'true' || s == 'yes' || s == 'on';
+  }
 }
+
+int _iclamp(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
 
 /* ------------------------------- feature signature ------------------------------ */
 
@@ -167,37 +173,6 @@ void _savePolicy({
   print('Saved policy → $path');
 }
 
-// Rebuild PolicyNetwork from JSON produced by _policyToJson.
-PolicyNetwork _policyFromJson(Map<String, dynamic> m) {
-  final arch = m['arch'] as Map<String, dynamic>;
-  final inDim = (arch['input'] as num).toInt();
-  final hidden = (arch['hidden'] as List).map((e) => (e as num).toInt()).toList();
-  final p = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: 0xBEEF);
-
-  final trunk = (m['trunk'] as List).cast<Map<String, dynamic>>();
-  for (int i = 0; i < trunk.length; i++) {
-    final Wi = (trunk[i]['W'] as List).map((r) => (r as List).map((x) => (x as num).toDouble()).toList()).toList();
-    final bi = (trunk[i]['b'] as List).map((x) => (x as num).toDouble()).toList();
-    p.trunk.layers[i].W = List.generate(Wi.length, (r) => List<double>.from(Wi[r]));
-    p.trunk.layers[i].b = List<double>.from(bi);
-  }
-
-  void loadHead(String key, Linear head) {
-    final hj = (m['heads'] as Map<String, dynamic>)[key] as Map<String, dynamic>;
-    final W = (hj['W'] as List).map((r) => (r as List).map((x) => (x as num).toDouble()).toList()).toList();
-    final b = (hj['b'] as List).map((x) => (x as num).toDouble()).toList();
-    head.W = List.generate(W.length, (r) => List<double>.from(W[r]));
-    head.b = List<double>.from(b);
-  }
-
-  loadHead('intent', p.heads.intent);
-  loadHead('turn',   p.heads.turn);
-  loadHead('thr',    p.heads.thr);
-  loadHead('val',    p.heads.val);
-
-  return p;
-}
-
 /* --------------------------------- env config --------------------------------- */
 
 et.EngineConfig makeConfig({
@@ -284,13 +259,183 @@ class EvalStats {
   double meanAbsDx = 0;
 }
 
-EvalStats evaluate({
+class _EvalChunkResult {
+  final List<double> costs;
+  final int landed;
+  final int crashed;
+  final int stepsSum;
+  final double absDxSum;
+  _EvalChunkResult(this.costs, this.landed, this.crashed, this.stepsSum, this.absDxSum);
+}
+
+_EvalChunkResult _evalChunk({
+  required int episodes,
+  required int seed,
+  required int attemptsPerTerrain,
+  required PolicyNetwork policyClone,
+  required List<int> hidden,
+  required et.EngineConfig cfg,
+}) {
+  // Local env + FE + trainer referencing the cloned policy
+  final env = eng.GameEngine(cfg);
+  env.rayCfg = const RayConfig(rayCount: 180, includeFloor: false, forwardAligned: true);
+  final fe = FeatureExtractorRays(rayCount: env.rayCfg.rayCount);
+  final trainer = Trainer(
+    env: env,
+    fe: fe,
+    policy: policyClone,
+    dt: 1 / 60.0,
+    gamma: 0.99,
+    seed: seed,
+    twoStage: true,
+    planHold: 1,
+    tempIntent: 1.0,
+    intentEntropyBeta: 0.0,
+    useLearnedController: false,
+    blendPolicy: 1.0,
+    intentAlignWeight: 0.0,
+    intentPgWeight: 0.0,
+    actionAlignWeight: 0.0,
+    normalizeFeatures: true,
+    gateScoreMin: -1e9,
+    gateOnlyLanded: false,
+    gateVerbose: false,
+    externalRewardHook: null,
+  );
+
+  final rnd = math.Random(seed);
+  final costs = <double>[];
+  int landed = 0, crashed = 0, stepsSum = 0;
+  double absDxSum = 0.0;
+
+  int terrAttempts = 0;
+  int currentTerrainSeed = rnd.nextInt(1 << 30);
+
+  for (int i = 0; i < episodes; i++) {
+    if (terrAttempts == 0) {
+      currentTerrainSeed = rnd.nextInt(1 << 30);
+    }
+    env.reset(seed: currentTerrainSeed);
+    final res = trainer.runEpisode(train: false, greedy: true, scoreIsReward: false);
+    terrAttempts = (terrAttempts + 1) % attemptsPerTerrain;
+
+    costs.add(res.totalCost);
+    stepsSum += res.steps;
+    if (env.status == et.GameStatus.landed) landed++; else crashed++;
+    final padCx = env.terrain.padCenter;
+    absDxSum += (env.lander.pos.x - padCx).abs();
+  }
+
+  return _EvalChunkResult(costs, landed, crashed, stepsSum, absDxSum);
+}
+
+Future<EvalStats> evaluateParallel({
+  required et.EngineConfig cfg,
+  required PolicyNetwork policy,
+  required List<int> hidden,
+  required int episodes,
+  required int attemptsPerTerrain,
+  required int seed,
+  required int workers,
+}) async {
+  final sw = Stopwatch()..start();
+
+  // even split
+  final per = episodes ~/ workers;
+  final extra = episodes % workers;
+
+  // clone params (weights) once for read-only use
+  PolicyNetwork _clonePolicy(PolicyNetwork p) {
+    final cp = PolicyNetwork(inputSize: p.inputSize, hidden: List<int>.from(hidden), seed: seed ^ 0xA11CE);
+    // copy trunk
+    for (int li = 0; li < cp.trunk.layers.length; li++) {
+      final Ld = cp.trunk.layers[li];
+      final Ls = p.trunk.layers[li];
+      for (int i = 0; i < Ld.W.length; i++) {
+        for (int j = 0; j < Ld.W[0].length; j++) {
+          Ld.W[i][j] = Ls.W[i][j];
+        }
+      }
+      for (int i = 0; i < Ld.b.length; i++) Ld.b[i] = Ls.b[i];
+    }
+    // heads
+    List<List<double>> _copyW(List<List<double>> W) =>
+        List.generate(W.length, (i) => List<double>.from(W[i]));
+    cp.heads.intent.W = _copyW(p.heads.intent.W); cp.heads.intent.b = List<double>.from(p.heads.intent.b);
+    cp.heads.turn.W   = _copyW(p.heads.turn.W);   cp.heads.turn.b   = List<double>.from(p.heads.turn.b);
+    cp.heads.thr.W    = _copyW(p.heads.thr.W);    cp.heads.thr.b    = List<double>.from(p.heads.thr.b);
+    cp.heads.val.W    = _copyW(p.heads.val.W);    cp.heads.val.b    = List<double>.from(p.heads.val.b);
+    return cp;
+  }
+
+  // spin isolates with Isolate.run (simple API)
+  final futures = <Future<_EvalChunkResult>>[];
+  for (int w = 0; w < workers; w++) {
+    final nThis = per + (w < extra ? 1 : 0);
+    if (nThis == 0) continue;
+
+    // freeze a clone for this isolate
+    final pClone = _clonePolicy(policy);
+    final seedW = seed ^ (0xBEEF << w);
+
+    futures.add(Isolate.run(() {
+      return _evalChunk(
+        episodes: nThis,
+        seed: seedW,
+        attemptsPerTerrain: attemptsPerTerrain,
+        policyClone: pClone,
+        hidden: hidden,
+        cfg: cfg,
+      );
+    }));
+  }
+
+  final chunks = await Future.wait(futures);
+
+  // reduce
+  final costs = <double>[];
+  int landed = 0, crashed = 0, stepsSum = 0;
+  double absDxSum = 0.0;
+
+  for (final c in chunks) {
+    costs.addAll(c.costs);
+    landed += c.landed;
+    crashed += c.crashed;
+    stepsSum += c.stepsSum;
+    absDxSum += c.absDxSum;
+  }
+
+  costs.sort();
+  final st = EvalStats();
+  st.meanCost = costs.isEmpty ? 0 : costs.reduce((a, b) => a + b) / costs.length;
+  st.medianCost = costs.isEmpty ? 0 : costs[costs.length ~/ 2];
+  final total = landed + crashed;
+  st.landPct = total == 0 ? 0 : 100.0 * landed / total;
+  st.crashPct = total == 0 ? 0 : 100.0 * crashed / total;
+  st.meanSteps = total == 0 ? 0 : stepsSum / total;
+  st.meanAbsDx = total == 0 ? 0 : absDxSum / total;
+
+  sw.stop();
+  final ms = sw.elapsedMilliseconds;
+  final eps = total == 0 ? 0 : (1000.0 * total / math.max(1, ms));
+
+  print('Eval: N=$episodes | workers=$workers | ${ms} ms | ${eps.toStringAsFixed(1)} eps/s '
+      '| land%=${st.landPct.toStringAsFixed(1)} | meanCost=${st.meanCost.toStringAsFixed(3)} '
+      '| median=${st.medianCost.toStringAsFixed(3)} | steps=${st.meanSteps.toStringAsFixed(1)} '
+      '| mean|dx|=${st.meanAbsDx.toStringAsFixed(1)}');
+
+  return st;
+}
+
+EvalStats evaluateSequential({
   required eng.GameEngine env,
   required Trainer trainer,
   int episodes = 40,
   int seed = 123,
-  int attemptsPerTerrain = 1, // reuse terrain across N episodes
+  int attemptsPerTerrain = 1,
 }) {
+  final sw = Stopwatch()..start();
+
   final rnd = math.Random(seed);
   final costs = <double>[];
   int landed = 0, crashed = 0, stepsSum = 0;
@@ -332,6 +477,16 @@ EvalStats evaluate({
   st.crashPct = 100.0 * crashed / episodes;
   st.meanSteps = stepsSum / episodes;
   st.meanAbsDx = absDxSum / episodes;
+
+  sw.stop();
+  final ms = sw.elapsedMilliseconds;
+  final eps = (1000.0 * episodes / math.max(1, ms));
+
+  print('Eval: N=$episodes | workers=1 | ${ms} ms | ${eps.toStringAsFixed(1)} eps/s '
+      '| land%=${st.landPct.toStringAsFixed(1)} | meanCost=${st.meanCost.toStringAsFixed(3)} '
+      '| median=${st.medianCost.toStringAsFixed(3)} | steps=${st.meanSteps.toStringAsFixed(1)} '
+      '| mean|dx|=${st.meanAbsDx.toStringAsFixed(1)}');
+
   return st;
 }
 
@@ -425,7 +580,7 @@ void _warmFeatureNorm({
   print('Feature norm warmed with $accepted synthetic samples.');
 }
 
-/* -------------------- PF velocity-only reward (final approach boost) -------------------- */
+/* ----------------------------- PF velocity-only reward ------------------------- */
 
 class PFShapingCfg {
   // base weights
@@ -440,18 +595,19 @@ class PFShapingCfg {
   // scaling + norms
   final double vmax;         // normalization for velocity error
 
-  // NEW: near-pad emphasis
-  final double padTightFrac; // horizontal tight zone as fraction of worldW (e.g., 0.10)
-  final double hTight;       // vertical tight zone in px (e.g., 140)
-  final double latBoost;     // extra weight on lateral error near pad (e.g., 4.0)
-  final double velPenaltyBoost; // multiplies overall v-error near pad (e.g., 3.0)
-  final double alignBoost;      // multiplies align reward near pad (e.g., 1.5)
-  final double vMinTouchdown;   // desired |v| right at pad (e.g., 1.5..3.0)
+  // near-pad emphasis
+  final double padTightFrac; // fraction of worldW
+  final double hTight;       // px
+  final double latBoost;     // lateral weight boost near pad
+  final double velPenaltyBoost;
+  final double alignBoost;
+  final double vMinTouchdown;
 
-  // NEW: feasibility clamp (prevents unwinnable target)
-  final double feasiness;    // fraction of a_max*dt allowed change in v_pf per frame (0..1)
+  // feasibility clamp
+  final double feasiness;
 
-  final double xBias;        // stronger X (lateral) weighting overall
+  // stronger X weighting overall
+  final double xBias;
 
   const PFShapingCfg({
     this.wAlign = 1.0,
@@ -460,55 +616,24 @@ class PFShapingCfg {
     this.vMaxFar = 90.0,
     this.alpha = 1.2,
     this.vmax = 140.0,
-
     this.padTightFrac = 0.10,
     this.hTight = 140.0,
     this.latBoost = 4.0,
     this.velPenaltyBoost = 3.0,
     this.alignBoost = 1.5,
     this.vMinTouchdown = 2.0,
-
     this.feasiness = 0.75,
-
     this.xBias = 3.0,
   });
-
-  Map<String, dynamic> toJson() => {
-    'wAlign': wAlign, 'wVelDelta': wVelDelta,
-    'vMinClose': vMinClose, 'vMaxFar': vMaxFar, 'alpha': alpha,
-    'vmax': vmax,
-    'padTightFrac': padTightFrac, 'hTight': hTight,
-    'latBoost': latBoost, 'velPenaltyBoost': velPenaltyBoost, 'alignBoost': alignBoost,
-    'vMinTouchdown': vMinTouchdown, 'feasiness': feasiness,
-    'xBias': xBias,
-  };
-
-  static PFShapingCfg fromJson(Map<String, dynamic> m) => PFShapingCfg(
-    wAlign: (m['wAlign'] as num).toDouble(),
-    wVelDelta: (m['wVelDelta'] as num).toDouble(),
-    vMinClose: (m['vMinClose'] as num).toDouble(),
-    vMaxFar: (m['vMaxFar'] as num).toDouble(),
-    alpha: (m['alpha'] as num).toDouble(),
-    vmax: (m['vmax'] as num).toDouble(),
-    padTightFrac: (m['padTightFrac'] as num).toDouble(),
-    hTight: (m['hTight'] as num).toDouble(),
-    latBoost: (m['latBoost'] as num).toDouble(),
-    velPenaltyBoost: (m['velPenaltyBoost'] as num).toDouble(),
-    alignBoost: (m['alignBoost'] as num).toDouble(),
-    vMinTouchdown: (m['vMinTouchdown'] as num).toDouble(),
-    feasiness: (m['feasiness'] as num).toDouble(),
-    xBias: (m['xBias'] as num).toDouble(),
-  );
 }
 
-/// Reward = wAlign_eff * cos(v, flow) - wVel_eff * ||W*(v - v_pf)|| / vmax
 ai.ExternalRewardHook makePFRewardHook({
   required eng.GameEngine env,
   PFShapingCfg cfg = const PFShapingCfg(),
 }) {
   final pf = buildPotentialField(env, nx: 160, ny: 120, iters: 1200, omega: 1.7, tol: 1e-4);
 
-  // Effective max linear accel per real second (rough estimate from engine):
+  // Effective max linear accel per real second
   final double aMax = env.cfg.t.thrustAccel * 0.05 * env.cfg.stepScale; // px/s^2
 
   return ({required eng.GameEngine env, required double dt, required int tStep}) {
@@ -521,7 +646,6 @@ ai.ExternalRewardHook makePFRewardHook({
     final padCx = env.terrain.padCenter.toDouble();
     final dxAbs = (x - padCx).abs();
     final W = env.cfg.worldW.toDouble();
-
     final gy = env.terrain.heightAt(x);
     final h  = (gy - y).toDouble().clamp(0.0, 1000.0);
 
@@ -530,15 +654,15 @@ ai.ExternalRewardHook makePFRewardHook({
     final ph_ = math.exp(- (h*h)       / (cfg.hTight*cfg.hTight + 1e-6));
     final prox = (px_ * ph_).clamp(0.0, 1.0);
 
-    // Alignment (unit flow) term
-    final flow = pf.sampleFlow(x, y); // unit (nx, ny)
+    // Alignment
+    final flow = pf.sampleFlow(x, y);
     final vmag = math.sqrt(vx*vx + vy*vy);
     double align = 0.0;
     if (vmag > 1e-6) {
-      align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny; // [-1,1]
+      align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny;
     }
 
-    // Base PF suggestion (fast far, slow near)
+    // Base PF suggestion
     var sugg = pf.suggestVelocity(
       x, y,
       vMinClose: cfg.vMinClose,
@@ -568,7 +692,7 @@ ai.ExternalRewardHook makePFRewardHook({
       sugg = (vx: vx + dv_pf_x * s, vy: vy + dv_pf_y * s);
     }
 
-    // Border avoidance: speed-aware & earlier
+    // Border avoidance
     final wallTau = 1.2;
     final wallMarginFrac = 0.22;
     final wallBlendMax = 0.80;
@@ -606,10 +730,10 @@ ai.ExternalRewardHook makePFRewardHook({
 
     final wallBoost = 1.0 + wallVelPenalty * borderProx;
 
-    // Stronger X weighting; ramp faster near pad
+    // Stronger X weighting near pad
     final prox2 = prox * prox;
-    final wLat = (cfg.xBias) * (1.0 + cfg.latBoost * prox2);     // X
-    final wVer = 1.0 * (1.0 + 0.7 * cfg.latBoost * prox2);       // Y
+    final wLat = (cfg.xBias) * (1.0 + cfg.latBoost * prox2);
+    final wVer = 1.0 * (1.0 + 0.7 * cfg.latBoost * prox2);
 
     final dvx = (vx - sugg.vx) * wLat;
     final dvy = (vy - sugg.vy) * wVer;
@@ -629,390 +753,7 @@ ai.ExternalRewardHook makePFRewardHook({
   };
 }
 
-/* ------------------------------- parallel eval -------------------------------- */
-
-class _EvalJob {
-  final Map<String, dynamic> policyJson; // from _policyToJson
-  final Map<String, dynamic>? normJson;  // included inside policyJson['norm'] but easy access
-  final Map<String, dynamic> cfg;        // engine cfg snapshot (CLI params)
-  final Map<String, dynamic> pfCfg;      // PFShapingCfg
-  final int episodes;
-  final int attemptsPerTerrain;
-  final int seedShard;
-  _EvalJob({
-    required this.policyJson,
-    required this.normJson,
-    required this.cfg,
-    required this.pfCfg,
-    required this.episodes,
-    required this.attemptsPerTerrain,
-    required this.seedShard,
-  });
-
-  Map<String, dynamic> toMap() => {
-    'policy': policyJson,
-    'norm': normJson,
-    'cfg': cfg,
-    'pfCfg': pfCfg,
-    'episodes': episodes,
-    'attemptsPerTerrain': attemptsPerTerrain,
-    'seedShard': seedShard,
-  };
-
-  static _EvalJob fromMap(Map<String, dynamic> m) => _EvalJob(
-    policyJson: (m['policy'] as Map).cast<String, dynamic>(),
-    normJson: (m['norm'] as Map?)?.cast<String, dynamic>(),
-    cfg: (m['cfg'] as Map).cast<String, dynamic>(),
-    pfCfg: (m['pfCfg'] as Map).cast<String, dynamic>(),
-    episodes: (m['episodes'] as num).toInt(),
-    attemptsPerTerrain: (m['attemptsPerTerrain'] as num).toInt(),
-    seedShard: (m['seedShard'] as num).toInt(),
-  );
-}
-
-class _EvalPartial {
-  final List<double> costs;
-  final int landed;
-  final int crashed;
-  final int stepsSum;
-  final double absDxSum;
-  _EvalPartial(this.costs, this.landed, this.crashed, this.stepsSum, this.absDxSum);
-
-  Map<String, dynamic> toMap() => {
-    'costs': costs,
-    'landed': landed,
-    'crashed': crashed,
-    'stepsSum': stepsSum,
-    'absDxSum': absDxSum,
-  };
-
-  static _EvalPartial fromMap(Map<String, dynamic> m) => _EvalPartial(
-    (m['costs'] as List).map((e) => (e as num).toDouble()).toList(),
-    (m['landed'] as num).toInt(),
-    (m['crashed'] as num).toInt(),
-    (m['stepsSum'] as num).toInt(),
-    (m['absDxSum'] as num).toDouble(),
-  );
-}
-
-// Worker entry
-void _evalWorker(Map<String, dynamic> init) async {
-  final back = init['send'] as SendPort;
-  final job = _EvalJob.fromMap((init['job'] as Map).cast<String, dynamic>());
-
-  // Reconstruct env config
-  final cfg = makeConfig(
-    seed: job.seedShard,
-    lockTerrain: job.cfg['lockTerrain'] as bool,
-    lockSpawn: job.cfg['lockSpawn'] as bool,
-    randomSpawnX: job.cfg['randomSpawnX'] as bool,
-    worldW: (job.cfg['worldW'] as num).toDouble(),
-    worldH: (job.cfg['worldH'] as num).toDouble(),
-    maxFuel: (job.cfg['maxFuel'] as num).toDouble(),
-    crashOnTilt: job.cfg['crashOnTilt'] as bool,
-    gravity: (job.cfg['gravity'] as num).toDouble(),
-    thrustAccel: (job.cfg['thrustAccel'] as num).toDouble(),
-    rotSpeed: (job.cfg['rotSpeed'] as num).toDouble(),
-    rcsEnabled: job.cfg['rcsEnabled'] as bool,
-    rcsAccel: (job.cfg['rcsAccel'] as num).toDouble(),
-    rcsBodyFrame: job.cfg['rcsBodyFrame'] as bool,
-    downThrEnabled: job.cfg['downThrEnabled'] as bool,
-    downThrAccel: (job.cfg['downThrAccel'] as num).toDouble(),
-    downThrBurn: (job.cfg['downThrBurn'] as num).toDouble(),
-  );
-  final env = eng.GameEngine(cfg);
-  env.rayCfg = const RayConfig(rayCount: 180, includeFloor: false, forwardAligned: true);
-
-  // FE
-  final fe = FeatureExtractorRays(rayCount: env.rayCfg.rayCount);
-  env.reset(seed: job.seedShard ^ 0xC0FFEE);
-  env.step(1 / 60.0, const et.ControlInput(thrust: false, left: false, right: false));
-
-  // Policy from JSON
-  final policy = _policyFromJson(job.policyJson);
-
-  // Trainer
-  ai.ExternalRewardHook pfHook = makePFRewardHook(env: env, cfg: PFShapingCfg.fromJson(job.pfCfg));
-  final trainer = Trainer(
-    env: env,
-    fe: fe,
-    policy: policy,
-    dt: 1 / 60.0,
-    gamma: 0.99,
-    seed: job.seedShard,
-    twoStage: true,
-    planHold: 1,
-    tempIntent: 1.0,
-    intentEntropyBeta: 0.0,
-    useLearnedController: false,
-    blendPolicy: 1.0,
-    intentAlignWeight: 0.0,
-    intentPgWeight: 0.0,
-    actionAlignWeight: 0.0,
-    normalizeFeatures: true,
-    gateScoreMin: -1e9,
-    gateOnlyLanded: false,
-    gateVerbose: false,
-    externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
-      return pfHook(env: env, dt: dt, tStep: tStep);
-    }),
-  );
-
-  // Load norm (if provided)
-  final nj = job.normJson;
-  if (nj != null && trainer.norm != null && trainer.norm!.dim == (nj['dim'] as num).toInt()) {
-    final mean = (nj['mean'] as List).map((e) => (e as num).toDouble()).toList();
-    final var_ = (nj['var'] as List).map((e) => (e as num).toDouble()).toList();
-    trainer.norm!.momentum = (nj['momentum'] as num).toDouble();
-    trainer.norm!..inited = true
-      ..mean = List<double>.from(mean)
-      ..var_ = List<double>.from(var_);
-  }
-
-  // Run shard episodes
-  final rnd = math.Random(job.seedShard);
-  int terrAttempts = 0;
-  int currentTerrainSeed = rnd.nextInt(1 << 30);
-
-  final costs = <double>[];
-  int landed = 0, crashed = 0, stepsSum = 0;
-  double absDxSum = 0.0;
-
-  for (int i = 0; i < job.episodes; i++) {
-    if (terrAttempts == 0) currentTerrainSeed = rnd.nextInt(1 << 30);
-    env.reset(seed: currentTerrainSeed);
-
-    final res = trainer.runEpisode(train: false, greedy: true, scoreIsReward: false);
-    terrAttempts = (terrAttempts + 1) % job.attemptsPerTerrain;
-
-    costs.add(res.totalCost);
-    stepsSum += res.steps;
-    if (env.status == et.GameStatus.landed) {
-      landed++;
-    } else {
-      crashed++;
-    }
-    final padCx = env.terrain.padCenter;
-    absDxSum += (env.lander.pos.x - padCx).abs();
-  }
-
-  back.send(_EvalPartial(costs, landed, crashed, stepsSum, absDxSum).toMap());
-}
-
-// Orchestrator
-Future<EvalStats> evaluateParallel({
-  required PolicyNetwork policy,
-  required RunningNorm? norm,
-  required eng.GameEngine envTemplate,
-  required PFShapingCfg pfCfg,
-  required int episodes,
-  required int attemptsPerTerrain,
-  required int seed,
-  int? workers,
-}) async {
-  final cores = Platform.numberOfProcessors;
-  final W = workers == null ? cores : math.max(1, math.min(workers, cores));
-  final N = episodes;
-  final per = (N / W).ceil();
-
-  // Snapshot policy+norm to JSON once, pass to all workers.
-  final feDummy = FeatureExtractorRays(rayCount: envTemplate.rayCfg.rayCount);
-  envTemplate.reset(seed: seed ^ 0xABCD);
-  envTemplate.step(1 / 60.0, const et.ControlInput(thrust: false, left: false, right: false));
-  final inDim = feDummy.extract(envTemplate).length;
-  final kindsOneHot = (inDim == 6 + envTemplate.rayCfg.rayCount * 4);
-  final policyJson = _policyToJson(
-    p: policy,
-    rayCount: envTemplate.rayCfg.rayCount,
-    kindsOneHot: kindsOneHot,
-    env: envTemplate,
-    norm: norm,
-  );
-
-  // Engine cfg snapshot (only scalar values)
-  final cfg = {
-    'lockTerrain': envTemplate.cfg.lockTerrain,
-    'lockSpawn': envTemplate.cfg.lockSpawn,
-    'randomSpawnX': envTemplate.cfg.randomSpawnX,
-    'worldW': envTemplate.cfg.worldW,
-    'worldH': envTemplate.cfg.worldH,
-    'maxFuel': envTemplate.cfg.t.maxFuel,
-    'crashOnTilt': envTemplate.cfg.t.crashOnTilt,
-    'gravity': envTemplate.cfg.t.gravity,
-    'thrustAccel': envTemplate.cfg.t.thrustAccel,
-    'rotSpeed': envTemplate.cfg.t.rotSpeed,
-    'rcsEnabled': envTemplate.cfg.t.rcsEnabled,
-    'rcsAccel': envTemplate.cfg.t.rcsAccel,
-    'rcsBodyFrame': envTemplate.cfg.t.rcsBodyFrame,
-    'downThrEnabled': envTemplate.cfg.t.downThrEnabled,
-    'downThrAccel': envTemplate.cfg.t.downThrAccel,
-    'downThrBurn': envTemplate.cfg.t.downThrBurn,
-  };
-
-  final pfMap = pfCfg.toJson();
-
-  final ports = <ReceivePort>[];
-  final isolates = <Isolate>[];
-
-  for (int w = 0; w < W; w++) {
-    final rp = ReceivePort();
-    ports.add(rp);
-
-    final episodesThis = (w == W - 1) ? (N - per * (W - 1)) : per;
-    final job = _EvalJob(
-      policyJson: policyJson,
-      normJson: policyJson['norm'] as Map<String, dynamic>?,
-      cfg: cfg,
-      pfCfg: pfMap,
-      episodes: math.max(0, episodesThis),
-      attemptsPerTerrain: attemptsPerTerrain,
-      seedShard: seed ^ (0xA11CE ^ (w * 0x9E3779B1)),
-    );
-
-    final iso = await Isolate.spawn(
-      _evalWorker,
-      {
-        'send': rp.sendPort,
-        'job': job.toMap(),
-      },
-      debugName: 'eval-worker-$w',
-    );
-    isolates.add(iso);
-  }
-
-  // Collect
-  final costs = <double>[];
-  int landed = 0, crashed = 0, stepsSum = 0;
-  double absDxSum = 0.0;
-
-  int received = 0;
-  final completer = Completer<EvalStats>();
-
-  for (final rp in ports) {
-    rp.listen((msg) {
-      final part = _EvalPartial.fromMap((msg as Map).cast<String, dynamic>());
-      costs.addAll(part.costs);
-      landed += part.landed;
-      crashed += part.crashed;
-      stepsSum += part.stepsSum;
-      absDxSum += part.absDxSum;
-
-      rp.close();
-      received++;
-      if (received == ports.length && !completer.isCompleted) {
-        for (final iso in isolates) {
-          // Best-effort; workers exit after send anyway.
-          iso.kill(priority: Isolate.immediate);
-        }
-        costs.sort();
-        final st = EvalStats();
-        final n = costs.length == 0 ? 1 : costs.length;
-        st.meanCost = costs.isEmpty ? 0 : costs.reduce((a, b) => a + b) / n;
-        st.medianCost = costs.isEmpty ? 0 : costs[n ~/ 2];
-        st.landPct = n == 0 ? 0 : 100.0 * landed / n;
-        st.crashPct = n == 0 ? 0 : 100.0 * crashed / n;
-        st.meanSteps = n == 0 ? 0 : stepsSum / n;
-        st.meanAbsDx = n == 0 ? 0 : absDxSum / n;
-        completer.complete(st);
-      }
-    });
-  }
-
-  return completer.future;
-}
-
 /* ------------------------------------ main ------------------------------------ */
-String _fmtElapsed(Duration d) {
-  final ms = d.inMilliseconds;
-  if (ms < 1000) return '${ms}ms';
-  final s = (ms / 1000).toStringAsFixed(2);
-  return '${s}s';
-}
-
-Future<EvalStats> _timedEvalAndLog({
-  required bool parallel,
-  required int episodes,
-  required int attemptsPerTerrain,
-  required int seed,
-  required int evalWorkersFlag, // 0 means auto
-  required PolicyNetwork policy,
-  required RunningNorm? norm,
-  required eng.GameEngine env,
-  required PFShapingCfg pfCfg,
-}) async {
-  final sw = Stopwatch()..start();
-  final int workersUsed = parallel
-      ? (evalWorkersFlag > 0 ? evalWorkersFlag : Platform.numberOfProcessors)
-      : 1;
-
-  final EvalStats ev = parallel
-      ? await evaluateParallel(
-    policy: policy,
-    norm: norm,
-    envTemplate: env,
-    pfCfg: pfCfg,
-    episodes: episodes,
-    attemptsPerTerrain: attemptsPerTerrain,
-    seed: seed,
-    workers: (evalWorkersFlag <= 0) ? null : evalWorkersFlag,
-  )
-      : evaluate(
-    env: env,
-    trainer: Trainer(
-      env: env,
-      fe: FeatureExtractorRays(rayCount: env.rayCfg.rayCount),
-      policy: policy,
-      dt: 1 / 60.0,
-      gamma: 0.99,
-      seed: seed,
-      twoStage: true,
-      planHold: 1,
-      tempIntent: 1.0,
-      intentEntropyBeta: 0.0,
-      useLearnedController: false,
-      blendPolicy: 1.0,
-      intentAlignWeight: 0.0,
-      intentPgWeight: 0.0,
-      actionAlignWeight: 0.0,
-      normalizeFeatures: true,
-      gateScoreMin: -1e9,
-      gateOnlyLanded: false,
-      gateVerbose: false,
-      externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
-        // build a PF per-episode inside evaluate() normally; we won’t use this path here
-        return 0.0;
-      }),
-    ),
-    episodes: episodes,
-    seed: seed,
-    attemptsPerTerrain: attemptsPerTerrain,
-  );
-
-  sw.stop();
-  final elapsed = sw.elapsed;
-  final secs = elapsed.inMilliseconds / 1000.0;
-  final eps = episodes / (secs > 0 ? secs : 1e-9);
-  final epsPerWorker = eps / workersUsed;
-
-  // Compact speed line:
-  print(
-      'Eval ${parallel ? "(parallel)" : "(single)"}: '
-          'workers=$workersUsed | episodes=$episodes | time=${_fmtElapsed(elapsed)} '
-          '| eps=${eps.toStringAsFixed(1)} | eps/worker=${epsPerWorker.toStringAsFixed(1)}'
-  );
-
-  // Keep your existing quality line:
-  print(
-      'Eval(real${parallel ? ",P" : ""}) → '
-          'meanCost=${ev.meanCost.toStringAsFixed(3)} | '
-          'median=${ev.medianCost.toStringAsFixed(3)} | '
-          'land%=${ev.landPct.toStringAsFixed(1)} | '
-          'crash%=${ev.crashPct.toStringAsFixed(1)} | '
-          'steps=${ev.meanSteps.toStringAsFixed(1)} | '
-          'mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}'
-  );
-  return ev;
-}
 
 List<int> _parseHiddenList(String? s, {List<int> fallback = const [64, 64]}) {
   if (s == null || s.trim().isEmpty) return List<int>.from(fallback);
@@ -1073,12 +814,12 @@ void main(List<String> argv) async {
   final pfVmax = args.getDouble('pf_vmax', def: 140.0);
   final pfXBias = args.getDouble('pf_x_bias', def: 3.0);
 
-  // NEW: attempts per terrain + eval cadence/size + parallel
-  final attemptsPerTerrain = args.getInt('attempts_per_terrain', def: 1).clamp(1, 1000000);
-  final evalEvery = args.getInt('eval_every', def: 10).clamp(1, 1000000);
-  final evalEpisodes = args.getInt('eval_episodes', def: 80).clamp(1, 1000000);
-  final evalParallel = args.getFlag('eval_parallel', def: true);
-  final evalWorkers = args.getInt('eval_workers', def: 0); // 0 = auto
+  // attempts per terrain + eval cadence/size + parallel
+  final attemptsPerTerrain = _iclamp(args.getInt('attempts_per_terrain', def: 1), 1, 1000000);
+  final evalEvery = _iclamp(args.getInt('eval_every', def: 10), 1, 1000000);
+  final evalEpisodes = _iclamp(args.getInt('eval_episodes', def: 80), 1, 1000000);
+  final evalParallel = args.getFlag('eval_parallel', def: false);
+  final evalWorkers = _iclamp(args.getInt('eval_workers', def: Platform.numberOfProcessors), 1, 512);
 
   final determinism = args.getFlag('determinism_probe', def: true);
   final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
@@ -1131,7 +872,7 @@ void main(List<String> argv) async {
   final policy = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
   print('Loaded init policy. hidden=${policy.hidden} | FE(kind=rays, in=$inDim, rays=${env.rayCfg.rayCount}, oneHot=$kindsOneHot)');
 
-  // PF reward cfg
+  // ===== PF velocity-only reward hook (rebuilt per episode) =====
   PFShapingCfg pfCfg = PFShapingCfg(
     wAlign: pfAlign,
     wVelDelta: pfVelDelta,
@@ -1166,7 +907,7 @@ void main(List<String> argv) async {
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
 
-    // dense PF reward per step (velocity-only)
+    // add dense PF reward per step (velocity-only)
     externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
       return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
     }),
@@ -1182,7 +923,7 @@ void main(List<String> argv) async {
     print('Determinism probe: steps ${a.steps} vs ${b.steps} | cost ${a.cost.toStringAsFixed(6)} vs ${b.cost.toStringAsFixed(6)} => ${ok ? "OK" : "MISMATCH"}');
   }
 
-  // Optional: warm the feature norm so early updates aren’t wild
+  // Optional: warm the feature norm
   _warmFeatureNorm(
     norm: trainer.norm,
     trainer: trainer,
@@ -1192,30 +933,26 @@ void main(List<String> argv) async {
     seed: seed ^ 0xACE,
   );
 
-  // Quick baseline eval
+  // ===== Baseline eval (now honors --eval_episodes exactly) =====
       {
-    final baseEvalN = 1000; //math.max(10, math.min(evalEpisodes, 40));
     if (evalParallel) {
-      final ev = await _timedEvalAndLog(
-        parallel: evalParallel,
-        episodes: baseEvalN,
+      await evaluateParallel(
+        cfg: cfg,
+        policy: policy,
+        hidden: hidden,
+        episodes: evalEpisodes,
         attemptsPerTerrain: attemptsPerTerrain,
         seed: seed ^ 0x999,
-        evalWorkersFlag: evalWorkers,
-        policy: policy,
-        norm: trainer.norm,
-        env: env,
-        pfCfg: pfCfg,
+        workers: evalWorkers,
       );
     } else {
-      final ev = evaluate(
+      evaluateSequential(
         env: env,
         trainer: trainer,
-        episodes: baseEvalN,
+        episodes: evalEpisodes,
         seed: seed ^ 0x999,
         attemptsPerTerrain: attemptsPerTerrain,
       );
-      print('Eval(real) → meanCost=${ev.meanCost.toStringAsFixed(3)} | median=${ev.medianCost.toStringAsFixed(3)} | land%=${ev.landPct.toStringAsFixed(1)} | crash%=${ev.crashPct.toStringAsFixed(1)} | steps=${ev.meanSteps.toStringAsFixed(1)} | mean|dx|=${ev.meanAbsDx.toStringAsFixed(1)}');
     }
   }
 
@@ -1245,7 +982,7 @@ void main(List<String> argv) async {
       pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
       final res = trainer.runEpisode(
-        train: true, // Trainer handles gating internally & prints [TRAIN] lines
+        train: true,
         greedy: false,
         scoreIsReward: false,
         lr: lr,
@@ -1264,17 +1001,26 @@ void main(List<String> argv) async {
 
     // periodic eval + save (driven by CLI)
     if ((it + 1) % evalEvery == 0) {
-      final ev = await _timedEvalAndLog(
-        parallel: evalParallel,
-        episodes: evalEpisodes,
-        attemptsPerTerrain: attemptsPerTerrain,
-        seed: seed ^ (0x1111 * (it + 1)),
-        evalWorkersFlag: evalWorkers,
-        policy: policy,
-        norm: trainer.norm,
-        env: env,
-        pfCfg: pfCfg,
-      );
+      final EvalStats ev;
+      if (evalParallel) {
+        ev = await evaluateParallel(
+          cfg: cfg,
+          policy: policy,
+          hidden: hidden,
+          episodes: evalEpisodes,
+          attemptsPerTerrain: attemptsPerTerrain,
+          seed: seed ^ (0x1111 * (it + 1)),
+          workers: evalWorkers,
+        );
+      } else {
+        ev = evaluateSequential(
+          env: env,
+          trainer: trainer,
+          episodes: evalEpisodes,
+          seed: seed ^ (0x1111 * (it + 1)),
+          attemptsPerTerrain: attemptsPerTerrain,
+        );
+      }
 
       if (ev.meanCost < bestMeanCost) {
         bestMeanCost = ev.meanCost;
@@ -1313,32 +1059,18 @@ void main(List<String> argv) async {
 
 /* ----------------------------------- usage ------------------------------------
 
-Velocity-vector–only shaping examples:
-
-1) Defaults:
+Examples:
 
   dart run lib/ai/train_agent.dart \
     --hidden=96,96,64 \
     --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 \
     --blend_policy=1.0 --intent_align=0.25 --intent_pg=0.6 \
-    --gate_min=0.0 --gate_landed
-
-2) Stronger alignment, weaker velocity error:
-
-  dart run lib/ai/train_agent.dart \
-    --pf_align=1.5 --pf_vel_delta=0.4
-
-3) Faster far, gentler near the pad:
-
-  dart run lib/ai/train_agent.dart \
-    --pf_vmin_close=6 --pf_vmax_far=110 --pf_alpha=1.4
-
-Knobs added here:
-- reuse terrain within groups:      --attempts_per_terrain=20
-- eval cadence and size:            --eval_every=20 --eval_episodes=120
-- parallel eval:                    --eval_parallel --eval_workers=NUM  (default = CPU cores)
+    --gate_min=0.0 --gate_landed \
+    --eval_every=20 --eval_episodes=120 --eval_parallel --eval_workers=20
 
 Notes:
-- The trainer uses only the PF reward via `externalRewardHook`.
-- `segMean` in logs reports mean PF reward (used for gating).
+- `--eval_episodes` is honored for both the baseline and periodic evals.
+- When `--eval_parallel` is set, the program prints eval runtime and eps/s,
+  and uses `--eval_workers` (default = CPU cores). Each worker runs its own
+  env/feature-extractor/trainer with a cloned, read-only policy.
 ------------------------------------------------------------------------------ */
