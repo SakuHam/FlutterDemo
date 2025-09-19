@@ -568,6 +568,11 @@ class RuntimeTwoStagePolicy {
   final bool fixPolarityWithPadRays; // swap goLeft/goRight if pad-avg disagrees
   final bool mirrorX; // hard flip left/right mapping (debug/safety)
 
+  // ===== NEW: runtime knobs =====
+  double intentTemp;           // 1.0 = unchanged; >1.0 flatter; <1.0 sharper
+  bool stochasticPlanner;      // if true, sample intent ~ softmax(logits / T)
+  final math.Random _rnd;
+
   RuntimeTwoStagePolicy._({
     required this.inputSize,
     required this.trunk,
@@ -582,12 +587,19 @@ class RuntimeTwoStagePolicy {
     required this.physics, // NEW
     this.fixPolarityWithPadRays = false,
     this.mirrorX = false,
-  });
+    this.intentTemp = 1.0,
+    this.stochasticPlanner = false,
+    math.Random? rnd,
+  }) : _rnd = rnd ?? math.Random(0xC0FFEE);
 
   static RuntimeTwoStagePolicy fromJson(
       String jsonString, {
         _RuntimeFE? fe,
         int planHold = 1,
+        // NEW knobs (optional)
+        double intentTemp = 1.0,
+        bool stochasticPlanner = false,
+        math.Random? rnd,
       }) {
     final Map<String, dynamic> j = json.decode(jsonString);
 
@@ -701,6 +713,9 @@ class RuntimeTwoStagePolicy {
         physics: physics,
         fixPolarityWithPadRays: true,
         mirrorX: false,
+        intentTemp: intentTemp,
+        stochasticPlanner: stochasticPlanner,
+        rnd: rnd,
       );
     }
 
@@ -756,15 +771,28 @@ class RuntimeTwoStagePolicy {
       norm: norm,
       signature: sig,
       physics: physics,
+      intentTemp: intentTemp,
+      stochasticPlanner: stochasticPlanner,
+      rnd: rnd,
     );
   }
 
   static Future<RuntimeTwoStagePolicy> loadFromAsset(
       String assetPath, {
         int planHold = 12,
+        // NEW knobs (optional)
+        double intentTemp = 1.0,
+        bool stochasticPlanner = false,
+        math.Random? rnd,
       }) async {
     final js = await rootBundle.loadString(assetPath);
-    return RuntimeTwoStagePolicy.fromJson(js, planHold: planHold);
+    return RuntimeTwoStagePolicy.fromJson(
+      js,
+      planHold: planHold,
+      intentTemp: intentTemp,
+      stochasticPlanner: stochasticPlanner,
+      rnd: rnd,
+    );
   }
 
   // Expose physics to the game layer (read-only)
@@ -773,6 +801,15 @@ class RuntimeTwoStagePolicy {
   void resetPlanner() {
     _framesLeft = 0;
     _currentIntentIdx = -1;
+  }
+
+  // ===== NEW: runtime setters you can call from UI/loop =====
+  void setIntentTemperature(double t) {
+    intentTemp = t.clamp(1e-6, 1000.0);
+  }
+
+  void setStochasticPlanner(bool on) {
+    stochasticPlanner = on;
   }
 
   /// Back-compat: original API (no side/down thrusters).
@@ -799,9 +836,26 @@ class RuntimeTwoStagePolicy {
       if (norm != null) x = norm!.apply(x);
 
       final h = trunk.forward(x);
-      final logits = headIntent.forward(h);
-      final probs = _softmax(logits);
-      final idx = _argmax(probs);
+      final rawLogits = headIntent.forward(h);
+
+      // ===== NEW: temperature + (optional) sampling =====
+      final z = List<double>.generate(rawLogits.length, (i) => rawLogits[i] / intentTemp);
+      final probs = _softmax(z);
+
+      int idx;
+      if (stochasticPlanner) {
+        // Multinomial sample from probs
+        final u = _rnd.nextDouble();
+        double acc = 0.0;
+        idx = probs.length - 1;
+        for (int i = 0; i < probs.length; i++) {
+          acc += probs[i];
+          if (u <= acc) { idx = i; break; }
+        }
+      } else {
+        // Greedy
+        idx = _argmax(probs);
+      }
 
       _currentIntentIdx = idx;
       _framesLeft = planHold;
@@ -820,7 +874,7 @@ class RuntimeTwoStagePolicy {
               intent: kIntentNames[_currentIntentIdx],
               probs: _lastReplanProbs ?? const [],
               step: step,
-              meta: {'polarity_fix': true},
+              meta: {'polarity_fix': true, 'T': intentTemp, 'stochastic': stochasticPlanner},
             ));
           }
         }
@@ -828,10 +882,10 @@ class RuntimeTwoStagePolicy {
 
       IntentBus.instance.publishIntent(
         IntentEvent(
-          intent: kIntentNames[idx],
+          intent: kIntentNames[_currentIntentIdx],
           probs: probs,
           step: step,
-          meta: {'plan_hold': planHold},
+          meta: {'plan_hold': planHold, 'T': intentTemp, 'stochastic': stochasticPlanner},
         ),
       );
     }

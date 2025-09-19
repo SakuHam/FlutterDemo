@@ -89,6 +89,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         'assets/ai/policy.json',
         planHold: 2,
       );
+      p.setStochasticPlanner(true);
+      p.setIntentTemperature(1.8);
+      
       if (!mounted) return;
 
       _applyPolicyPhysicsToEngine(p);
