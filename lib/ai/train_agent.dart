@@ -268,6 +268,17 @@ class _EvalChunkResult {
   _EvalChunkResult(this.costs, this.landed, this.crashed, this.stepsSum, this.absDxSum);
 }
 
+// Wilson 95% CI for a proportion (land%)
+({double lo, double hi}) _wilson95(int success, int n) {
+  if (n <= 0) return (lo: 0, hi: 0);
+  const z = 1.96;
+  final p = success / n;
+  final denom = 1 + z * z / n;
+  final center = (p + z * z / (2 * n)) / denom;
+  final half = (z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)) / denom;
+  return (lo: 100.0 * (center - half), hi: 100.0 * (center + half));
+}
+
 _EvalChunkResult _evalChunk({
   required int episodes,
   required int seed,
@@ -275,11 +286,19 @@ _EvalChunkResult _evalChunk({
   required PolicyNetwork policyClone,
   required List<int> hidden,
   required et.EngineConfig cfg,
+  // NEW: to match training/runtime exactly
+  required int planHold,
+  required double blendPolicy,
+  required double tempIntent,
+  required double intentEntropy,
+  required bool evalDebug,
+  required int evalDebugFailN,
 }) {
   // Local env + FE + trainer referencing the cloned policy
   final env = eng.GameEngine(cfg);
   env.rayCfg = const RayConfig(rayCount: 180, includeFloor: false, forwardAligned: true);
   final fe = FeatureExtractorRays(rayCount: env.rayCfg.rayCount);
+
   final trainer = Trainer(
     env: env,
     fe: fe,
@@ -288,11 +307,11 @@ _EvalChunkResult _evalChunk({
     gamma: 0.99,
     seed: seed,
     twoStage: true,
-    planHold: 1,
-    tempIntent: 1.0,
-    intentEntropyBeta: 0.0,
+    planHold: planHold,
+    tempIntent: tempIntent,
+    intentEntropyBeta: intentEntropy,
     useLearnedController: false,
-    blendPolicy: 1.0,
+    blendPolicy: blendPolicy,
     intentAlignWeight: 0.0,
     intentPgWeight: 0.0,
     actionAlignWeight: 0.0,
@@ -303,6 +322,17 @@ _EvalChunkResult _evalChunk({
     externalRewardHook: null,
   );
 
+  // One-time debug header per worker
+  if (evalDebug) {
+    final t = env.cfg.t;
+    print('[EVAL DBG] worker seed=$seed '
+        '| planHold=$planHold blendPolicy=$blendPolicy tempIntent=$tempIntent intentEntropy=$intentEntropy '
+        '| rays=${env.rayCfg.rayCount}, fwdAligned=${env.rayCfg.forwardAligned}, includeFloor=${env.rayCfg.includeFloor} '
+        '| physics{g=${t.gravity}, thrust=${t.thrustAccel}, rot=${t.rotSpeed}, rcs=${t.rcsEnabled}/${t.rcsAccel}, down=${t.downThrEnabled}/${t.downThrAccel}} '
+        '| landLimits{vx=${t.landingMaxVx}, vy=${t.landingMaxVy}, omg=${t.landingMaxOmega}} '
+        '| world=${env.cfg.worldW}x${env.cfg.worldH}');
+  }
+
   final rnd = math.Random(seed);
   final costs = <double>[];
   int landed = 0, crashed = 0, stepsSum = 0;
@@ -310,6 +340,8 @@ _EvalChunkResult _evalChunk({
 
   int terrAttempts = 0;
   int currentTerrainSeed = rnd.nextInt(1 << 30);
+
+  int printedFails = 0;
 
   for (int i = 0; i < episodes; i++) {
     if (terrAttempts == 0) {
@@ -321,7 +353,25 @@ _EvalChunkResult _evalChunk({
 
     costs.add(res.totalCost);
     stepsSum += res.steps;
-    if (env.status == et.GameStatus.landed) landed++; else crashed++;
+
+    final ok = (env.status == et.GameStatus.landed);
+    if (ok) {
+      landed++;
+    } else {
+      crashed++;
+      if (evalDebug && printedFails < evalDebugFailN) {
+        final L = env.lander;
+        final T = env.terrain;
+        final gx = T.heightAt(L.pos.x.toDouble());
+        final h  = (gx - L.pos.y).toDouble();
+        print('[EVAL DBG FAIL] ep=$i terrSeed=$currentTerrainSeed '
+            'status=${env.status} x=${L.pos.x.toStringAsFixed(1)} y=${L.pos.y.toStringAsFixed(1)} '
+            'h=${h.toStringAsFixed(1)} vx=${L.vel.x.toStringAsFixed(1)} vy=${L.vel.y.toStringAsFixed(1)} '
+            'fuel=${L.fuel.toStringAsFixed(1)} '
+            'padCx=${T.padCenter.toStringAsFixed(1)} | cost=${res.totalCost.toStringAsFixed(3)} steps=${res.steps}');
+        printedFails++;
+      }
+    }
     final padCx = env.terrain.padCenter;
     absDxSum += (env.lander.pos.x - padCx).abs();
   }
@@ -337,10 +387,17 @@ Future<EvalStats> evaluateParallel({
   required int attemptsPerTerrain,
   required int seed,
   required int workers,
+  // match training/runtime
+  required int planHold,
+  required double blendPolicy,
+  required double tempIntent,
+  required double intentEntropy,
+  // debug
+  required bool evalDebug,
+  required int evalDebugFailN,
 }) async {
   final sw = Stopwatch()..start();
 
-  // even split
   final per = episodes ~/ workers;
   final extra = episodes % workers;
 
@@ -368,25 +425,35 @@ Future<EvalStats> evaluateParallel({
     return cp;
   }
 
-  // spin isolates with Isolate.run (simple API)
   final futures = <Future<_EvalChunkResult>>[];
   for (int w = 0; w < workers; w++) {
     final nThis = per + (w < extra ? 1 : 0);
     if (nThis == 0) continue;
 
-    // freeze a clone for this isolate
     final pClone = _clonePolicy(policy);
-    final seedW = seed ^ (0xBEEF << w);
+    final seedW = seed ^ (0xBEEF << (w & 15));
 
     futures.add(Isolate.run(() {
-      return _evalChunk(
-        episodes: nThis,
-        seed: seedW,
-        attemptsPerTerrain: attemptsPerTerrain,
-        policyClone: pClone,
-        hidden: hidden,
-        cfg: cfg,
-      );
+      try {
+        return _evalChunk(
+          episodes: nThis,
+          seed: seedW,
+          attemptsPerTerrain: attemptsPerTerrain,
+          policyClone: pClone,
+          hidden: hidden,
+          cfg: cfg,
+          planHold: planHold,
+          blendPolicy: blendPolicy,
+          tempIntent: tempIntent,
+          intentEntropy: intentEntropy,
+          evalDebug: evalDebug,
+          evalDebugFailN: evalDebugFailN,
+        );
+      } catch (e, st) {
+        // Bubble up as an empty chunk but print a clear message
+        stderr.writeln('[EVAL WORKER ERROR] $e\n$st');
+        return _EvalChunkResult(const [], 0, 0, 0, 0.0);
+      }
     }));
   }
 
@@ -418,9 +485,11 @@ Future<EvalStats> evaluateParallel({
   sw.stop();
   final ms = sw.elapsedMilliseconds;
   final eps = total == 0 ? 0 : (1000.0 * total / math.max(1, ms));
+  final ci = _wilson95(landed, math.max(1, total));
 
   print('Eval: N=$episodes | workers=$workers | ${ms} ms | ${eps.toStringAsFixed(1)} eps/s '
-      '| land%=${st.landPct.toStringAsFixed(1)} | meanCost=${st.meanCost.toStringAsFixed(3)} '
+      '| land%=${st.landPct.toStringAsFixed(1)} (CI ${ci.lo.toStringAsFixed(1)}–${ci.hi.toStringAsFixed(1)}) '
+      '| meanCost=${st.meanCost.toStringAsFixed(3)} '
       '| median=${st.medianCost.toStringAsFixed(3)} | steps=${st.meanSteps.toStringAsFixed(1)} '
       '| mean|dx|=${st.meanAbsDx.toStringAsFixed(1)}');
 
@@ -433,8 +502,17 @@ EvalStats evaluateSequential({
   int episodes = 40,
   int seed = 123,
   int attemptsPerTerrain = 1,
+  bool evalDebug = false,
+  int evalDebugFailN = 3,
 }) {
   final sw = Stopwatch()..start();
+
+  if (evalDebug) {
+    final t = env.cfg.t;
+    print('[EVAL DBG] SEQ world=${env.cfg.worldW}x${env.cfg.worldH} rays=${env.rayCfg.rayCount} '
+        '| physics{g=${t.gravity}, thrust=${t.thrustAccel}, rot=${t.rotSpeed}, rcs=${t.rcsEnabled}/${t.rcsAccel}, down=${t.downThrEnabled}/${t.downThrAccel}} '
+        '| landLimits{vx=${t.landingMaxVx}, vy=${t.landingMaxVy}, omg=${t.landingMaxOmega}}');
+  }
 
   final rnd = math.Random(seed);
   final costs = <double>[];
@@ -443,6 +521,8 @@ EvalStats evaluateSequential({
 
   int terrAttempts = 0;
   int currentTerrainSeed = rnd.nextInt(1 << 30);
+
+  int printedFails = 0;
 
   for (int i = 0; i < episodes; i++) {
     if (terrAttempts == 0) {
@@ -464,6 +544,18 @@ EvalStats evaluateSequential({
       landed++;
     } else {
       crashed++;
+      if (evalDebug && printedFails < evalDebugFailN) {
+        final L = env.lander;
+        final T = env.terrain;
+        final gx = T.heightAt(L.pos.x.toDouble());
+        final h  = (gx - L.pos.y).toDouble();
+        print('[EVAL DBG FAIL] ep=$i terrSeed=$currentTerrainSeed '
+            'status=${env.status} x=${L.pos.x.toStringAsFixed(1)} y=${L.pos.y.toStringAsFixed(1)} '
+            'h=${h.toStringAsFixed(1)} vx=${L.vel.x.toStringAsFixed(1)} vy=${L.vel.y.toStringAsFixed(1)} '
+            'fuel=${L.fuel.toStringAsFixed(1)} '
+            'padCx=${T.padCenter.toStringAsFixed(1)} | cost=${res.totalCost.toStringAsFixed(3)} steps=${res.steps}');
+        printedFails++;
+      }
     }
     final padCx = env.terrain.padCenter;
     absDxSum += (env.lander.pos.x - padCx).abs();
@@ -481,9 +573,11 @@ EvalStats evaluateSequential({
   sw.stop();
   final ms = sw.elapsedMilliseconds;
   final eps = (1000.0 * episodes / math.max(1, ms));
+  final ci = _wilson95(landed, episodes);
 
   print('Eval: N=$episodes | workers=1 | ${ms} ms | ${eps.toStringAsFixed(1)} eps/s '
-      '| land%=${st.landPct.toStringAsFixed(1)} | meanCost=${st.meanCost.toStringAsFixed(3)} '
+      '| land%=${st.landPct.toStringAsFixed(1)} (CI ${ci.lo.toStringAsFixed(1)}–${ci.hi.toStringAsFixed(1)}) '
+      '| meanCost=${st.meanCost.toStringAsFixed(3)} '
       '| median=${st.medianCost.toStringAsFixed(3)} | steps=${st.meanSteps.toStringAsFixed(1)} '
       '| mean|dx|=${st.meanAbsDx.toStringAsFixed(1)}');
 
@@ -655,11 +749,15 @@ ai.ExternalRewardHook makePFRewardHook({
     final prox = (px_ * ph_).clamp(0.0, 1.0);
 
     // Alignment
-    final flow = pf.sampleFlow(x, y);
+    var flow = pf.sampleFlow(x, y);
     final vmag = math.sqrt(vx*vx + vy*vy);
     double align = 0.0;
     if (vmag > 1e-6) {
       align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny;
+    }
+
+    if (prox > 0.65 && flow.fy < 0.0) {
+      flow = (fx: flow.fx, fy: 0.0, nx: flow.nx, ny: 0.0, mag: flow.mag);
     }
 
     // Base PF suggestion
@@ -672,8 +770,8 @@ ai.ExternalRewardHook makePFRewardHook({
     );
 
     // Final-approach flare
-    final flareLat = (1.0 - 0.90 * prox);
-    final flareVer = (1.0 - 0.70 * prox);
+    final flareLat = (1.0 - 0.70 * prox);
+    final flareVer = (1.0 - 0.45 * prox);
     final magNow = math.sqrt(sugg.vx*sugg.vx + sugg.vy*sugg.vy) + 1e-9;
     sugg = (vx: sugg.vx * flareLat, vy: sugg.vy * flareVer);
 
@@ -739,14 +837,16 @@ ai.ExternalRewardHook makePFRewardHook({
     final dvy = (vy - sugg.vy) * wVer;
     final vErr = math.sqrt(dvx*dvx + dvy*dvy) / cfg.vmax;
 
-    final wVelEff = cfg.wVelDelta * (1.0 + cfg.velPenaltyBoost * prox2) * wallBoost;
+    final wVelEff = cfg.wVelDelta * (1.0 + 0.6 * cfg.velPenaltyBoost * prox2) * wallBoost;
     final wAlignEff = cfg.wAlign * (1.0 + cfg.alignBoost * prox);
 
-    // touchdown speed bonus
-    final speed = vmag;
+    // touchdown speed bonus (gated)
     final touchTarget = cfg.vMinTouchdown.clamp(0.5, 15.0);
-    final touchWeight = 6.0;
-    final touchBonus = touchWeight * prox2 * (touchTarget - speed) / (touchTarget + 1e-6);
+    const double touchWeight = 3.0;
+    final bool inTouchBand = (h < 90.0) && (dxAbs < 0.12 * W);
+    final double touchBonus = inTouchBand
+        ? touchWeight * (touchTarget - vmag) / (touchTarget + 1e-6)
+        : 0.0;
 
     final r = wAlignEff * align + touchBonus - wVelEff * vErr;
     return r;
@@ -814,12 +914,14 @@ void main(List<String> argv) async {
   final pfVmax = args.getDouble('pf_vmax', def: 140.0);
   final pfXBias = args.getDouble('pf_x_bias', def: 3.0);
 
-  // attempts per terrain + eval cadence/size + parallel
+  // attempts per terrain + eval cadence/size + parallel + debug
   final attemptsPerTerrain = _iclamp(args.getInt('attempts_per_terrain', def: 1), 1, 1000000);
   final evalEvery = _iclamp(args.getInt('eval_every', def: 10), 1, 1000000);
   final evalEpisodes = _iclamp(args.getInt('eval_episodes', def: 80), 1, 1000000);
   final evalParallel = args.getFlag('eval_parallel', def: false);
   final evalWorkers = _iclamp(args.getInt('eval_workers', def: Platform.numberOfProcessors), 1, 512);
+  final evalDebug = args.getFlag('eval_debug', def: false);
+  final evalDebugFailN = _iclamp(args.getInt('eval_debug_fail', def: 3), 0, 1000);
 
   final determinism = args.getFlag('determinism_probe', def: true);
   final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
@@ -933,7 +1035,7 @@ void main(List<String> argv) async {
     seed: seed ^ 0xACE,
   );
 
-  // ===== Baseline eval (now honors --eval_episodes exactly) =====
+  // ===== Baseline eval (honors --eval_episodes exactly) =====
       {
     if (evalParallel) {
       await evaluateParallel(
@@ -944,6 +1046,12 @@ void main(List<String> argv) async {
         attemptsPerTerrain: attemptsPerTerrain,
         seed: seed ^ 0x999,
         workers: evalWorkers,
+        planHold: planHold,
+        blendPolicy: blendPolicy,
+        tempIntent: tempIntent,
+        intentEntropy: intentEntropy,
+        evalDebug: evalDebug,
+        evalDebugFailN: evalDebugFailN,
       );
     } else {
       evaluateSequential(
@@ -952,6 +1060,8 @@ void main(List<String> argv) async {
         episodes: evalEpisodes,
         seed: seed ^ 0x999,
         attemptsPerTerrain: attemptsPerTerrain,
+        evalDebug: evalDebug,
+        evalDebugFailN: evalDebugFailN,
       );
     }
   }
@@ -1011,6 +1121,12 @@ void main(List<String> argv) async {
           attemptsPerTerrain: attemptsPerTerrain,
           seed: seed ^ (0x1111 * (it + 1)),
           workers: evalWorkers,
+          planHold: planHold,
+          blendPolicy: blendPolicy,
+          tempIntent: tempIntent,
+          intentEntropy: intentEntropy,
+          evalDebug: evalDebug,
+          evalDebugFailN: evalDebugFailN,
         );
       } else {
         ev = evaluateSequential(
@@ -1019,6 +1135,8 @@ void main(List<String> argv) async {
           episodes: evalEpisodes,
           seed: seed ^ (0x1111 * (it + 1)),
           attemptsPerTerrain: attemptsPerTerrain,
+          evalDebug: evalDebug,
+          evalDebugFailN: evalDebugFailN,
         );
       }
 
@@ -1066,11 +1184,16 @@ Examples:
     --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 \
     --blend_policy=1.0 --intent_align=0.25 --intent_pg=0.6 \
     --gate_min=0.0 --gate_landed \
-    --eval_every=20 --eval_episodes=120 --eval_parallel --eval_workers=20
+    --eval_every=20 --eval_episodes=120 \
+    --eval_parallel --eval_workers=20 \
+    --eval_debug --eval_debug_fail=3
 
 Notes:
 - `--eval_episodes` is honored for both the baseline and periodic evals.
 - When `--eval_parallel` is set, the program prints eval runtime and eps/s,
   and uses `--eval_workers` (default = CPU cores). Each worker runs its own
   env/feature-extractor/trainer with a cloned, read-only policy.
+- `--eval_debug` prints physics/rays/limits at eval start, and logs the first
+  N failed episodes (`--eval_debug_fail=N`) with final kinematics to diagnose
+  “lands live, 0% in eval” mismatches.
 ------------------------------------------------------------------------------ */
