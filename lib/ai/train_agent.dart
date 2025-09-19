@@ -296,7 +296,7 @@ _EvalChunkResult _evalChunk({
 }) {
   // Local env + FE + trainer referencing the cloned policy
   final env = eng.GameEngine(cfg);
-  env.rayCfg = const RayConfig(rayCount: 180, includeFloor: false, forwardAligned: true);
+  env.rayCfg = const RayConfig(rayCount: 180, includeFloor: false, forwardAligned: false);
   final fe = FeatureExtractorRays(rayCount: env.rayCfg.rayCount);
 
   final trainer = Trainer(
@@ -674,36 +674,35 @@ void _warmFeatureNorm({
   print('Feature norm warmed with $accepted synthetic samples.');
 }
 
-/* ----------------------------- PF velocity-only reward ------------------------- */
+/* ----------------------------- PF velocity+accel reward ------------------------ */
 
 class PFShapingCfg {
-  // base weights
+  // --- Velocity shaping ---
   final double wAlign;       // reward per unit cos(v, flow)
-  final double wVelDelta;    // base penalty for ||v - v_pf|| / vmax
-
-  // distance-shaped target-speed parameters
-  final double vMinClose;    // far-to-near baseline (will get tapered further near pad)
+  final double wVelDelta;    // penalty for ||v - v_pf|| / vmax
+  final double vMinClose;
   final double vMaxFar;
-  final double alpha;        // taper sharpness
-
-  // scaling + norms
-  final double vmax;         // normalization for velocity error
-
-  // near-pad emphasis
-  final double padTightFrac; // fraction of worldW
-  final double hTight;       // px
-  final double latBoost;     // lateral weight boost near pad
+  final double alpha;
+  final double vmax;
+  final double padTightFrac;
+  final double hTight;
+  final double latBoost;
   final double velPenaltyBoost;
   final double alignBoost;
   final double vMinTouchdown;
-
-  // feasibility clamp
   final double feasiness;
-
-  // stronger X weighting overall
   final double xBias;
 
+  // --- Acceleration (Δv) matching to feasible PF Δv ---
+  final double wAccAlign;    // reward for cos(dv_actual, dv_pf)
+  final double wAccErr;      // penalty for ||dv_actual - dv_pf|| / dv_pf_cap
+  final double accEma;       // EMA smoothing for dv_actual (helps noisy policies)
+
+  // Debug
+  final bool debug;
+
   const PFShapingCfg({
+    // velocity
     this.wAlign = 1.0,
     this.wVelDelta = 0.6,
     this.vMinClose = 8.0,
@@ -718,6 +717,12 @@ class PFShapingCfg {
     this.vMinTouchdown = 2.0,
     this.feasiness = 0.75,
     this.xBias = 3.0,
+    // acceleration
+    this.wAccAlign = 2.0,
+    this.wAccErr = 1.0,
+    this.accEma = 0.2,
+    // debug
+    this.debug = false,
   });
 }
 
@@ -729,6 +734,16 @@ ai.ExternalRewardHook makePFRewardHook({
 
   // Effective max linear accel per real second
   final double aMax = env.cfg.t.thrustAccel * 0.05 * env.cfg.stepScale; // px/s^2
+
+  // --- Keep previous velocity to measure actual Δv ---
+  double? prevVx, prevVy;
+  double smDvX = 0.0, smDvY = 0.0; // EMA-smoothed dv (for stability)
+
+  // Debug accumulators (persist across steps within an episode)
+  int dbgN = 0;
+  double sumAbsDVpfX = 0, sumAbsDVpfY = 0;
+  double sumWLat = 0, sumWVer = 0;
+  double sumAlignAbs = 0, sumVelPen = 0;
 
   return ({required eng.GameEngine env, required double dt, required int tStep}) {
     final x = env.lander.pos.x.toDouble();
@@ -748,7 +763,7 @@ ai.ExternalRewardHook makePFRewardHook({
     final ph_ = math.exp(- (h*h)       / (cfg.hTight*cfg.hTight + 1e-6));
     final prox = (px_ * ph_).clamp(0.0, 1.0);
 
-    // Alignment
+    // Alignment to PF flow (directional)
     var flow = pf.sampleFlow(x, y);
     final vmag = math.sqrt(vx*vx + vy*vy);
     double align = 0.0;
@@ -756,11 +771,12 @@ ai.ExternalRewardHook makePFRewardHook({
       align = (vx / vmag) * flow.nx + (vy / vmag) * flow.ny;
     }
 
+    // Kill-down near pad
     if (prox > 0.65 && flow.fy < 0.0) {
       flow = (fx: flow.fx, fy: 0.0, nx: flow.nx, ny: 0.0, mag: flow.mag);
     }
 
-    // Base PF suggestion
+    // Base PF target velocity (before feasibility clamp)
     var sugg = pf.suggestVelocity(
       x, y,
       vMinClose: cfg.vMinClose,
@@ -769,7 +785,7 @@ ai.ExternalRewardHook makePFRewardHook({
       clampSpeed: 9999.0,
     );
 
-    // Final-approach flare
+    // Flare toward touchdown
     final flareLat = (1.0 - 0.70 * prox);
     final flareVer = (1.0 - 0.45 * prox);
     final magNow = math.sqrt(sugg.vx*sugg.vx + sugg.vy*sugg.vy) + 1e-9;
@@ -780,18 +796,23 @@ ai.ExternalRewardHook makePFRewardHook({
     final kMag = (magTarget / magNew).clamp(0.0, 1.0);
     sugg = (vx: sugg.vx * kMag, vy: sugg.vy * kMag);
 
-    // Feasibility clamp
-    final dv_pf_x = sugg.vx - vx;
-    final dv_pf_y = sugg.vy - vy;
-    final dv_pf_mag = math.sqrt(dv_pf_x*dv_pf_x + dv_pf_y*dv_pf_y);
+    // --- Feasibility clamp (defines the *desired Δv* we want to match) ---
+    final dv_pf_x_raw = sugg.vx - vx;
+    final dv_pf_y_raw = sugg.vy - vy;
+    final dv_pf_mag_raw = math.sqrt(dv_pf_x_raw*dv_pf_x_raw + dv_pf_y_raw*dv_pf_y_raw);
+
     final dv_pf_cap = (aMax * dt * cfg.feasiness).clamp(0.0, 1e9);
-    if (dv_pf_mag > dv_pf_cap && dv_pf_mag > 1e-9) {
-      final s = dv_pf_cap / dv_pf_mag;
-      sugg = (vx: vx + dv_pf_x * s, vy: vy + dv_pf_y * s);
+    double dv_pf_x = dv_pf_x_raw, dv_pf_y = dv_pf_y_raw;
+    if (dv_pf_mag_raw > dv_pf_cap && dv_pf_mag_raw > 1e-9) {
+      final s = dv_pf_cap / dv_pf_mag_raw;
+      dv_pf_x *= s;
+      dv_pf_y *= s;
+      // And update "feasible" target velocity accordingly:
+      sugg = (vx: vx + dv_pf_x, vy: vy + dv_pf_y);
     }
 
-    // Border avoidance
-    final wallTau = 1.2;
+    // --- Border avoidance (X walls) ---
+    final wallTau = 5.0;
     final wallMarginFrac = 0.22;
     final wallBlendMax = 0.80;
     final wallVInward = 0.90;
@@ -826,29 +847,104 @@ ai.ExternalRewardHook makePFRewardHook({
     vy: sugg.vy * (1.0 - 0.35 * borderProx)
     );
 
+    // --- Ceiling avoidance (speed-aware) ---
+    final double Hworld = env.cfg.worldH.toDouble();
+    final double distTop = y;
+    final double baseBandY = 0.35 * Hworld;
+    final double tauY = 5.0;
+    final double vyTowardTop = (-vy).clamp(0.0, double.infinity);
+    final double warnTop = baseBandY + tauY * vyTowardTop;
+    double proxTop = 1.0 - (distTop / (warnTop + 1e-6)).clamp(0.0, 1.0);
+    if (vy > 0) proxTop *= 0.6;
+    final double gammaY = 1.5;
+    final double blendTop = 0.75 * math.pow(proxTop, gammaY);
+    final double vDownward = (70.0 + 1.0 * vyTowardTop).clamp(40.0, 220.0);
+
+    sugg = (
+    vx: sugg.vx * (1.0 - 0.15 * proxTop),
+    vy: (1.0 - blendTop) * sugg.vy + blendTop * vDownward
+    );
+
+    final double wallBoostY = 1.0 + 2.5 * proxTop;
     final wallBoost = 1.0 + wallVelPenalty * borderProx;
 
-    // Stronger X weighting near pad
+    // --- Velocity error term (with X bias near pad) ---
     final prox2 = prox * prox;
     final wLat = (cfg.xBias) * (1.0 + cfg.latBoost * prox2);
     final wVer = 1.0 * (1.0 + 0.7 * cfg.latBoost * prox2);
 
-    final dvx = (vx - sugg.vx) * wLat;
-    final dvy = (vy - sugg.vy) * wVer;
-    final vErr = math.sqrt(dvx*dvx + dvy*dvy) / cfg.vmax;
+    final dvx_vel = (vx - sugg.vx) * wLat;
+    final dvy_vel = (vy - sugg.vy) * wVer;
+    final vErr = math.sqrt(dvx_vel*dvx_vel + dvy_vel*dvy_vel) / cfg.vmax;
 
-    final wVelEff = cfg.wVelDelta * (1.0 + 0.6 * cfg.velPenaltyBoost * prox2) * wallBoost;
+    final wVelEff = cfg.wVelDelta
+        * (1.0 + 0.6 * cfg.velPenaltyBoost * prox2)
+        * wallBoost
+        * wallBoostY;
     final wAlignEff = cfg.wAlign * (1.0 + cfg.alignBoost * prox);
 
-    // touchdown speed bonus (gated)
+    // Touchdown bonus (gated)
     final touchTarget = cfg.vMinTouchdown.clamp(0.5, 15.0);
     const double touchWeight = 3.0;
     final bool inTouchBand = (h < 90.0) && (dxAbs < 0.12 * W);
+    final double vmagNow = math.sqrt(vx*vx + vy*vy) + 1e-9;
     final double touchBonus = inTouchBand
-        ? touchWeight * (touchTarget - vmag) / (touchTarget + 1e-6)
+        ? touchWeight * (touchTarget - vmagNow) / (touchTarget + 1e-6)
         : 0.0;
 
-    final r = wAlignEff * align + touchBonus - wVelEff * vErr;
+    // --- Acceleration (Δv) matching ---
+    double rAcc = 0.0;
+    if (prevVx != null && prevVy != null && dt > 0) {
+      // Actual dv in this step
+      double dvx_act = (vx - prevVx!);
+      double dvy_act = (vy - prevVy!);
+
+      // Smooth it (EMA) to reduce jitter
+      smDvX = cfg.accEma * dvx_act + (1.0 - cfg.accEma) * smDvX;
+      smDvY = cfg.accEma * dvy_act + (1.0 - cfg.accEma) * smDvY;
+
+      final dv_pf_mag = math.sqrt(dv_pf_x*dv_pf_x + dv_pf_y*dv_pf_y) + 1e-12;
+      final dv_act_mag = math.sqrt(smDvX*smDvX + smDvY*smDvY) + 1e-12;
+
+      // Cosine alignment of Δv vectors
+      final cosAcc = ((smDvX * dv_pf_x) + (smDvY * dv_pf_y)) / (dv_pf_mag * dv_act_mag);
+      final accAlign = cosAcc.clamp(-1.0, 1.0);
+
+      // Magnitude mismatch normalized to feasible cap
+      final errX = (smDvX - dv_pf_x);
+      final errY = (smDvY - dv_pf_y);
+      final accErr = (math.sqrt(errX*errX + errY*errY) / (dv_pf_cap + 1e-9)).clamp(0.0, 5.0);
+
+      rAcc = cfg.wAccAlign * accAlign - cfg.wAccErr * accErr;
+    }
+
+    // Update previous v for next step
+    prevVx = vx; prevVy = vy;
+
+    // Optional PF debug (prints once per ~240 frames)
+    if (cfg.debug) {
+      sumAbsDVpfX += dv_pf_x.abs();
+      sumAbsDVpfY += dv_pf_y.abs();
+      sumWLat += wLat;
+      sumWVer += wVer;
+      sumVelPen += (wVelEff * vErr);
+      sumAlignAbs += wAlignEff * align.abs();
+
+      dbgN++;
+      if ((dbgN % 240) == 0) {
+        final mX = (sumAbsDVpfX / dbgN).toStringAsFixed(2);
+        final mY = (sumAbsDVpfY / dbgN).toStringAsFixed(2);
+        final mWL = (sumWLat / dbgN).toStringAsFixed(2);
+        final mWV = (sumWVer / dbgN).toStringAsFixed(2);
+        final mVel = (sumVelPen / dbgN).toStringAsFixed(3);
+        final mAli = (sumAlignAbs / dbgN).toStringAsFixed(3);
+        print('[PFDBG] frames=$dbgN | mean|dv_pf_x|=$mX mean|dv_pf_y|=$mY '
+            '| mean wLat=$mWL wVer=$mWV | velPen=$mVel align=$mAli');
+      }
+    }
+
+    // Total reward
+    final r = wAlignEff * align + touchBonus - wVelEff * vErr + rAcc;
     return r;
   };
 }
@@ -905,7 +1001,7 @@ void main(List<String> argv) async {
   final downThrAccel = args.getDouble('down_thr_accel', def: 0.30);
   final downThrBurn = args.getDouble('down_thr_burn', def: 10.0);
 
-  // PF velocity-only reward CLI knobs
+  // PF reward CLI knobs
   final pfAlign = args.getDouble('pf_align', def: 1.0);
   final pfVelDelta = args.getDouble('pf_vel_delta', def: 0.6);
   final pfVminClose = args.getDouble('pf_vmin_close', def: 8.0);
@@ -913,6 +1009,11 @@ void main(List<String> argv) async {
   final pfAlpha = args.getDouble('pf_alpha', def: 1.2);
   final pfVmax = args.getDouble('pf_vmax', def: 140.0);
   final pfXBias = args.getDouble('pf_x_bias', def: 3.0);
+  // NEW accel/diagnostics knobs
+  final pfAccAlign = args.getDouble('pf_acc_align', def: 2.0);
+  final pfAccErr   = args.getDouble('pf_acc_err',   def: 1.0);
+  final pfAccEma   = args.getDouble('pf_acc_ema',   def: 0.2);
+  final pfDebug    = args.getFlag('pf_debug',       def: false);
 
   // attempts per terrain + eval cadence/size + parallel + debug
   final attemptsPerTerrain = _iclamp(args.getInt('attempts_per_terrain', def: 1), 1, 1000000);
@@ -960,7 +1061,7 @@ void main(List<String> argv) async {
   env.rayCfg = const RayConfig(
     rayCount: 180,
     includeFloor: false,
-    forwardAligned: true,
+    forwardAligned: false,
   );
 
   // FE probe
@@ -974,7 +1075,7 @@ void main(List<String> argv) async {
   final policy = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
   print('Loaded init policy. hidden=${policy.hidden} | FE(kind=rays, in=$inDim, rays=${env.rayCfg.rayCount}, oneHot=$kindsOneHot)');
 
-  // ===== PF velocity-only reward hook (rebuilt per episode) =====
+  // ===== PF reward hook (rebuilt per episode) =====
   PFShapingCfg pfCfg = PFShapingCfg(
     wAlign: pfAlign,
     wVelDelta: pfVelDelta,
@@ -983,6 +1084,10 @@ void main(List<String> argv) async {
     alpha: pfAlpha,
     vmax: pfVmax,
     xBias: pfXBias,
+    wAccAlign: pfAccAlign,
+    wAccErr: pfAccErr,
+    accEma: pfAccEma,
+    debug: pfDebug,
   );
   ai.ExternalRewardHook? pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
@@ -1004,12 +1109,12 @@ void main(List<String> argv) async {
     intentPgWeight: intentPgWeight,
     actionAlignWeight: actionAlignWeight,
     normalizeFeatures: true,
-    // gating inside trainer (prints [TRAIN] lines)
+    // gating inside trainer (prints [TRAIN] lines if you re-enable in agent.dart)
     gateScoreMin: gateScoreMin,
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
 
-    // add dense PF reward per step (velocity-only)
+    // add dense PF reward per step
     externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
       return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
     }),
@@ -1078,6 +1183,7 @@ void main(List<String> argv) async {
     double lastCost = 0.0;
     int lastSteps = 0;
     bool lastLanded = false;
+    double lastSegMean = 0.0;
 
     for (int b = 0; b < batch; b++) {
       // Pick a new terrain seed when starting a new group
@@ -1107,6 +1213,12 @@ void main(List<String> argv) async {
       lastCost = res.totalCost;
       lastSteps = res.steps;
       lastLanded = res.landed;
+      lastSegMean = res.segMean;
+    }
+
+    if (gateVerbose && ((it + 1) % 10 == 0)) {
+      final tag = lastLanded ? 'L' : 'NL';
+      print('[TRAIN] iter=${it + 1} | segMean=${lastSegMean.toStringAsFixed(3)} | steps=$lastSteps | landed=$tag');
     }
 
     // periodic eval + save (driven by CLI)
@@ -1186,14 +1298,13 @@ Examples:
     --gate_min=0.0 --gate_landed \
     --eval_every=20 --eval_episodes=120 \
     --eval_parallel --eval_workers=20 \
-    --eval_debug --eval_debug_fail=3
+    --eval_debug --eval_debug_fail=3 \
+    --pf_acc_align=2.0 --pf_acc_err=1.0 --pf_acc_ema=0.2 --pf_debug
 
 Notes:
 - `--eval_episodes` is honored for both the baseline and periodic evals.
 - When `--eval_parallel` is set, the program prints eval runtime and eps/s,
   and uses `--eval_workers` (default = CPU cores). Each worker runs its own
   env/feature-extractor/trainer with a cloned, read-only policy.
-- `--eval_debug` prints physics/rays/limits at eval start, and logs the first
-  N failed episodes (`--eval_debug_fail=N`) with final kinematics to diagnose
-  “lands live, 0% in eval” mismatches.
+- `--pf_debug` prints PF diagnostics about lateral vs vertical targets (safe to leave off).
 ------------------------------------------------------------------------------ */

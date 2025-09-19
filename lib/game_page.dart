@@ -150,7 +150,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _engine!.rayCfg = const RayConfig(
         rayCount: 180,
         includeFloor: false,
-        forwardAligned: true,
+        forwardAligned: false,
       );
 
       final p = _policy;

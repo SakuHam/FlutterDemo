@@ -19,7 +19,7 @@ class RayConfig {
   const RayConfig({
     this.rayCount = 180,
     this.includeFloor = false,
-    this.forwardAligned = true,
+    this.forwardAligned = false,
   });
 
   RayConfig copyWith({int? rayCount, bool? includeFloor, bool? forwardAligned}) => RayConfig(

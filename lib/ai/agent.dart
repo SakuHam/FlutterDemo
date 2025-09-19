@@ -270,7 +270,7 @@ int predictiveIntentLabelAdaptive(
   return intentToIndex(Intent.descendSlow);
 }
 
-bool _canStrafe(eng.GameEngine env, {double maxTilt = 0.10, double minH = 110.0, double maxVy = 35.0}) {
+bool _canStrafe(eng.GameEngine env, {double minH = 110.0, double maxVy = 35.0}) {
   final t = env.cfg.t;
   final hasRcs = (t as dynamic);
   final enabled = (hasRcs as dynamic).rcsEnabled ?? false;
@@ -279,10 +279,38 @@ bool _canStrafe(eng.GameEngine env, {double maxTilt = 0.10, double minH = 110.0,
   final L = env.lander;
   final gy = env.terrain.heightAt(L.pos.x);
   final h  = (gy - L.pos.y).toDouble();
+
   if (h <= minH) return false;
   if (L.vel.y.abs() >= maxVy) return false;
-  if (L.angle.abs() > maxTilt) return false;
+
+  // NOTE: no angle/tilt constraint here — strafing is allowed at any tilt.
   return true;
+}
+
+// --- helpers: smooth vertical caps + short-term lookahead --------------------
+double _vCapHover(double h)  => (0.06 * h + 6.0).clamp(6.0, 18.0);
+double _vCapDesc(double h)   => (0.10 * h + 8.0).clamp(8.0, 26.0);
+double _vCapBrakeUp(double h)=> (0.07 * h + 6.0).clamp(6.0, 16.0);
+
+/// Predict near-future vertical speed (px/s) after tauReact without thrust.
+double _vyPredictNoThrust(eng.GameEngine env, {double tauReact = 0.35}) {
+  final vy = env.lander.vel.y.toDouble();
+  final g  = env.cfg.t.gravity;
+  return vy + g * tauReact;
+}
+
+/// Should we pre-boost now to avoid exceeding cap soon?
+bool _needPreBoost({
+  required double vCap,
+  required eng.GameEngine env,
+  double warnFrac = 0.85,      // trigger before cap at 80% of vCap
+  double tauReact = 1.0,      // seconds of look-ahead
+  double extraPad = 2.5,       // px/s extra safety margin
+}) {
+  final vyNow   = env.lander.vel.y.toDouble();
+  final vyNext  = _vyPredictNoThrust(env, tauReact: tauReact);
+  final vWarn   = vCap * warnFrac;
+  return (vyNow > vWarn - extraPad) || (vyNext > vWarn);
 }
 
 et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
@@ -290,16 +318,24 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final T = env.terrain;
   final px = L.pos.x.toDouble();
   final gy = T.heightAt(px);
-  final h  = (gy - L.pos.y).toDouble();
+  final h  = (gy - L.pos.y).toDouble().clamp(0.0, 1e9);
   final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
 
   bool rcsLeft = false, rcsRight = false;
 
+  // Generic altitude-hold helper used by many intents
+  bool _altHold() {
+    // Make the descent cap a bit stricter near ground
+    final vCapSoft = math.min(_vCapDesc(h), (0.085 * h + 9.0).clamp(8.0, 22.0));
+    return _needPreBoost(vCap: vCapSoft, env: env, warnFrac: 0.80, tauReact: 1.35, extraPad: 2.0);
+  }
+
   switch (intent) {
     case Intent.brakeUp: {
-      final vCap = (0.07 * h + 6.0).clamp(6.0, 16.0);
-      final needUp = vy > vCap;
+      // Strong emergency gate, but react earlier with look-ahead
+      final vCap = _vCapBrakeUp(h);
+      final needUp = vy > vCap || _needPreBoost(vCap: vCap, env: env, warnFrac: 0.75, tauReact: 1.40, extraPad: 3.0);
       return et.ControlInput(
         thrust: needUp, left: false, right: false,
         sideLeft: false, sideRight: false,
@@ -308,13 +344,14 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
     }
 
     case Intent.descendSlow: {
-      // Target gentle descent; if gravity is tiny or we’re too slow to descend, use DOWN thruster.
-      final vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);
+      // Gentle descent with proactive pre-boost; use DOWN thruster if rising/too slow
+      final vCap     = _vCapDesc(h);
+      final vWarnOK  = _needPreBoost(vCap: vCap, env: env, warnFrac: 0.80, tauReact: 1.35, extraPad: 2.0);
+
       final t = (env.cfg.t as dynamic);
       final downEnabled = (t.downThrEnabled ?? false) == true;
-
-      final needUp   = vy > vCap || (!downEnabled && h < 110.0);
-      final needDown = downEnabled && (vy < 0.6 * vCap); // actively push down if too slow/rising
+      final needUp      = (vy > vCap) || vWarnOK;
+      final needDown    = downEnabled && (vy < 0.6 * vCap); // actively push down if too slow/rising
 
       return et.ControlInput(
         thrust: needUp, left: false, right: false,
@@ -327,8 +364,9 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
       final wantTiltRight   = (vx < -4.0);
       final allowTranslate  = (h > 110 && h < 300) && (vy < 35);
       if (_canStrafe(env)) rcsLeft = true; // push right
+      final needAltHold = _altHold();      // pre-boost if vy trending too down
       return et.ControlInput(
-        thrust: allowTranslate && !rcsLeft && wantTiltRight,
+        thrust: (allowTranslate && !rcsLeft && wantTiltRight) || needAltHold,
         left: false, right: (!rcsLeft && wantTiltRight),
         sideLeft: rcsLeft, sideRight: false,
         downThrust: false,
@@ -339,8 +377,9 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
       final wantTiltLeft    = (vx >  4.0);
       final allowTranslate  = (h > 110 && h < 300) && (vy < 35);
       if (_canStrafe(env)) rcsRight = true; // push left
+      final needAltHold = _altHold();
       return et.ControlInput(
-        thrust: allowTranslate && !rcsRight && wantTiltLeft,
+        thrust: (allowTranslate && !rcsRight && wantTiltLeft) || needAltHold,
         left: (!rcsRight && wantTiltLeft), right: false,
         sideLeft: false, sideRight: rcsRight,
         downThrust: false,
@@ -350,8 +389,9 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
     case Intent.goLeft: {
       final translate = (h > 110 && h < 300) && (vy < 35);
       if (_canStrafe(env)) rcsRight = true; // push left
+      final needAltHold = _altHold();
       return et.ControlInput(
-        thrust: translate && !rcsRight,
+        thrust: (translate && !rcsRight) || needAltHold,
         left: !rcsRight, right: false,
         sideLeft: false, sideRight: rcsRight,
         downThrust: false,
@@ -361,8 +401,9 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
     case Intent.goRight: {
       final translate = (h > 110 && h < 300) && (vy < 35);
       if (_canStrafe(env)) rcsLeft = true; // push right
+      final needAltHold = _altHold();
       return et.ControlInput(
-        thrust: translate && !rcsLeft,
+        thrust: (translate && !rcsLeft) || needAltHold,
         left: false, right: !rcsLeft,
         sideLeft: rcsLeft, sideRight: false,
         downThrust: false,
@@ -371,8 +412,9 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
     case Intent.hover:
     default: {
-      final vHover = (0.06 * h + 6.0).clamp(6.0, 18.0);
-      final needUp = vy > vHover;
+      // Hover with predictive pre-boost, a bit stricter near ground
+      final vCap = math.min(_vCapHover(h), (0.075 * h + 7.0).clamp(7.0, 18.0));
+      final needUp = (vy > vCap) || _needPreBoost(vCap: vCap, env: env, warnFrac: 0.80, tauReact: 1.35, extraPad: 2.0);
       return et.ControlInput(
         thrust: needUp, left: false, right: false,
         sideLeft: false, sideRight: false,
