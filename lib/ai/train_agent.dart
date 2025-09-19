@@ -674,7 +674,7 @@ void _warmFeatureNorm({
   print('Feature norm warmed with $accepted synthetic samples.');
 }
 
-/* ----------------------------- PF velocity+accel reward ------------------------ */
+/* ----------------------- PF reward (velocity + accel) -------------------------- */
 
 class PFShapingCfg {
   // --- Velocity shaping ---
@@ -801,7 +801,7 @@ ai.ExternalRewardHook makePFRewardHook({
     final dv_pf_y_raw = sugg.vy - vy;
     final dv_pf_mag_raw = math.sqrt(dv_pf_x_raw*dv_pf_x_raw + dv_pf_y_raw*dv_pf_y_raw);
 
-    final dv_pf_cap = (aMax * dt * cfg.feasiness).clamp(0.0, 1e9);
+    final dv_pf_cap = (env.cfg.t.thrustAccel * 0.05 * env.cfg.stepScale * dt * 0.75).clamp(0.0, 1e9);
     double dv_pf_x = dv_pf_x_raw, dv_pf_y = dv_pf_y_raw;
     if (dv_pf_mag_raw > dv_pf_cap && dv_pf_mag_raw > 1e-9) {
       final s = dv_pf_cap / dv_pf_mag_raw;
@@ -870,26 +870,26 @@ ai.ExternalRewardHook makePFRewardHook({
 
     // --- Velocity error term (with X bias near pad) ---
     final prox2 = prox * prox;
-    final wLat = (cfg.xBias) * (1.0 + cfg.latBoost * prox2);
-    final wVer = 1.0 * (1.0 + 0.7 * cfg.latBoost * prox2);
+    final wLat = (1.0 * 3.0) * (1.0 + 4.0 * prox2);
+    final wVer = 1.0 * (1.0 + 0.7 * 4.0 * prox2);
 
     final dvx_vel = (vx - sugg.vx) * wLat;
     final dvy_vel = (vy - sugg.vy) * wVer;
-    final vErr = math.sqrt(dvx_vel*dvx_vel + dvy_vel*dvy_vel) / cfg.vmax;
+    final vErr = math.sqrt(dvx_vel*dvx_vel + dvy_vel*dvy_vel) / 140.0;
 
-    final wVelEff = cfg.wVelDelta
-        * (1.0 + 0.6 * cfg.velPenaltyBoost * prox2)
+    final wVelEff = 0.6
+        * (1.0 + 0.6 * 3.0 * prox2)
         * wallBoost
         * wallBoostY;
-    final wAlignEff = cfg.wAlign * (1.0 + cfg.alignBoost * prox);
+    final wAlignEff = 1.0 * (1.0 + 1.5 * prox);
 
     // Touchdown bonus (gated)
-    final touchTarget = cfg.vMinTouchdown.clamp(0.5, 15.0);
+    final touchTarget = 2.0.clamp(0.5, 15.0);
     const double touchWeight = 3.0;
     final bool inTouchBand = (h < 90.0) && (dxAbs < 0.12 * W);
-    final double vmagNow = math.sqrt(vx*vx + vy*vy) + 1e-9;
+    final double vmagNow2 = math.sqrt(vx*vx + vy*vy) + 1e-9;
     final double touchBonus = inTouchBand
-        ? touchWeight * (touchTarget - vmagNow) / (touchTarget + 1e-6)
+        ? touchWeight * (touchTarget - vmagNow2) / (touchTarget + 1e-6)
         : 0.0;
 
     // --- Acceleration (Δv) matching ---
@@ -900,8 +900,8 @@ ai.ExternalRewardHook makePFRewardHook({
       double dvy_act = (vy - prevVy!);
 
       // Smooth it (EMA) to reduce jitter
-      smDvX = cfg.accEma * dvx_act + (1.0 - cfg.accEma) * smDvX;
-      smDvY = cfg.accEma * dvy_act + (1.0 - cfg.accEma) * smDvY;
+      smDvX = 0.2 * dvx_act + (1.0 - 0.2) * smDvX;
+      smDvY = 0.2 * dvy_act + (1.0 - 0.2) * smDvY;
 
       final dv_pf_mag = math.sqrt(dv_pf_x*dv_pf_x + dv_pf_y*dv_pf_y) + 1e-12;
       final dv_act_mag = math.sqrt(smDvX*smDvX + smDvY*smDvY) + 1e-12;
@@ -915,14 +915,14 @@ ai.ExternalRewardHook makePFRewardHook({
       final errY = (smDvY - dv_pf_y);
       final accErr = (math.sqrt(errX*errX + errY*errY) / (dv_pf_cap + 1e-9)).clamp(0.0, 5.0);
 
-      rAcc = cfg.wAccAlign * accAlign - cfg.wAccErr * accErr;
+      rAcc = 2.0 * accAlign - 1.0 * accErr;
     }
 
     // Update previous v for next step
     prevVx = vx; prevVy = vy;
 
     // Optional PF debug (prints once per ~240 frames)
-    if (cfg.debug) {
+    if (false) {
       sumAbsDVpfX += dv_pf_x.abs();
       sumAbsDVpfY += dv_pf_y.abs();
       sumWLat += wLat;
@@ -945,6 +945,110 @@ ai.ExternalRewardHook makePFRewardHook({
 
     // Total reward
     final r = wAlignEff * align + touchBonus - wVelEff * vErr + rAcc;
+    return r;
+  };
+}
+
+/* --------------------------- Curriculum: velocity trim ------------------------- */
+
+class VelTrimCfg {
+  final double vMin;
+  final double vMax;
+  final double hMin;
+  final double hMax;
+  final bool centerPadX;
+  final bool rotFree;
+  final double allowUpward; // 0..1, how lenient we are with upward motion in reward
+  final bool debug;
+
+  const VelTrimCfg({
+    this.vMin = 20.0,
+    this.vMax = 140.0,
+    this.hMin = 80.0,
+    this.hMax = 360.0,
+    this.centerPadX = true,
+    this.rotFree = true,
+    this.allowUpward = 0.6,
+    this.debug = false,
+  });
+}
+
+/// Builds a hook that (a) hard-sets an initial random flight vector on tStep==0,
+/// then (b) rewards the **reduction of speed** over time.
+/// r ≈ k*(|v_prev|-|v_now|) - small penalty for going up too much.
+ai.ExternalRewardHook makeVelTrimHook({
+  required eng.GameEngine env,
+  VelTrimCfg cfg = const VelTrimCfg(),
+  int seed = 0xC011D,
+}) {
+  final rnd = math.Random(seed ^ 0xBAD5EED);
+
+  // Sample once per episode (the closure persists for the episode).
+  double? prevVmag;
+  bool inited = false;
+  double vx0 = 0, vy0 = 0;
+
+  return ({required eng.GameEngine env, required double dt, required int tStep}) {
+    final L = env.lander;
+    final T = env.terrain;
+
+    if (!inited && tStep == 0) {
+      // Position X
+      final double x = cfg.centerPadX
+          ? T.padCenter.toDouble()
+          : rnd.nextDouble() * (env.cfg.worldW - 40.0) + 20.0;
+
+      // Height
+      final double gy = T.heightAt(x);
+      final double h = cfg.hMin + rnd.nextDouble() * (cfg.hMax - cfg.hMin);
+      final double y = (gy - h).clamp(10.0, env.cfg.worldH - 10.0);
+
+      // Speed & direction
+      final double spd = cfg.vMin + rnd.nextDouble() * (cfg.vMax - cfg.vMin);
+      final double ang = rnd.nextDouble() * 2 * math.pi;
+      vx0 = spd * math.cos(ang);
+      vy0 = spd * math.sin(ang);
+
+      L
+        ..pos.x = x
+        ..pos.y = y
+        ..vel.x = vx0
+        ..vel.y = vy0
+        ..fuel = env.cfg.t.maxFuel;
+
+      if (!cfg.rotFree) {
+        L.angle = 0.0;
+      }
+
+      if (cfg.debug) {
+        print('[CUR] init v=(${vx0.toStringAsFixed(1)}, ${vy0.toStringAsFixed(1)}) '
+            'speed=${spd.toStringAsFixed(1)} at h=${h.toStringAsFixed(1)} x=${x.toStringAsFixed(1)}');
+      }
+
+      inited = true;
+      prevVmag = null; // will set below
+    }
+
+    final vx = L.vel.x.toDouble();
+    final vy = L.vel.y.toDouble();
+    final vmag = math.sqrt(vx*vx + vy*vy);
+
+    double r = 0.0;
+    if (prevVmag != null) {
+      // Primary term: reward decrease in speed
+      r += (prevVmag! - vmag);
+    }
+    prevVmag = vmag;
+
+    // Shape out excessive upward drift (vy < 0 is upward if +y is down; adjust if opposite)
+    // Here, positive vy is downward (from your env). Penalize strong upward (vy < 0) a bit.
+    final upward = (-vy).clamp(0.0, double.infinity); // upward magnitude
+    final upPenalty = (1.0 - cfg.allowUpward) * 0.02 * upward; // small shaping
+    r -= upPenalty;
+
+    // Slight per-step normalization
+    r *= 0.02;
+
     return r;
   };
 }
@@ -1014,6 +1118,18 @@ void main(List<String> argv) async {
   final pfAccErr   = args.getDouble('pf_acc_err',   def: 1.0);
   final pfAccEma   = args.getDouble('pf_acc_ema',   def: 0.2);
   final pfDebug    = args.getFlag('pf_debug',       def: false);
+
+  // --------- Curriculum knobs ---------
+  final doCurriculum = args.getFlag('curriculum', def: false);
+  final curIters     = args.getInt('cur_iters', def: 3000);
+  final curVmin      = args.getDouble('cur_vmin', def: 20.0);
+  final curVmax      = args.getDouble('cur_vmax', def: 140.0);
+  final curHmin      = args.getDouble('cur_hmin', def: 80.0);
+  final curHmax      = args.getDouble('cur_hmax', def: 360.0);
+  final curCenterPad = args.getFlag('cur_center_pad', def: true);
+  final curRotFree   = args.getFlag('cur_rot_free', def: true);
+  final curAllowUp   = args.getDouble('cur_allow_upward', def: 0.6).clamp(0.0, 1.0);
+  final curDebug     = args.getFlag('cur_debug', def: false);
 
   // attempts per terrain + eval cadence/size + parallel + debug
   final attemptsPerTerrain = _iclamp(args.getInt('attempts_per_terrain', def: 1), 1, 1000000);
@@ -1091,8 +1207,20 @@ void main(List<String> argv) async {
   );
   ai.ExternalRewardHook? pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
-  // ----- Trainer -----
-  final trainer = Trainer(
+  // ===== Curriculum (velocity trim) hook (rebuilt per episode) =====
+  final velTrimCfg = VelTrimCfg(
+    vMin: curVmin, vMax: curVmax,
+    hMin: curHmin, hMax: curHmax,
+    centerPadX: curCenterPad,
+    rotFree: curRotFree,
+    allowUpward: curAllowUp,
+    debug: curDebug,
+  );
+  ai.ExternalRewardHook? curHook = makeVelTrimHook(env: env, cfg: velTrimCfg, seed: seed ^ 0xC011D);
+
+  // ----- Trainers -----
+  // Main trainer: full PF shaping + your chosen supervision weights
+  final trainerMain = Trainer(
     env: env,
     fe: fe,
     policy: policy,
@@ -1113,10 +1241,34 @@ void main(List<String> argv) async {
     gateScoreMin: gateScoreMin,
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
-
-    // add dense PF reward per step
     externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
       return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
+    }),
+  );
+
+  // Curriculum trainer: reward = trim velocity; no supervised alignment in this stage
+  final trainerCur = Trainer(
+    env: env,
+    fe: fe,
+    policy: policy,
+    dt: 1 / 60.0,
+    gamma: 0.99,
+    seed: seed ^ 0xB00,
+    twoStage: true,
+    planHold: planHold,
+    tempIntent: tempIntent,
+    intentEntropyBeta: intentEntropy,
+    useLearnedController: useLearned,
+    blendPolicy: blendPolicy.clamp(0.0, 1.0),
+    intentAlignWeight: 0.0,      // <— off for curriculum
+    intentPgWeight: intentPgWeight,
+    actionAlignWeight: 0.0,      // <— off for curriculum
+    normalizeFeatures: true,
+    gateScoreMin: -1e9,
+    gateOnlyLanded: false,
+    gateVerbose: gateVerbose,
+    externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
+      return curHook != null ? curHook!(env: env, dt: dt, tStep: tStep) : 0.0;
     }),
   );
 
@@ -1132,8 +1284,8 @@ void main(List<String> argv) async {
 
   // Optional: warm the feature norm
   _warmFeatureNorm(
-    norm: trainer.norm,
-    trainer: trainer,
+    norm: trainerMain.norm,
+    trainer: trainerMain,
     fe: fe,
     env: env,
     perClass: 500,
@@ -1161,7 +1313,7 @@ void main(List<String> argv) async {
     } else {
       evaluateSequential(
         env: env,
-        trainer: trainer,
+        trainer: trainerMain,
         episodes: evalEpisodes,
         seed: seed ^ 0x999,
         attemptsPerTerrain: attemptsPerTerrain,
@@ -1180,6 +1332,10 @@ void main(List<String> argv) async {
   int currentTerrainSeed = rnd.nextInt(1 << 30);
 
   for (int it = 0; it < iters; it++) {
+    // Select which trainer/hook to use for this iteration
+    final bool inCurriculum = doCurriculum && (it < curIters);
+    final trainer = inCurriculum ? trainerCur : trainerMain;
+
     double lastCost = 0.0;
     int lastSteps = 0;
     bool lastLanded = false;
@@ -1194,8 +1350,12 @@ void main(List<String> argv) async {
       // Reuse terrain within the group
       env.reset(seed: currentTerrainSeed);
 
-      // Rebuild PF-based reward hook for this terrain/episode
-      pfHook = makePFRewardHook(env: env, cfg: pfCfg);
+      // Rebuild the corresponding reward hook for this terrain/episode
+      if (inCurriculum) {
+        curHook = makeVelTrimHook(env: env, cfg: velTrimCfg, seed: seed ^ (0xC011D ^ (it << 2) ^ b));
+      } else {
+        pfHook = makePFRewardHook(env: env, cfg: pfCfg);
+      }
 
       final res = trainer.runEpisode(
         train: true,
@@ -1218,7 +1378,8 @@ void main(List<String> argv) async {
 
     if (gateVerbose && ((it + 1) % 10 == 0)) {
       final tag = lastLanded ? 'L' : 'NL';
-      print('[TRAIN] iter=${it + 1} | segMean=${lastSegMean.toStringAsFixed(3)} | steps=$lastSteps | landed=$tag');
+      final stage = inCurriculum ? 'CUR' : 'MAIN';
+      print('[TRAIN/$stage] iter=${it + 1} | segMean=${lastSegMean.toStringAsFixed(3)} | steps=$lastSteps | landed=$tag');
     }
 
     // periodic eval + save (driven by CLI)
@@ -1243,7 +1404,7 @@ void main(List<String> argv) async {
       } else {
         ev = evaluateSequential(
           env: env,
-          trainer: trainer,
+          trainer: trainerMain, // eval on main objective
           episodes: evalEpisodes,
           seed: seed ^ (0x1111 * (it + 1)),
           attemptsPerTerrain: attemptsPerTerrain,
@@ -1260,7 +1421,7 @@ void main(List<String> argv) async {
           rayCount: rayCount,
           kindsOneHot: kindsOneHot,
           env: env,
-          norm: trainer.norm,
+          norm: trainerMain.norm,
         );
         print('★ New BEST by cost at iter ${it + 1}: meanCost=${ev.meanCost.toStringAsFixed(3)} → saved policy_best_cost.json');
       }
@@ -1271,7 +1432,7 @@ void main(List<String> argv) async {
         rayCount: rayCount,
         kindsOneHot: kindsOneHot,
         env: env,
-        norm: trainer.norm,
+        norm: trainerMain.norm,
       );
     }
   }
@@ -1282,7 +1443,7 @@ void main(List<String> argv) async {
     rayCount: rayCount,
     kindsOneHot: kindsOneHot,
     env: env,
-    norm: trainer.norm,
+    norm: trainerMain.norm,
   );
   print('Training done. Saved → policy_final.json');
 }
@@ -1291,20 +1452,20 @@ void main(List<String> argv) async {
 
 Examples:
 
+  # With curriculum for the first 3k iters, then normal PF shaping
   dart run lib/ai/train_agent.dart \
     --hidden=96,96,64 \
-    --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 \
+    --train_iters=60000 --batch=1 --lr=0.0003 --plan_hold=1 \
     --blend_policy=1.0 --intent_align=0.25 --intent_pg=0.6 \
-    --gate_min=0.0 --gate_landed \
-    --eval_every=20 --eval_episodes=120 \
-    --eval_parallel --eval_workers=20 \
-    --eval_debug --eval_debug_fail=3 \
-    --pf_acc_align=2.0 --pf_acc_err=1.0 --pf_acc_ema=0.2 --pf_debug
+    --gate_min=0.0 \
+    --eval_every=100 --eval_episodes=100 --eval_parallel --eval_workers=20 \
+    --curriculum --cur_iters=3000 --cur_vmin=30 --cur_vmax=140 \
+    --cur_hmin=100 --cur_hmax=360 --cur_center_pad --cur_rot_free \
+    --cur_allow_upward=0.6 --cur_debug
 
 Notes:
-- `--eval_episodes` is honored for both the baseline and periodic evals.
-- When `--eval_parallel` is set, the program prints eval runtime and eps/s,
-  and uses `--eval_workers` (default = CPU cores). Each worker runs its own
-  env/feature-extractor/trainer with a cloned, read-only policy.
-- `--pf_debug` prints PF diagnostics about lateral vs vertical targets (safe to leave off).
+- Curriculum stage hard-sets a **random flight vector** at episode start and
+  rewards **reducing speed**. No teacher CE is used in that stage.
+- Hooks are rebuilt per episode to reflect the current terrain and stage.
+- After `--cur_iters`, training continues with your PF reward as before.
 ------------------------------------------------------------------------------ */
