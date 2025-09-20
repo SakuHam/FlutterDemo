@@ -457,6 +457,24 @@ class PolicyNetwork {
   final nn.MLPTrunk trunk;
   final nn.PolicyHeads heads;
 
+  // ---- Consolidation (L2-SP) anti-forgetting ----
+  bool consolidateEnabled = false;
+  double consolidateTrunk = 0.0;   // e.g. 1e-3
+  double consolidateHeads = 0.0;   // e.g. 5e-4
+
+  // Snapshots (previous-stage weights)
+  List<List<List<double>>>? _snapWTrunk;
+  List<List<double>>? _snapBTrunk;
+
+  List<List<double>>? _snapWIntent;
+  List<double>? _snapBIntent;
+
+  List<List<double>>? _snapWTurn;
+  List<double>? _snapBTurn;
+
+  List<List<double>>? _snapWThr;
+  List<double>? _snapBThr;
+
   PolicyNetwork({
     required this.inputSize,
     List<int> hidden = const [64, 64],
@@ -478,6 +496,28 @@ class PolicyNetwork {
         ) {
     assert(heads.intent.b.length == kIntents, 'intent head outDim mismatch');
     assert(heads.intent.W.length == kIntents, 'intent head rows mismatch');
+  }
+
+  void captureConsolidationAnchor() {
+    // trunk
+    _snapWTrunk = [
+      for (final L in trunk.layers)
+        [ for (final row in L.W) List<double>.from(row) ]
+    ];
+    _snapBTrunk = [
+      for (final L in trunk.layers) List<double>.from(L.b)
+    ];
+    // heads
+    _snapWIntent = [ for (final row in heads.intent.W) List<double>.from(row) ];
+    _snapBIntent = List<double>.from(heads.intent.b);
+
+    _snapWTurn   = [ for (final row in heads.turn.W)   List<double>.from(row) ];
+    _snapBTurn   = List<double>.from(heads.turn.b);
+
+    _snapWThr    = [ for (final row in heads.thr.W)    List<double>.from(row) ];
+    _snapBThr    = List<double>.from(heads.thr.b);
+
+    consolidateEnabled = true;
   }
 
   ForwardCache _forwardFull(List<double> x) {
@@ -701,6 +741,50 @@ class PolicyNetwork {
       final calibStep = 0.25;
       heads.thr.b[0] += (logitTarget - meanThrLogit) * calibStep;
     }
+
+    // ===================== L2-SP consolidation (optional) =====================
+    if (consolidateEnabled) {
+      // Trunk penalty: add dL/dW += λ (W - W0), dL/db += λ (b - b0)
+      if (consolidateTrunk > 0.0 && _snapWTrunk != null && _snapBTrunk != null) {
+        for (int li = 0; li < trunk.layers.length; li++) {
+          final L = trunk.layers[li];
+          final W0 = _snapWTrunk![li];
+          final b0 = _snapBTrunk![li];
+          for (int i = 0; i < L.W.length; i++) {
+            for (int j = 0; j < L.W[0].length; j++) {
+              gW_trunk[li][i][j] += consolidateTrunk * (L.W[i][j] - W0[i][j]);
+            }
+            gb_trunk[li][i] += consolidateTrunk * (L.b[i] - b0[i]);
+          }
+        }
+      }
+      // Heads penalty (usually smaller λ)
+      if (consolidateHeads > 0.0) {
+        if (_snapWIntent != null && _snapBIntent != null) {
+          for (int i = 0; i < heads.intent.W.length; i++) {
+            for (int j = 0; j < heads.intent.W[0].length; j++) {
+              gW_int[i][j] += consolidateHeads * (heads.intent.W[i][j] - _snapWIntent![i][j]);
+            }
+            gb_int[i] += consolidateHeads * (heads.intent.b[i] - _snapBIntent![i]);
+          }
+        }
+        if (_snapWTurn != null && _snapBTurn != null) {
+          for (int i = 0; i < heads.turn.W.length; i++) {
+            for (int j = 0; j < heads.turn.W[0].length; j++) {
+              gW_turn[i][j] += consolidateHeads * (heads.turn.W[i][j] - _snapWTurn![i][j]);
+            }
+            gb_turn[i] += consolidateHeads * (heads.turn.b[i] - _snapBTurn![i]);
+          }
+        }
+        if (_snapWThr != null && _snapBThr != null) {
+          for (int j = 0; j < heads.thr.W[0].length; j++) {
+            gW_thr[0][j] += consolidateHeads * (heads.thr.W[0][j] - _snapWThr![0][j]);
+          }
+          gb_thr[0] += consolidateHeads * (heads.thr.b[0] - _snapBThr![0]);
+        }
+      }
+    }
+    // =================== end consolidation (optional) ========================
 
     // ----- Apply trunk update (shared grads) -----
     final trunkScale = lr;
@@ -1058,22 +1142,6 @@ class Trainer {
           actionThrustTargets: actionThrustTargets,
           actionAlignWeight: actionAlignWeight,
         );
-        /*
-        if (gateVerbose) {
-          final tag = landed ? 'Y' : (nearPadCrashOK ? 'padCrash' : 'N');
-          print('[TRAIN] accepted | steps=$steps | pfMean=${segMean.toStringAsFixed(3)} | landed=$tag '
-              '| caches: dec=${decisionCaches.length}, act=${actionCaches.length}');
-        }
-
-         */
-      } else {
-        /*
-        if (gateVerbose) {
-          final tag = landed ? 'Y' : (nearPadCrashOK ? 'padCrash' : 'N');
-          print('[TRAIN] skipped  | steps=$steps | pfMean=${segMean.toStringAsFixed(3)} | landed=$tag');
-        }
-
-         */
       }
     }
 
