@@ -1280,6 +1280,233 @@ EpisodeResult _runCurriculumEpisode({
   return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: 0.0);
 }
 
+/* -------------------- CURRICULUM STAGE 2 (low-alt flight) --------------------- */
+
+// Reward for flying in a low-altitude band safely
+double _lowAltReward({
+  required eng.GameEngine env,
+  required double dt,
+  required int tStep,
+  double hTarget = 70.0,
+  double hBandLo = 35.0,
+  double hBandHi = 120.0,
+  double wHeight = 1.4,
+  double wVy = 0.9,
+  double wVxNear = 0.15,
+  double wVxFar = 0.45,
+  double padTightFrac = 0.12,
+}) {
+  final L = env.lander;
+  final T = env.terrain;
+  final x = L.pos.x.toDouble();
+  final y = L.pos.y.toDouble();
+
+  final gy = T.heightAt(x);
+  final h  = (gy - y).toDouble().clamp(0.0, 2e9);
+  final vx = L.vel.x.toDouble();
+  final vy = L.vel.y.toDouble();
+
+  // pad proximity (for modulating target lateral speed tolerance)
+  final padCx = T.padCenter.toDouble();
+  final dxAbs = (x - padCx).abs();
+  final W = env.cfg.worldW.toDouble();
+  final tightX = padTightFrac * W;
+  final px = math.exp(-(dxAbs*dxAbs) / (tightX*tightX + 1e-6)); // 0..1 near pad
+
+  // Height shaping: “bell” around hTarget, clipped within [hBandLo, hBandHi]
+  double heightErr = 0.0;
+  final hClamped = h.clamp(hBandLo, hBandHi);
+  final dh = (hClamped - hTarget);
+  heightErr = (dh.abs() / math.max(8.0, 0.25 * (hBandHi - hBandLo))).clamp(0.0, 4.0);
+  // Encourage being inside band strongly, and softly around target
+  final rH = -wHeight * (0.25 * heightErr + (h < hBandLo ? 1.5 : 0.0) + (h > hBandHi ? 0.8 : 0.0));
+
+  // Vertical flare: keep |vy| low at low altitude
+  final vyTol = (h * 0.10 + 6.0).clamp(6.0, 18.0);
+  final vyPen = (vy.abs() / vyTol).clamp(0.0, 5.0);
+  final rVy = -wVy * vyPen;
+
+  // Lateral speed: near pad → stricter; far from pad → allow more
+  final vxTolNear = 12.0, vxTolFar = 36.0;
+  final vxTol = (px * vxTolNear + (1 - px) * vxTolFar);
+  final vxPen = (vx.abs() / vxTol).clamp(0.0, 5.0);
+  final rVx = -(px * wVxNear + (1 - px) * wVxFar) * vxPen;
+
+  // Small stability reward if we’re inside the height band and slow vertically
+  final stable = (h >= hBandLo && h <= hBandHi && vy.abs() < vyTol);
+  final rStable = stable ? 0.3 : 0.0;
+
+  return rH + rVy + rVx + rStable;
+}
+
+// Randomize starts close to the ground with moderate lateral drift
+void _initLowAltStart(eng.GameEngine env, math.Random r) {
+  final T = env.terrain;
+  final padCx = T.padCenter.toDouble();
+  final W = env.cfg.worldW.toDouble();
+  // final padHalfW = (((T.padX2 - T.padX1).abs()) * 0.5).clamp(12.0, W); // unused but handy
+
+  // Spawn in a corridor around pad, low height
+  final x = (padCx + (r.nextDouble() * 0.35 - 0.175) * W).clamp(16.0, W - 16.0);
+  final gy = T.heightAt(x);
+  final h = 40.0 + 60.0 * r.nextDouble(); // low altitude
+  final vx = (r.nextDouble() < 0.5 ? -1 : 1) * (10.0 + 30.0 * r.nextDouble());
+  final vy = (r.nextDouble() * 10.0) - 5.0;
+
+  env.lander
+    ..pos.x = x
+    ..pos.y = (gy - h).clamp(0.0, env.cfg.worldH - 10.0)
+    ..vel.x = vx
+    ..vel.y = vy
+    ..angle = 0.0
+    ..fuel = env.cfg.t.maxFuel;
+}
+
+// One low-altitude “curriculum episode” (teacher executes)
+EpisodeResult _runLowAltEpisode({
+  required eng.GameEngine env,
+  required FeatureExtractorRays fe,
+  required PolicyNetwork policy,
+  required RunningNorm? norm,
+  required math.Random rnd,
+  required int planHold,
+  required double tempIntent,
+  required double gamma,
+  required double lr,
+  required double intentAlignWeight,
+  required double intentPgWeight,
+  required double actionAlignWeight,
+  // reward knobs (optional override from CLI later)
+  double hTarget = 70.0,
+  double hBandLo = 35.0,
+  double hBandHi = 120.0,
+}) {
+  policy.trunk.trainMode = true;
+
+  final decisionRewards = <double>[];
+  final decisionCaches  = <ForwardCache>[];
+  final intentChoices   = <int>[];
+  final decisionReturns = <double>[];
+  final alignLabels     = <int>[];
+
+  final actionCaches        = <ForwardCache>[];
+  final actionTurnTargets   = <int>[];
+  final actionThrustTargets = <bool>[];
+
+  env.reset(seed: rnd.nextInt(1 << 30));
+  _initLowAltStart(env, rnd);
+
+  int framesLeft = 0;
+  int currentIntentIdx = 0;
+  double Racc = 0.0;
+
+  int steps = 0;
+  double totalCost = 0.0;
+  bool landed = false;
+
+  while (true) {
+    if (framesLeft <= 0) {
+      var x = fe.extract(env);
+      final yTeacher = predictiveIntentLabelAdaptive(env);
+      if (norm != null) { norm.observe(x); x = norm.normalize(x, update: false); }
+
+      final (idxGreedy, p, cache) = policy.actIntentGreedy(x);
+      int pick;
+      if (tempIntent <= 1e-6) {
+        pick = idxGreedy;
+      } else {
+        final z = p.map((pp) => math.log(pp.clamp(1e-12, 1.0))).toList();
+        for (int i = 0; i < z.length; i++) z[i] /= tempIntent;
+        final sm = nn.Ops.softmax(z);
+        final u = rnd.nextDouble();
+        double acc = 0.0; pick = sm.length - 1;
+        for (int i = 0; i < sm.length; i++) { acc += sm[i]; if (u <= acc) { pick = i; break; } }
+      }
+      currentIntentIdx = pick;
+
+      decisionCaches.add(cache);
+      intentChoices.add(pick);
+      alignLabels.add(yTeacher);
+      decisionRewards.add(Racc);
+      Racc = 0.0;
+
+      // compute normalized returns over the (growing) decision window
+      final Tn = decisionRewards.length;
+      final tmp = List<double>.filled(Tn, 0.0);
+      double G = 0.0;
+      for (int i = Tn - 1; i >= 0; i--) { G = decisionRewards[i] + gamma * G; tmp[i] = G; }
+      double mean = 0.0; for (final v in tmp) mean += v; mean /= math.max(1, Tn);
+      double var0 = 0.0; for (final v in tmp) { final d = v - mean; var0 += d * d; }
+      var0 = (var0 / math.max(1, Tn)).clamp(1e-9, double.infinity);
+      final std = math.sqrt(var0);
+      decisionReturns..clear()..addAll(tmp.map((v) => (v - mean) / std));
+      framesLeft = planHold;
+    }
+
+    final intent = indexToIntent(currentIntentIdx);
+    final uTeacher = controllerForIntent(intent, env);
+
+    var xAct = fe.extract(env);
+    if (norm != null) xAct = norm.normalize(xAct, update: false);
+    final (_, __, ___, ____, cAct) = policy.actGreedy(xAct);
+    actionCaches.add(cAct);
+    actionTurnTargets.add(uTeacher.left ? 0 : (uTeacher.right ? 2 : 1));
+    actionThrustTargets.add(uTeacher.thrust);
+
+    final info = env.step(1 / 60.0, et.ControlInput(
+      thrust: uTeacher.thrust,
+      left: uTeacher.left,
+      right: uTeacher.right,
+      sideLeft: uTeacher.sideLeft,
+      sideRight: uTeacher.sideRight,
+      downThrust: uTeacher.downThrust,
+      intentIdx: currentIntentIdx,
+    ));
+
+    Racc += _lowAltReward(
+      env: env, dt: 1/60.0, tStep: steps,
+      hTarget: hTarget, hBandLo: hBandLo, hBandHi: hBandHi,
+    );
+
+    totalCost += info.costDelta;
+    steps++;
+    framesLeft--;
+
+    // End early if it climbs far away or timeouts; we care about stable low-alt flight
+    final gy = env.terrain.heightAt(env.lander.pos.x.toDouble());
+    final h = (gy - env.lander.pos.y).toDouble();
+    final tooHigh = h > (hBandHi + 160.0);
+    if (info.terminal || steps > 600 || tooHigh) {
+      landed = (env.status == et.GameStatus.landed);
+      if (decisionRewards.isNotEmpty && Racc.abs() > 0) {
+        decisionRewards[decisionRewards.length - 1] += Racc;
+        Racc = 0.0;
+      }
+      break;
+    }
+  }
+
+  policy.updateFromEpisode(
+    decisionCaches: decisionCaches,
+    intentChoices: intentChoices,
+    decisionReturns: decisionReturns,
+    alignLabels: alignLabels,
+    alignWeight: intentAlignWeight,
+    intentPgWeight: intentPgWeight,
+    lr: lr,
+    entropyBeta: 0.0,
+    valueBeta: 0.0,
+    huberDelta: 1.0,
+    intentMode: true,
+    actionCaches: actionCaches,
+    actionTurnTargets: actionTurnTargets,
+    actionThrustTargets: actionThrustTargets,
+    actionAlignWeight: actionAlignWeight,
+  );
+
+  return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: 0.0);
+}
+
 /* ------------------------------------ main ------------------------------------ */
 
 List<int> _parseHiddenList(String? s, {List<int> fallback = const [64, 64]}) {
@@ -1305,6 +1532,13 @@ void main(List<String> argv) async {
   final curIters = args.getInt('curriculum_iters', def: 0);
   final curBatch = args.getInt('curriculum_batch', def: 1);
   final warmAfterCurr = args.getFlag('warm_norm_after_curriculum', def: true);
+
+  // ---- Curriculum Stage 2 (low-altitude) ----
+  final loaltIters = args.getInt('lowalt_iters', def: 0);
+  final loaltBatch = args.getInt('lowalt_batch', def: 1);
+  final loaltHTarget = args.getDouble('lowalt_h_target', def: 70.0);
+  final loaltHBandLo = args.getDouble('lowalt_h_lo', def: 35.0);
+  final loaltHBandHi = args.getDouble('lowalt_h_hi', def: 120.0);
 
   // ---- Stage 2 (PF) knobs ----
   final iters = args.getInt('train_iters', def: args.getInt('iters', def: 200));
@@ -1555,6 +1789,47 @@ void main(List<String> argv) async {
     }
   }
 
+  // ----- CURRICULUM STAGE 2 (optional: low-altitude flight) -----
+  if (loaltIters > 0) {
+    print('=== Curriculum Stage 2: low-altitude flight near ground ===');
+    final rnd2 = math.Random(seed ^ 0xBADA55);
+    for (int it = 0; it < loaltIters; it++) {
+      for (int b = 0; b < math.max(1, loaltBatch); b++) {
+        _runLowAltEpisode(
+          env: env,
+          fe: fe,
+          policy: policy,
+          norm: trainer.norm,
+          rnd: rnd2,
+          planHold: planHold,
+          tempIntent: tempIntent, // keep a bit of exploration
+          gamma: 0.99,
+          lr: lr,
+          intentAlignWeight: intentAlignWeight,
+          intentPgWeight: intentPgWeight,
+          actionAlignWeight: actionAlignWeight,
+          hTarget: loaltHTarget,
+          hBandLo: loaltHBandLo,
+          hBandHi: loaltHBandHi,
+        );
+      }
+      if ((it + 1) % 200 == 0) {
+        print('[CUR-LOWALT] iter=${it + 1}');
+      }
+    }
+
+    // Save a clearly-named snapshot after low-altitude curriculum
+    _savePolicy(
+      path: 'policy_curriculum_lowalt.json',
+      p: policy,
+      rayCount: env.rayCfg.rayCount,
+      kindsOneHot: kindsOneHot,
+      env: env,
+      norm: trainer.norm,
+    );
+    print('★ Curriculum Stage 2 complete → saved policy_curriculum_lowalt.json');
+  }
+
   // ===== Baseline eval (honors --eval_episodes exactly) =====
       {
     if (evalParallel) {
@@ -1700,7 +1975,7 @@ Examples:
 
 1) Resume from a saved policy and run PF training (stage 2 only):
   dart run lib/ai/train_agent.dart \
-    --load_policy=policy_curriculum.json \
+    --load_policy=policy_curriculum_lowalt.json \
     --hidden=96,96,64 \
     --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 \
     --blend_policy=1.0 --intent_align=0.25 --intent_pg=0.6 \
@@ -1708,15 +1983,17 @@ Examples:
     --eval_every=20 --eval_episodes=120 \
     --eval_parallel --eval_workers=20
 
-2) Run curriculum stage 1 then stage 2:
+2) Run curriculum stage 1 (speed-min) then stage 2 (low-alt) then PF:
   dart run lib/ai/train_agent.dart \
     --curriculum_iters=3000 --curriculum_batch=1 \
+    --lowalt_iters=1500 --lowalt_batch=1 \
     --train_iters=400 --batch=1 --lr=0.0003 \
     --plan_hold=1 --intent_temp=1.0 \
     --intent_align=0.25 --intent_pg=0.6 --action_align=0.0
 
 Notes:
-- Stage 1 (curriculum) saves an intermediate snapshot as policy_curriculum.json.
-- Pass --warm_norm_after_curriculum=false if you prefer to skip post-curriculum norm warming.
+- Stage 1 saves an intermediate snapshot as policy_curriculum.json.
+- Stage 2 saves an intermediate snapshot as policy_curriculum_lowalt.json.
+- Pass --warm_norm_after_curriculum=false to skip post-curriculum norm warming.
 - You can still use all PF knobs (--pf_*) and evaluation flags exactly as before.
 ------------------------------------------------------------------------------ */
