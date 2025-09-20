@@ -1280,90 +1280,134 @@ EpisodeResult _runCurriculumEpisode({
   return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: 0.0);
 }
 
-/* -------------------- CURRICULUM STAGE 2 (low-alt flight) --------------------- */
+/* -------------------- CURRICULUM STAGE 3 (hard-approach) -------------------- */
 
-// Reward for flying in a low-altitude band safely
-double _lowAltReward({
-  required eng.GameEngine env,
-  required double dt,
-  required int tStep,
-  double hTarget = 70.0,
-  double hBandLo = 35.0,
-  double hBandHi = 120.0,
-  double wHeight = 1.4,
-  double wVy = 0.9,
-  double wVxNear = 0.15,
-  double wVxFar = 0.45,
-  double padTightFrac = 0.12,
-}) {
-  final L = env.lander;
-  final T = env.terrain;
-  final x = L.pos.x.toDouble();
-  final y = L.pos.y.toDouble();
-
-  final gy = T.heightAt(x);
-  final h  = (gy - y).toDouble().clamp(0.0, 2e9);
-  final vx = L.vel.x.toDouble();
-  final vy = L.vel.y.toDouble();
-
-  // pad proximity (for modulating target lateral speed tolerance)
-  final padCx = T.padCenter.toDouble();
-  final dxAbs = (x - padCx).abs();
+/// Initialize starts that emulate a hard downward approach.
+/// - Spawns near pad laterally, medium altitude, **large downward vy**.
+/// - Adds a bit of lateral drift to force cross-control.
+/// - Angle zeroed; fuel topped.
+/// Hard downward approach initializer with safe-top clamp, min height, and
+/// duration-aware vy selection. It resamples X if ground is too high.
+void _initHardApproachStart(
+    eng.GameEngine env,
+    math.Random r, {
+      int minSteps = 24,   // ~0.4s if stepScale=60
+      int maxSteps = 72,   // ~1.2s
+      double minH = 180.0, // guarantee at least this height
+      double maxH = 520.0, // and cap height so we stay “approach-like”
+      double minVy = 35.0, // always descending “hard-ish”
+      double maxVy = 140.0,
+      int maxResamples = 8,
+    }) {
   final W = env.cfg.worldW.toDouble();
-  final tightX = padTightFrac * W;
-  final px = math.exp(-(dxAbs*dxAbs) / (tightX*tightX + 1e-6)); // 0..1 near pad
+  final H = env.cfg.worldH.toDouble();
+  final padCx = env.terrain.padCenter.toDouble();
 
-  // Height shaping: “bell” around hTarget, clipped within [hBandLo, hBandHi]
-  double heightErr = 0.0;
-  final hClamped = h.clamp(hBandLo, hBandHi);
-  final dh = (hClamped - hTarget);
-  heightErr = (dh.abs() / math.max(8.0, 0.25 * (hBandHi - hBandLo))).clamp(0.0, 4.0);
-  // Encourage being inside band strongly, and softly around target
-  final rH = -wHeight * (0.25 * heightErr + (h < hBandLo ? 1.5 : 0.0) + (h > hBandHi ? 0.8 : 0.0));
+  const safeXMargin   = 24.0;
+  const safeTopMargin = 60.0;
 
-  // Vertical flare: keep |vy| low at low altitude
-  final vyTol = (h * 0.10 + 6.0).clamp(6.0, 18.0);
-  final vyPen = (vy.abs() / vyTol).clamp(0.0, 5.0);
-  final rVy = -wVy * vyPen;
+  // Pick an X near the pad; resample if we can’t get enough height there.
+  double x = padCx;
+  double gy = env.terrain.heightAt(x);
+  bool ok = false;
 
-  // Lateral speed: near pad → stricter; far from pad → allow more
-  final vxTolNear = 12.0, vxTolFar = 36.0;
-  final vxTol = (px * vxTolNear + (1 - px) * vxTolFar);
-  final vxPen = (vx.abs() / vxTol).clamp(0.0, 5.0);
-  final rVx = -(px * wVxNear + (1 - px) * wVxFar) * vxPen;
+  for (int tries = 0; tries < maxResamples; tries++) {
+    final dx = (r.nextDouble() * 0.20 - 0.10) * W; // ±10% W
+    final xCand = (padCx + dx).clamp(safeXMargin, W - safeXMargin);
+    final gyCand = env.terrain.heightAt(xCand);
 
-  // Small stability reward if we’re inside the height band and slow vertically
-  final stable = (h >= hBandLo && h <= hBandHi && vy.abs() < vyTol);
-  final rStable = stable ? 0.3 : 0.0;
+    // Max attainable height here, given safeTopMargin
+    final maxHHere = (gyCand - safeTopMargin).clamp(0.0, 1e9);
 
-  return rH + rVy + rVx + rStable;
-}
+    if (maxHHere >= minH) {
+      x = xCand;
+      gy = gyCand;
+      ok = true;
+      break;
+    }
+  }
+  // Fallback: use pad center even if it’s tight; we’ll clamp height below.
+  if (!ok) {
+    x = padCx.clamp(safeXMargin, W - safeXMargin);
+    gy = env.terrain.heightAt(x);
+  }
 
-// Randomize starts close to the ground with moderate lateral drift
-void _initLowAltStart(eng.GameEngine env, math.Random r) {
-  final T = env.terrain;
-  final padCx = T.padCenter.toDouble();
-  final W = env.cfg.worldW.toDouble();
-  // final padHalfW = (((T.padX2 - T.padX1).abs()) * 0.5).clamp(12.0, W); // unused but handy
+  // Choose desired height and clamp to feasible at this X.
+  final hDesired = (minH + r.nextDouble() * (maxH - minH)).clamp(minH, maxH);
+  final hMaxFeasible = (gy - safeTopMargin).clamp(minH, maxH);
+  final h = math.min(hDesired, hMaxFeasible);
 
-  // Spawn in a corridor around pad, low height
-  final x = (padCx + (r.nextDouble() * 0.35 - 0.175) * W).clamp(16.0, W - 16.0);
-  final gy = T.heightAt(x);
-  final h = 40.0 + 60.0 * r.nextDouble(); // low altitude
-  final vx = (r.nextDouble() < 0.5 ? -1 : 1) * (10.0 + 30.0 * r.nextDouble());
-  final vy = (r.nextDouble() * 10.0) - 5.0;
+  // Target steps → vy ≈ h / steps. Bound & never let vy be tiny.
+  final tgtSteps = (minSteps + r.nextInt(math.max(1, (maxSteps - minSteps + 1)))).
+  toDouble().clamp(4.0, 900.0);
+
+  final vyFromDur = (0.95 * h / math.max(1.0, tgtSteps)).clamp(minVy, maxVy);
+
+  // Add some randomness but keep bounds.
+  final jitter = 1.0 + 0.15 * (r.nextDouble() * 2 - 1); // ±15%
+  final vy = (vyFromDur * jitter).clamp(minVy, maxVy);
+
+  // Small lateral drift.
+  final vx = (r.nextDouble() * 40.0) - 20.0;
+
+  // Final spawn Y honoring safe top margin and chosen h.
+  final y = (gy - h).clamp(safeTopMargin, H - 10.0);
 
   env.lander
     ..pos.x = x
-    ..pos.y = (gy - h).clamp(0.0, env.cfg.worldH - 10.0)
+    ..pos.y = y
     ..vel.x = vx
     ..vel.y = vy
     ..angle = 0.0
     ..fuel = env.cfg.t.maxFuel;
 }
 
-// One low-altitude “curriculum episode” (teacher executes)
-EpisodeResult _runLowAltEpisode({
+/// Height-aware safe vertical cap used in shaping (more strict near ground).
+double _safeVyCap(double height) {
+  // Like controller caps, but tighter for training signal.
+  double vyCap = 10.0 + 0.08 * math.sqrt(height.clamp(0.0, 9999.0)) * 40.0;
+  return vyCap.clamp(8.0, 38.0);
+}
+
+/// Reward that encourages:
+///  - killing downward speed as ground approaches
+///  - being laterally near pad during the flare
+///  - small touchdown bonus when slow & centered
+double _hardApproachReward({required eng.GameEngine env, required double dt, required int tStep}) {
+  final x = env.lander.pos.x.toDouble();
+  final vx = env.lander.vel.x.toDouble();
+  final vy = env.lander.vel.y.toDouble();
+  final W  = env.cfg.worldW.toDouble();
+
+  final padCx = env.terrain.padCenter.toDouble();
+  final dxAbs = (x - padCx).abs();
+
+  final gy = env.terrain.heightAt(x);
+  final h  = (gy - env.lander.pos.y).toDouble().clamp(0.0, 1000.0);
+
+  // 1) Penalize excess vertical speed vs height-aware cap
+  final vyCap = _safeVyCap(h);
+  final excessDown = (vy - vyCap).clamp(0.0, double.infinity); // >0 when too fast down
+  double rVert = -0.015 * excessDown; // vertical shaping
+
+  // 2) Lateral regularization that ramps near ground
+  final nearPadBand = 0.12 * W;
+  final prox = math.exp(-(dxAbs * dxAbs) / (nearPadBand * nearPadBand + 1e-6));
+  final rLat = -0.0005 * (vx.abs()) * (0.3 + 0.7 * prox); // kill lateral during flare
+
+  // 3) Touchdown bonus (if very close to ground & slow)
+  double rTouch = 0.0;
+  final vmag = math.sqrt(vx * vx + vy * vy);
+  if (h < 40.0 && dxAbs < nearPadBand && vmag < 18.0) {
+    rTouch = 0.8 * (18.0 - vmag) / 18.0;
+  }
+
+  return rVert + rLat + rTouch;
+}
+
+/// Inner loop like Stage1’s, but with hard-approach starts and reward above.
+/// Uses teacher control for safety; trains both intent & action heads.
+EpisodeResult _runHardApproachEpisode({
   required eng.GameEngine env,
   required FeatureExtractorRays fe,
   required PolicyNetwork policy,
@@ -1376,29 +1420,29 @@ EpisodeResult _runLowAltEpisode({
   required double intentAlignWeight,
   required double intentPgWeight,
   required double actionAlignWeight,
-  // reward knobs (optional override from CLI later)
-  double hTarget = 70.0,
-  double hBandLo = 35.0,
-  double hBandHi = 120.0,
+  int minSteps = 24,
+  int maxSteps = 72,
 }) {
   policy.trunk.trainMode = true;
 
+  // buffers
   final decisionRewards = <double>[];
   final decisionCaches  = <ForwardCache>[];
   final intentChoices   = <int>[];
   final decisionReturns = <double>[];
   final alignLabels     = <int>[];
 
-  final actionCaches        = <ForwardCache>[];
-  final actionTurnTargets   = <int>[];
-  final actionThrustTargets = <bool>[];
+  final actionCaches       = <ForwardCache>[];
+  final actionTurnTargets  = <int>[];
+  final actionThrustTargets= <bool>[];
 
+  // Reset & init
   env.reset(seed: rnd.nextInt(1 << 30));
-  _initLowAltStart(env, rnd);
+  _initHardApproachStart(env, rnd,minSteps: minSteps, maxSteps: maxSteps);
 
   int framesLeft = 0;
   int currentIntentIdx = 0;
-  double Racc = 0.0;
+  double accReward = 0.0;
 
   int steps = 0;
   double totalCost = 0.0;
@@ -1408,9 +1452,13 @@ EpisodeResult _runLowAltEpisode({
     if (framesLeft <= 0) {
       var x = fe.extract(env);
       final yTeacher = predictiveIntentLabelAdaptive(env);
-      if (norm != null) { norm.observe(x); x = norm.normalize(x, update: false); }
-
+      if (norm != null) {
+        norm.observe(x);
+        x = norm.normalize(x, update: false);
+      }
       final (idxGreedy, p, cache) = policy.actIntentGreedy(x);
+
+      // Temperature sampling for more exploration
       int pick;
       if (tempIntent <= 1e-6) {
         pick = idxGreedy;
@@ -1424,35 +1472,40 @@ EpisodeResult _runLowAltEpisode({
       }
       currentIntentIdx = pick;
 
+      // bookkeeping
       decisionCaches.add(cache);
       intentChoices.add(pick);
       alignLabels.add(yTeacher);
-      decisionRewards.add(Racc);
-      Racc = 0.0;
+      decisionRewards.add(accReward);
+      accReward = 0.0;
 
-      // compute normalized returns over the (growing) decision window
-      final Tn = decisionRewards.length;
-      final tmp = List<double>.filled(Tn, 0.0);
+      // returns
+      final T = decisionRewards.length;
+      final tmp = List<double>.filled(T, 0.0);
       double G = 0.0;
-      for (int i = Tn - 1; i >= 0; i--) { G = decisionRewards[i] + gamma * G; tmp[i] = G; }
-      double mean = 0.0; for (final v in tmp) mean += v; mean /= math.max(1, Tn);
+      for (int i = T - 1; i >= 0; i--) { G = decisionRewards[i] + gamma * G; tmp[i] = G; }
+      double mean = 0.0; for (final v in tmp) mean += v; mean /= math.max(1, T);
       double var0 = 0.0; for (final v in tmp) { final d = v - mean; var0 += d * d; }
-      var0 = (var0 / math.max(1, Tn)).clamp(1e-9, double.infinity);
+      var0 = (var0 / math.max(1, T)).clamp(1e-9, double.infinity);
       final std = math.sqrt(var0);
-      decisionReturns..clear()..addAll(tmp.map((v) => (v - mean) / std));
+      decisionReturns
+        ..clear()
+        ..addAll(tmp.map((v) => (v - mean) / std));
       framesLeft = planHold;
     }
 
     final intent = indexToIntent(currentIntentIdx);
     final uTeacher = controllerForIntent(intent, env);
 
+    // supervise action head
     var xAct = fe.extract(env);
     if (norm != null) xAct = norm.normalize(xAct, update: false);
-    final (_, __, ___, ____, cAct) = policy.actGreedy(xAct);
-    actionCaches.add(cAct);
+    final (_, __, ___, ____, cacheAct) = policy.actGreedy(xAct);
+    actionCaches.add(cacheAct);
     actionTurnTargets.add(uTeacher.left ? 0 : (uTeacher.right ? 2 : 1));
     actionThrustTargets.add(uTeacher.thrust);
 
+    // step env using teacher
     final info = env.step(1 / 60.0, et.ControlInput(
       thrust: uTeacher.thrust,
       left: uTeacher.left,
@@ -1463,29 +1516,24 @@ EpisodeResult _runLowAltEpisode({
       intentIdx: currentIntentIdx,
     ));
 
-    Racc += _lowAltReward(
-      env: env, dt: 1/60.0, tStep: steps,
-      hTarget: hTarget, hBandLo: hBandLo, hBandHi: hBandHi,
-    );
+    // accumulate shaping
+    accReward += _hardApproachReward(env: env, dt: 1 / 60.0, tStep: steps);
 
     totalCost += info.costDelta;
     steps++;
     framesLeft--;
 
-    // End early if it climbs far away or timeouts; we care about stable low-alt flight
-    final gy = env.terrain.heightAt(env.lander.pos.x.toDouble());
-    final h = (gy - env.lander.pos.y).toDouble();
-    final tooHigh = h > (hBandHi + 160.0);
-    if (info.terminal || steps > 600 || tooHigh) {
-      landed = (env.status == et.GameStatus.landed);
-      if (decisionRewards.isNotEmpty && Racc.abs() > 0) {
-        decisionRewards[decisionRewards.length - 1] += Racc;
-        Racc = 0.0;
+    if (info.terminal || steps > 900) {
+      landed = env.status == et.GameStatus.landed;
+      if (decisionRewards.isNotEmpty && accReward.abs() > 0) {
+        decisionRewards[decisionRewards.length - 1] += accReward;
+        accReward = 0.0;
       }
       break;
     }
   }
 
+  // update
   policy.updateFromEpisode(
     decisionCaches: decisionCaches,
     intentChoices: intentChoices,
@@ -1533,12 +1581,12 @@ void main(List<String> argv) async {
   final curBatch = args.getInt('curriculum_batch', def: 1);
   final warmAfterCurr = args.getFlag('warm_norm_after_curriculum', def: true);
 
-  // ---- Curriculum Stage 2 (low-altitude) ----
-  final loaltIters = args.getInt('lowalt_iters', def: 0);
-  final loaltBatch = args.getInt('lowalt_batch', def: 1);
-  final loaltHTarget = args.getDouble('lowalt_h_target', def: 70.0);
-  final loaltHBandLo = args.getDouble('lowalt_h_lo', def: 35.0);
-  final loaltHBandHi = args.getDouble('lowalt_h_hi', def: 120.0);
+  // ---- Hard-approach (Stage 3) knobs ----
+  final hardAppIters = args.getInt('hardapp_iters', def: 0);
+  final hardAppBatch = args.getInt('hardapp_batch', def: 1);
+  final warmAfterHardApp = args.getFlag('warm_norm_after_hardapp', def: true);
+  final hardAppMinSteps = args.getInt('hardapp_min_steps', def: 24);
+  final hardAppMaxSteps = args.getInt('hardapp_max_steps', def: 72);
 
   // ---- Stage 2 (PF) knobs ----
   final iters = args.getInt('train_iters', def: args.getInt('iters', def: 200));
@@ -1789,45 +1837,63 @@ void main(List<String> argv) async {
     }
   }
 
-  // ----- CURRICULUM STAGE 2 (optional: low-altitude flight) -----
-  if (loaltIters > 0) {
-    print('=== Curriculum Stage 2: low-altitude flight near ground ===');
-    final rnd2 = math.Random(seed ^ 0xBADA55);
-    for (int it = 0; it < loaltIters; it++) {
-      for (int b = 0; b < math.max(1, loaltBatch); b++) {
-        _runLowAltEpisode(
+  // ----- CURRICULUM STAGE 3 (optional: hard approach to ground) -----
+  if (hardAppIters > 0) {
+    print('=== Curriculum Stage 3: hard approach to ground ===');
+    final rnd = math.Random(seed ^ 0x0BADF00D);
+    for (int it = 0; it < hardAppIters; it++) {
+      for (int b = 0; b < math.max(1, hardAppBatch); b++) {
+        final res = _runHardApproachEpisode(
           env: env,
           fe: fe,
           policy: policy,
           norm: trainer.norm,
-          rnd: rnd2,
+          rnd: rnd,
           planHold: planHold,
-          tempIntent: tempIntent, // keep a bit of exploration
+          tempIntent: tempIntent,     // exploration useful in this phase
           gamma: 0.99,
           lr: lr,
           intentAlignWeight: intentAlignWeight,
           intentPgWeight: intentPgWeight,
           actionAlignWeight: actionAlignWeight,
-          hTarget: loaltHTarget,
-          hBandLo: loaltHBandLo,
-          hBandHi: loaltHBandHi,
+          minSteps: hardAppMinSteps,
+          maxSteps: hardAppMaxSteps,
         );
+        if (gateVerbose && (b == 0)) {
+          final vy = env.lander.vel.y.toDouble();
+          final h  = (env.terrain.heightAt(env.lander.pos.x.toDouble()) - env.lander.pos.y).toDouble();
+          final estSteps = (h / math.max(1e-6, vy)).toStringAsFixed(1);
+          print('[HARDAPP] iter=${it + 1} | vy=${vy.toStringAsFixed(1)} | h=${h.toStringAsFixed(1)} '
+              '| estSteps≈$estSteps | steps=${res.steps}');
+        }
       }
-      if ((it + 1) % 200 == 0) {
-        print('[CUR-LOWALT] iter=${it + 1}');
+      if (gateVerbose && ((it + 1) % 100 == 0)) {
+        print('[TRAIN/HARDAPP] iter=${it + 1}');
       }
     }
 
-    // Save a clearly-named snapshot after low-altitude curriculum
+    // Save snapshot for clarity
     _savePolicy(
-      path: 'policy_curriculum_lowalt.json',
+      path: 'policy_curriculum_approach.json',
       p: policy,
       rayCount: env.rayCfg.rayCount,
       kindsOneHot: kindsOneHot,
       env: env,
       norm: trainer.norm,
     );
-    print('★ Curriculum Stage 2 complete → saved policy_curriculum_lowalt.json');
+    print('★ Curriculum Stage 3 complete → saved policy_curriculum_approach.json');
+
+    // Optional: re-warm norm to include the new approach distribution
+    if (warmAfterHardApp) {
+      _warmFeatureNorm(
+        norm: trainer.norm,
+        trainer: trainer,
+        fe: fe,
+        env: env,
+        perClass: 400,
+        seed: seed ^ 0xBEE,
+      );
+    }
   }
 
   // ===== Baseline eval (honors --eval_episodes exactly) =====
@@ -1975,7 +2041,7 @@ Examples:
 
 1) Resume from a saved policy and run PF training (stage 2 only):
   dart run lib/ai/train_agent.dart \
-    --load_policy=policy_curriculum_lowalt.json \
+    --load_policy=policy_curriculum.json \
     --hidden=96,96,64 \
     --train_iters=400 --batch=1 --lr=0.0003 --plan_hold=1 \
     --blend_policy=1.0 --intent_align=0.25 --intent_pg=0.6 \
@@ -1983,17 +2049,19 @@ Examples:
     --eval_every=20 --eval_episodes=120 \
     --eval_parallel --eval_workers=20
 
-2) Run curriculum stage 1 (speed-min) then stage 2 (low-alt) then PF:
+2) Run curriculum stage 1, stage 3 (hard approach), then stage 2 (PF):
   dart run lib/ai/train_agent.dart \
-    --curriculum_iters=3000 --curriculum_batch=1 \
-    --lowalt_iters=1500 --lowalt_batch=1 \
+    --curriculum_iters=2500 --curriculum_batch=1 \
+    --hardapp_iters=1500   --hardapp_batch=1 \
     --train_iters=400 --batch=1 --lr=0.0003 \
     --plan_hold=1 --intent_temp=1.0 \
-    --intent_align=0.25 --intent_pg=0.6 --action_align=0.0
+    --intent_align=0.25 --intent_pg=0.6 --action_align=0.0 \
+    --eval_every=20 --eval_episodes=120 \
+    --eval_parallel --eval_workers=20
 
 Notes:
 - Stage 1 saves an intermediate snapshot as policy_curriculum.json.
-- Stage 2 saves an intermediate snapshot as policy_curriculum_lowalt.json.
-- Pass --warm_norm_after_curriculum=false to skip post-curriculum norm warming.
+- Stage 3 saves an intermediate snapshot as policy_curriculum_approach.json.
+- Pass --warm_norm_after_curriculum=false or --warm_norm_after_hardapp=false to skip post-stage norm warming.
 - You can still use all PF knobs (--pf_*) and evaluation flags exactly as before.
 ------------------------------------------------------------------------------ */
