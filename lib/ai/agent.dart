@@ -282,8 +282,9 @@ int predictiveIntentLabelAdaptive(
   }
 
   if (dxF.abs() > padExit) {
-    return dxF > 0 ? intentToIndex(Intent.goRight)
-        : intentToIndex(Intent.goLeft);
+    // If we're right of center (dxF > 0), we should go LEFT toward the pad.
+    return dxF > 0 ? intentToIndex(Intent.goLeft)
+        : intentToIndex(Intent.goRight);
   }
 
   final willExitSoon = (dxF.abs() > padEnter) && (dx.abs() <= padEnter);
