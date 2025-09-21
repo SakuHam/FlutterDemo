@@ -20,7 +20,7 @@ double _tanh(double x) {
 }
 
 // SiLU / Swish: x * sigmoid(x) — friendlier in noisy regimes than tanh
-double _silu(double x) {
+double silu(double x) {
   if (x >= 0) {
     final e = math.exp(-x);
     return x / (1.0 + e);
@@ -194,7 +194,7 @@ class MLPTrunk {
 
   double _act(double z) {
     switch (activation) {
-      case Activation.silu: return _silu(z);
+      case Activation.silu: return silu(z);
       case Activation.tanh:
       default: return _tanh(z);
     }

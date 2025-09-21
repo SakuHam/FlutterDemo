@@ -494,6 +494,23 @@ void main(List<String> argv) async {
   final gateOnlyLanded = args.getFlag('gate_landed', def: false);
   final gateVerbose = args.getFlag('gate_verbose', def: true);
 
+  // ---------------------- Hebbian CLI knobs (new) ----------------------
+  final hebbOn       = args.getFlag('hebbian', def: false);
+  final hebbEta      = args.getDouble('hebb_eta', def: 3e-4);
+  final hebbClip     = args.getDouble('hebb_clip', def: 0.02);
+  final hebbRowCap   = args.getDouble('hebb_row_cap', def: 2.5);
+  final hebbOja      = args.getFlag('hebb_oja', def: true);
+  final hebbTrunk    = args.getFlag('hebb_trunk', def: true);
+  final hebbHeadInt  = args.getFlag('hebb_head_intent', def: false); // keep false by default
+  final hebbHeadTurn = args.getFlag('hebb_head_turn', def: true);
+  final hebbHeadThr  = args.getFlag('hebb_head_thr', def: true);
+  final hebbHeadVal  = args.getFlag('hebb_head_val', def: false);
+
+  final hebbModGain   = args.getDouble('hebb_mod_gain', def: 0.6);
+  final hebbModClip   = args.getDouble('hebb_mod_clip', def: 1.5);
+  final minIntEntropy = args.getDouble('min_intent_entropy', def: 0.5);
+  final maxSameRun    = args.getInt('max_same_intent_run', def: 48);
+
   double bestMeanCost = double.infinity;
 
   // ----- Build env -----
@@ -577,6 +594,25 @@ void main(List<String> argv) async {
     externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
       return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
     }),
+
+    // ---- NEW: Hebbian + guards wiring ----
+    hebbian: HebbianConfig(
+      enabled: hebbOn,
+      useOja: hebbOja,
+      eta: hebbEta,
+      clip: hebbClip,
+      rowL2Cap: hebbRowCap,
+      // where to apply
+      trunk: hebbTrunk,
+      headIntent: hebbHeadInt,
+      headTurn: hebbHeadTurn,
+      headThr: hebbHeadThr,
+      headVal: hebbHeadVal,
+    ),
+    hebbModGain: hebbModGain,
+    hebbModAbsClip: hebbModClip,
+    minIntentEntropy: minIntEntropy,
+    maxSameIntentRun: maxSameRun,
   );
 
   // Determinism probe

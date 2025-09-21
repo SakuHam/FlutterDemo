@@ -27,6 +27,55 @@ Intent indexToIntent(int k) => Intent.values[k.clamp(0, Intent.values.length - 1
 double _clip(double x, double a, double b) => x < a ? a : (x > b ? b : x);
 
 /* -------------------------------------------------------------------------- */
+/*                             HEBBIAN CONFIG/UTIL                            */
+/* -------------------------------------------------------------------------- */
+
+class HebbianConfig {
+  final bool enabled;
+  final bool useOja;   // Oja-stabilized (recommended)
+  final double eta;    // learning rate multiplier
+  final double decay;  // used if !useOja
+  final double clip;   // per-weight delta clip
+  final double rowL2Cap; // cap per-row L2 norm after update (<=0 disables)
+
+  // where to apply
+  final bool trunk;
+  final bool headIntent; // default false to avoid intent lock-in
+  final bool headTurn;
+  final bool headThr;
+  final bool headVal; // usually false
+
+  const HebbianConfig({
+    this.enabled = false,
+    this.useOja = true,
+    this.eta = 3e-4,
+    this.decay = 1e-4,
+    this.clip = 0.02,
+    this.rowL2Cap = 2.5,
+
+    this.trunk = true,
+    this.headIntent = false,
+    this.headTurn = true,
+    this.headThr = true,
+    this.headVal = false,
+  });
+}
+
+double _clipD(double x, double a) => x < -a ? -a : (x > a ? a : x);
+
+double _l2(List<double> v) {
+  double s = 0.0; for (final x in v) s += x * x; return math.sqrt(s);
+}
+void _capRowL2(List<double> row, double cap) {
+  if (cap <= 0) return;
+  final n = _l2(row);
+  if (n > cap && n > 0) {
+    final k = cap / n;
+    for (int j = 0; j < row.length; j++) row[j] *= k;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /*                               RUNNING  NORM                                */
 /* -------------------------------------------------------------------------- */
 
@@ -569,6 +618,136 @@ class PolicyNetwork {
     );
   }
 
+  /// Forward that also returns layer-wise inputs/outputs for Hebbian.
+  /// Layer indexing:
+  ///   0..trunk.layers.length-1  -> trunk layers (pre=input of layer, post=activation)
+  ///   then heads in order: intent, turn, thr, val (post = raw logits/value)
+  (List<double> intentLogits, List<double> turnLogits, double thrLogit, double valScalar,
+  List<List<double>> preActs, List<List<double>> postActs)
+  forwardWithActs(List<double> x) {
+    final preActs = <List<double>>[];
+    final postActs = <List<double>>[];
+
+    // Trunk
+    List<double> h = x;
+    for (final layer in trunk.layers) {
+      final pre = List<double>.from(h);
+      preActs.add(pre);
+      final z = List<double>.filled(layer.b.length, 0.0);
+      for (int i = 0; i < layer.W.length; i++) {
+        double s = layer.b[i];
+        final Wi = layer.W[i];
+        for (int j = 0; j < Wi.length; j++) s += Wi[j] * h[j];
+        z[i] = s;
+      }
+      final a = List<double>.generate(z.length, (i) => nn.silu(z[i]));
+      postActs.add(a);
+      h = a;
+    }
+
+    // Heads: linear logits/value
+    List<double> _head(List<List<double>> W, List<double> b, List<double> inp) {
+      final z = List<double>.filled(b.length, 0.0);
+      for (int i = 0; i < W.length; i++) {
+        double s = b[i];
+        final Wi = W[i];
+        for (int j = 0; j < Wi.length; j++) s += Wi[j] * inp[j];
+        z[i] = s;
+      }
+      return z;
+    }
+
+    final headPre = List<double>.from(h);
+
+    preActs.add(headPre);
+    final intentLogits = _head(heads.intent.W, heads.intent.b, h);
+    postActs.add(List<double>.from(intentLogits));
+
+    preActs.add(headPre);
+    final turnLogits = _head(heads.turn.W, heads.turn.b, h);
+    postActs.add(List<double>.from(turnLogits));
+
+    preActs.add(headPre);
+    final thrLogit = _head(heads.thr.W, heads.thr.b, h)[0];
+    postActs.add([thrLogit]);
+
+    preActs.add(headPre);
+    final valScalar = _head(heads.val.W, heads.val.b, h)[0];
+    postActs.add([valScalar]);
+
+    return (intentLogits, turnLogits, thrLogit, valScalar, preActs, postActs);
+  }
+
+  /// Reward-modulated Hebbian tick.
+  /// dW_ij = eta * mod * ( post_i * pre_j  - (useOja ? post_i^2 * W_ij : decay * W_ij) )
+  void hebbianTick({
+    required HebbianConfig cfg,
+    required List<List<double>> preActs,
+    required List<List<double>> postActs,
+    required double mod,
+  }) {
+    if (!cfg.enabled) return;
+    if (!mod.isFinite) return;
+
+    int li = 0;
+
+    // Trunk
+    for (final layer in trunk.layers) {
+      if (cfg.trunk) {
+        final pre = preActs[li];
+        final post = postActs[li];
+        _hebbLayerUpdate(layer.W, cfg, pre, post, mod);
+      }
+      li++;
+    }
+
+    // Heads (order matches forwardWithActs appends)
+    if (cfg.headIntent) {
+      _hebbLayerUpdate(heads.intent.W, cfg, preActs[li], postActs[li], mod);
+    }
+    li++;
+
+    if (cfg.headTurn) {
+      _hebbLayerUpdate(heads.turn.W, cfg, preActs[li], postActs[li], mod);
+    }
+    li++;
+
+    if (cfg.headThr) {
+      _hebbLayerUpdate(heads.thr.W, cfg, preActs[li], postActs[li], mod);
+    }
+    li++;
+
+    if (cfg.headVal) {
+      _hebbLayerUpdate(heads.val.W, cfg, preActs[li], postActs[li], mod);
+    }
+  }
+
+  void _hebbLayerUpdate(
+      List<List<double>> W,
+      HebbianConfig cfg,
+      List<double> pre,
+      List<double> post,
+      double mod,
+      ) {
+    final m = mod;
+    final eta = cfg.eta;
+    final clip = cfg.clip;
+    final decay = cfg.decay;
+
+    for (int i = 0; i < W.length; i++) {
+      final Wi = W[i];
+      final pi = post[i];
+      final stabFactor = cfg.useOja ? (pi * pi) : decay; // Oja vs decay
+      for (int j = 0; j < Wi.length; j++) {
+        final hebb = pi * pre[j];
+        final stab = stabFactor * Wi[j];
+        final dw = eta * m * (hebb - stab);
+        Wi[j] += _clipD(dw, clip);
+      }
+      if (cfg.rowL2Cap > 0) _capRowL2(Wi, cfg.rowL2Cap);
+    }
+  }
+
   (int, List<double>, ForwardCache) actIntentGreedy(List<double> x) {
     final c = _forwardFull(x);
     int arg = 0;
@@ -853,6 +1032,26 @@ required double dt,
 required int tStep,
 });
 
+class _Ema {
+  double m; final double a;
+  _Ema({this.a = 0.98, double init = 0.0}) : m = init;
+  double update(double x) { m = a * m + (1 - a) * x; return m; }
+}
+
+double _entropyFromLogits(List<double> logits) {
+  // softmax -> probs in a numerically stable way
+  final maxZ = logits.reduce((a,b) => a > b ? a : b);
+  var sum = 0.0;
+  final exps = List<double>.filled(logits.length, 0.0);
+  for (int i = 0; i < logits.length; i++) { exps[i] = math.exp(logits[i] - maxZ); sum += exps[i]; }
+  double H = 0.0;
+  for (final e in exps) {
+    final p = e / sum;
+    if (p > 0) H += -p * math.log(p);
+  }
+  return H;
+}
+
 class Trainer {
   final eng.GameEngine env;
   final FeatureExtractorRays fe;
@@ -876,13 +1075,13 @@ class Trainer {
   final bool gateOnlyLanded;
   final bool gateVerbose;
 
-  // NEW: accept near-pad crashes (configurable)
+  // accept near-pad crashes (configurable)
   final bool gateAcceptNearPadCrashes;
   final double gatePadFrac;
   final double gatePadHeight;
   final double gateMaxImpactSpeed;
 
-  // NEW: align teacher label polarity with pad rays (to mirror runtime fixer)
+  // align teacher label polarity with pad rays
   final bool alignPolarityWithPadRays;
 
   final RunningNorm? norm;
@@ -895,6 +1094,16 @@ class Trainer {
 
   // external per-step reward hook (PF)
   final ExternalRewardHook? externalRewardHook;
+
+  // Hebbian plasticity config + guards
+  final HebbianConfig hebbian;
+  final double hebbModGain;        // scales centered reward
+  final double hebbModAbsClip;     // absolute clip for modulation
+  final double minIntentEntropy;   // skip head Hebbian below this
+  final int maxSameIntentRun;      // skip head Hebbian if repeating too long
+  final _Ema _modEma = _Ema(a: 0.98);
+  int _sameIntentRun = 0;
+  int _lastIntent = -1;
 
   Trainer({
     required this.env,
@@ -924,11 +1133,19 @@ class Trainer {
     this.gatePadHeight = 160.0,
     this.gateMaxImpactSpeed = 60.0,
 
-    // NEW: training-time polarity alignment
+    // training-time polarity alignment
     this.alignPolarityWithPadRays = true,
 
     this.externalRewardHook,
-  }) : norm = RunningNorm(fe.inputSize, momentum: 0.995);
+
+    // Hebbian + guards
+    HebbianConfig? hebbian,
+    this.hebbModGain = 0.6,
+    this.hebbModAbsClip = 1.5,
+    this.minIntentEntropy = 0.5, // nats
+    this.maxSameIntentRun = 48,  // ~0.8s @60Hz
+  }) : hebbian = hebbian ?? const HebbianConfig(),
+        norm = RunningNorm(fe.inputSize, momentum: 0.995);
 
   int _sampleCategorical(List<double> probs, math.Random r, double temp) {
     if (temp <= 1e-6) {
@@ -974,7 +1191,7 @@ class Trainer {
     env.reset(seed: r.nextInt(1 << 30));
     double totalCost = 0.0;
 
-    // PF logging (use seg* names to keep CLI the same)
+    // PF logging
     double segSum = 0.0;
     int segCount = 0;
 
@@ -996,7 +1213,7 @@ class Trainer {
           env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35,
         );
 
-        // ===== NEW: flip teacher left/right if pad-ray polarity disagrees =====
+        // flip teacher left/right if pad-ray polarity disagrees
         if (alignPolarityWithPadRays) {
           final L = env.lander;
           final rays = env.rays;
@@ -1019,8 +1236,20 @@ class Trainer {
         }
 
         final (idxGreedy, p, cache) = policy.actIntentGreedy(x);
+        // Optional tiny exploration to avoid deadlocks:
+        // final eps = 0.03;
+        // final smoothed = List<double>.generate(p.length, (i) => (1 - eps) * p[i] + eps / p.length);
+        // final idx = greedy ? idxGreedy : _sampleCategorical(smoothed, r, tempIntent);
         final idx = greedy ? idxGreedy : _sampleCategorical(p, r, tempIntent);
         currentIntentIdx = idx;
+
+        // repetition tracking for lock guard
+        if (_lastIntent == currentIntentIdx) {
+          _sameIntentRun++;
+        } else {
+          _sameIntentRun = 0;
+          _lastIntent = currentIntentIdx;
+        }
 
         if (train) {
           // PF-only: push the accumulated PF reward for the last window
@@ -1060,7 +1289,7 @@ class Trainer {
           for (final v in tmp) decisionReturns.add((v - mean) / std);
         }
 
-        // adaptive plan hold (unchanged)
+        // adaptive plan hold
         final padCx = env.terrain.padCenter.toDouble();
         final dxAbs = (env.lander.pos.x.toDouble() - padCx).abs();
         final vxAbs = env.lander.vel.x.toDouble().abs();
@@ -1079,6 +1308,10 @@ class Trainer {
 
       var xAct = fe.extract(env);
       xAct = norm?.normalize(xAct, update: false) ?? xAct;
+
+      // Hebbian-aware forward (for activations)
+      final fw = policy.forwardWithActs(xAct);
+      // Also keep greedy path for caches/UI:
       final (thBool, lf, rt, probs, cAct) = policy.actGreedy(xAct);
 
       final groundY = env.terrain.heightAt(env.lander.pos.x);
@@ -1109,11 +1342,48 @@ class Trainer {
       final execSideRight = uTeacher.sideRight;
       final execDown      = uTeacher.downThrust;
 
-      // ----- PF-only reward accumulation -----
+      // ----- PF-only reward accumulation / modulation -----
       final r_pf = externalRewardHook?.call(env: env, dt: dt, tStep: steps) ?? 0.0;
       pfAcc += r_pf;
       segSum += r_pf; // for logging/gating
       segCount++;
+
+      // --- Reward-modulated Hebbian tick (centered, clipped, guarded) ---
+      if (train && hebbian.enabled) {
+        // Center & scale the reward, then hard-clip
+        final centered = r_pf - _modEma.update(r_pf);
+        double mod = centered * hebbModGain;
+        if (mod >  hebbModAbsClip) mod =  hebbModAbsClip;
+        if (mod < -hebbModAbsClip) mod = -hebbModAbsClip;
+
+        if (mod != 0.0) {
+          final intentEntropy = _entropyFromLogits(fw.$1); // fw.$1 = intentLogits
+          final skipHeadsForLock = (_sameIntentRun >= maxSameIntentRun) || (intentEntropy < minIntentEntropy);
+
+          final cfg = skipHeadsForLock
+              ? HebbianConfig(
+            enabled: true,
+            useOja: hebbian.useOja,
+            eta: hebbian.eta,
+            decay: hebbian.decay,
+            clip: hebbian.clip,
+            rowL2Cap: hebbian.rowL2Cap,
+            trunk: hebbian.trunk,
+            headIntent: false,
+            headTurn: false,
+            headThr: false,
+            headVal: false,
+          )
+              : hebbian;
+
+          policy.hebbianTick(
+            cfg: cfg,
+            preActs: fw.$5,   // pre
+            postActs: fw.$6,  // post
+            mod: mod,
+          );
+        }
+      }
 
       actionCaches.add(cAct);
       actionTurnTargets.add(uTeacher.left ? 0 : (uTeacher.right ? 2 : 1));
@@ -1145,7 +1415,6 @@ class Trainer {
           decisionRewards[decisionRewards.length - 1] += pfAcc;
           pfAcc = 0.0;
         }
-        // PF-only: no terminal bonus/penalty
         break;
       }
       if (steps > 5000) break;
