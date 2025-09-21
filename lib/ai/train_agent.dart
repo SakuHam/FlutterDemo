@@ -9,9 +9,14 @@ import '../engine/game_engine.dart' as eng;
 import '../engine/raycast.dart'; // RayConfig
 
 import 'agent.dart' as ai; // FeatureExtractorRays, PolicyNetwork, Trainer, RunningNorm, kIntentNames, predictiveIntentLabelAdaptive
-import 'agent.dart';       // bring symbols into scope (PolicyNetwork etc.)
+import 'agent.dart';
 import 'nn_helper.dart' as nn;
 import 'potential_field.dart'; // buildPotentialField, PotentialField
+
+// MODULAR CURRICULA
+import 'curriculum/core.dart';
+import 'curriculum/speed_min.dart';
+import 'curriculum/hard_approach.dart';
 
 /* ------------------------------- tiny arg parser ------------------------------- */
 
@@ -40,6 +45,9 @@ class _Args {
     final s = v.toLowerCase();
     return s == '1' || s == 'true' || s == 'yes' || s == 'on';
   }
+
+  Map<String, String?> get kv => _kv;
+  Set<String> get flags => _flags;
 }
 
 int _iclamp(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
@@ -473,8 +481,6 @@ Future<EvalStats> evaluateParallel({
   required bool evalDebug,
   required int evalDebugFailN,
 }) async {
-  final sw = Stopwatch()..start();
-
   final per = episodes ~/ workers;
   final extra = episodes % workers;
 
@@ -558,13 +564,8 @@ Future<EvalStats> evaluateParallel({
   st.meanSteps = total == 0 ? 0 : stepsSum / total;
   st.meanAbsDx = total == 0 ? 0 : absDxSum / total;
 
-  sw.stop();
-  final ms = sw.elapsedMilliseconds;
-  final eps = total == 0 ? 0 : (1000.0 * total / math.max(1, ms));
-  final ci = _wilson95(landed, math.max(1, total));
-
-  print('Eval: N=$episodes | workers=$workers | ${ms} ms | ${eps.toStringAsFixed(1)} eps/s '
-      '| land%=${st.landPct.toStringAsFixed(1)} (CI ${ci.lo.toStringAsFixed(1)}–${ci.hi.toStringAsFixed(1)}) '
+  print('Eval: N=$episodes | workers=$workers | '
+      '| land%=${st.landPct.toStringAsFixed(1)} '
       '| meanCost=${st.meanCost.toStringAsFixed(3)} '
       '| median=${st.medianCost.toStringAsFixed(3)} | steps=${st.meanSteps.toStringAsFixed(1)} '
       '| mean|dx|=${st.meanAbsDx.toStringAsFixed(1)}');
@@ -581,8 +582,6 @@ EvalStats evaluateSequential({
   bool evalDebug = false,
   int evalDebugFailN = 3,
 }) {
-  final sw = Stopwatch()..start();
-
   final rnd = math.Random(seed);
   final costs = <double>[];
   int landed = 0, crashed = 0, stepsSum = 0;
@@ -633,13 +632,8 @@ EvalStats evaluateSequential({
   st.meanSteps = stepsSum / episodes;
   st.meanAbsDx = absDxSum / episodes;
 
-  sw.stop();
-  final ms = sw.elapsedMilliseconds;
-  final eps = (1000.0 * episodes / math.max(1, ms));
-  final ci = _wilson95(landed, episodes);
-
-  print('Eval: N=$episodes | workers=1 | ${ms} ms | ${eps.toStringAsFixed(1)} eps/s '
-      '| land%=${st.landPct.toStringAsFixed(1)} (CI ${ci.lo.toStringAsFixed(1)}–${ci.hi.toStringAsFixed(1)}) '
+  print('Eval: N=$episodes | workers=1 '
+      '| land%=${st.landPct.toStringAsFixed(1)} '
       '| meanCost=${st.meanCost.toStringAsFixed(3)} '
       '| median=${st.medianCost.toStringAsFixed(3)} | steps=${st.meanSteps.toStringAsFixed(1)} '
       '| mean|dx|=${st.meanAbsDx.toStringAsFixed(1)}');
@@ -922,291 +916,6 @@ ai.ExternalRewardHook makePFRewardHook({
   };
 }
 
-/* ----------------------------- norm warmup (optional) -------------------------- */
-// (unchanged from your prior version; omitted here for brevity)
-
-/* ----------------------------- PF velocity+accel reward ------------------------ */
-// (unchanged from your prior version; omitted here for brevity; keep your PF config + hook)
-
-/* ----------------------- CURRICULUM STAGE 1 (speed-min) ------------------------ */
-// (keep your _speedMinReward, _initCurriculumStart, _runCurriculumEpisode)
-// NOTE: these are identical to your last working version.
-// For space, not re-pasted fully here — keep exactly as you had.
-
-/* -------------------------- Micro-stage: hard approach -------------------------- */
-// -------------------------- HARD APPROACH MICRO-STAGE --------------------------
-
-class _HardAppCfg {
-  final int iters;
-  final int batch;
-  final int minSteps;           // do at least this many steps before allowing early termination
-  final int warmFrames;         // frames where we don't allow main thrust (to establish descent)
-  final double vyMin;           // minimum downward start speed
-  final double vyMax;           // maximum downward start speed
-  final double hMin;            // minimum spawn height
-  final double hMax;            // maximum spawn height
-  final double nearPadFrac;     // spawn near pad horizontally (fraction of W)
-  final bool verbose;
-
-  const _HardAppCfg({
-    required this.iters,
-    this.batch = 1,
-    this.minSteps = 32,
-    this.warmFrames = 12,
-    this.vyMin = 28.0,
-    this.vyMax = 36.0,
-    this.hMin = 120.0,
-    this.hMax = 320.0,
-    this.nearPadFrac = 0.08,
-    this.verbose = true,
-  });
-}
-
-// Initialize a "hard approach": reasonably high, pointed down fast, near pad laterally.
-void _initHardApproachStart(eng.GameEngine env, math.Random r, _HardAppCfg cfg) {
-  final padCx = env.terrain.padCenter.toDouble();
-  final W = env.cfg.worldW.toDouble();
-
-  // sample around pad
-  final x = (padCx + (r.nextDouble() * 2 - 1) * (cfg.nearPadFrac * W))
-      .clamp(10.0, W - 10.0);
-
-  // height & downward speed
-  final h = (cfg.hMin + (cfg.hMax - cfg.hMin) * r.nextDouble());
-  double vy = cfg.vyMin + (cfg.vyMax - cfg.vyMin) * r.nextDouble();
-  if (vy < cfg.vyMin) vy = cfg.vyMin;
-
-  // small lateral drift
-  final vx = (r.nextDouble() * 16.0) - 8.0;
-
-  final gy = env.terrain.heightAt(x);
-  env.lander
-    ..pos.x = x
-    ..pos.y = (gy - h).clamp(0.0, env.cfg.worldH - 10.0)
-    ..vel.x = vx
-    ..vel.y = vy   // NOTE: positive is downward in this engine
-    ..angle = 0.0
-    ..fuel = env.cfg.t.maxFuel;
-}
-
-// A variant teacher for the warm-in window: avoid main thrust so descent actually starts,
-// but allow down-thruster to “commit” downward if available.
-et.ControlInput _teacherHardAppWarm(Intent intent, eng.GameEngine env) {
-  final base = controllerForIntent(intent, env);
-
-  // Never use main thrust in warm-in window
-  bool thrust = false;
-
-  // Optional: encourage down-thrust if rising/too slow (mirrors descendSlow)
-  final t = (env.cfg.t as dynamic);
-  final downEnabled = (t.downThrEnabled ?? false) == true;
-
-  final L = env.lander;
-  final gy = env.terrain.heightAt(L.pos.x);
-  final h  = (gy - L.pos.y).toDouble().clamp(0.0, 1e9);
-  final vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);
-  final needDown = downEnabled && (L.vel.y < 0.6 * vCap);
-
-  return et.ControlInput(
-    thrust: thrust,
-    left: base.left,
-    right: base.right,
-    sideLeft: base.sideLeft,
-    sideRight: base.sideRight,
-    downThrust: needDown,
-  );
-}
-
-// Predict near-future vertical speed (px/s) after tauReact without main thrust.
-double _vyPredictNoThrust(eng.GameEngine env, {double tauReact = 0.35}) {
-  final vy = env.lander.vel.y.toDouble();
-  final g  = env.cfg.t.gravity;
-  return vy + g * tauReact;
-}
-
-EpisodeResult _runHardApproachEpisode({
-  required eng.GameEngine env,
-  required FeatureExtractorRays fe,
-  required PolicyNetwork policy,
-  required RunningNorm? norm,
-  required math.Random rnd,
-  required int planHold,
-  required double tempIntent,
-  required double gamma,
-  required double lr,
-  required double intentAlignWeight,
-  required double intentPgWeight,
-  required double actionAlignWeight,
-  _HardAppCfg cfg = const _HardAppCfg(iters: 0),
-}) {
-  policy.trunk.trainMode = true;
-
-  // Per-episode containers (intent + action heads)
-  final decisionRewards = <double>[];
-  final decisionCaches  = <ForwardCache>[];
-  final intentChoices   = <int>[];
-  final decisionReturns = <double>[];
-  final alignLabels     = <int>[];
-
-  final actionCaches        = <ForwardCache>[];
-  final actionTurnTargets   = <int>[];
-  final actionThrustTargets = <bool>[];
-
-  env.reset(seed: rnd.nextInt(1 << 30));
-  _initHardApproachStart(env, rnd, cfg);
-
-  int framesLeft = 0;
-  int currentIntentIdx = intentToIndex(Intent.descendSlow);
-  double pfAcc = 0.0;
-
-  int steps = 0;
-  double totalCost = 0.0;
-  bool landed = false;
-
-  // local helper: a slightly looser cap so we don't insta-brake near ground
-  double _vCapDescLoose(double h) => (0.12 * h + 10.0).clamp(10.0, 30.0);
-
-  while (true) {
-    if (framesLeft <= 0) {
-      var x = fe.extract(env);
-      final yTeacher = predictiveIntentLabelAdaptive(env);
-      if (norm != null) {
-        norm.observe(x);
-        x = norm.normalize(x, update: false);
-      }
-      final (idxGreedy, p, cache) = policy.actIntentGreedy(x);
-      // sample with temperature to keep exploration high in micro-stage
-      int pick;
-      if (tempIntent <= 1e-6) {
-        pick = idxGreedy;
-      } else {
-        final z = p.map((pp) => math.log(pp.clamp(1e-12, 1.0))).toList();
-        for (int i = 0; i < z.length; i++) z[i] /= tempIntent;
-        final sm = nn.Ops.softmax(z);
-        final u = rnd.nextDouble();
-        double acc = 0.0; pick = sm.length - 1;
-        for (int i = 0; i < sm.length; i++) { acc += sm[i]; if (u <= acc) { pick = i; break; } }
-      }
-      currentIntentIdx = pick;
-
-      decisionCaches.add(cache);
-      intentChoices.add(pick);
-      alignLabels.add(yTeacher);
-      decisionRewards.add(pfAcc);
-      pfAcc = 0.0;
-
-      // compute decision-window advantages
-      final T = decisionRewards.length;
-      final tmp = List<double>.filled(T, 0.0);
-      double G = 0.0;
-      for (int i = T - 1; i >= 0; i--) { G = decisionRewards[i] + gamma * G; tmp[i] = G; }
-      double mean = 0.0; for (final v in tmp) mean += v; mean /= math.max(1, T);
-      double var0 = 0.0; for (final v in tmp) { final d = v - mean; var0 += d * d; }
-      var0 = (var0 / math.max(1, T)).clamp(1e-9, double.infinity);
-      final std = math.sqrt(var0);
-      decisionReturns
-        ..clear()
-        ..addAll(tmp.map((v) => (v - mean) / std));
-
-      framesLeft = planHold;
-    }
-
-    final intent = indexToIntent(currentIntentIdx);
-
-    // Warm-in window to ensure we actually descend
-    final useWarm = (steps < cfg.warmFrames);
-    final uTeacher = useWarm ? _teacherHardAppWarm(intent, env)
-        : controllerForIntent(intent, env);
-
-    // Slightly loosen the vertical cap logic in descend to avoid immediate hover
-    if (!useWarm && intent == Intent.descendSlow) {
-      final L = env.lander;
-      final gy = env.terrain.heightAt(L.pos.x);
-      final h  = (gy - L.pos.y).toDouble().clamp(0.0, 1e9);
-      final vCap = _vCapDescLoose(h);
-      // If predicted vy would exceed our loose cap, allow thrust. Otherwise, prefer letting it fall.
-      final vyNext = _vyPredictNoThrust(env, tauReact: 0.6);
-      final needUp = (L.vel.y > vCap) || (vyNext > 0.9 * vCap);
-      // Override thrust only (keep lateral/rcs from teacher)
-      final u2 = et.ControlInput(
-        thrust: needUp,
-        left: uTeacher.left, right: uTeacher.right,
-        sideLeft: uTeacher.sideLeft, sideRight: uTeacher.sideRight,
-        downThrust: uTeacher.downThrust,
-      );
-      // use the tweaked control
-      final info = env.step(1/60.0, u2);
-      totalCost += info.costDelta;
-    } else {
-      final info = env.step(1/60.0, uTeacher);
-      totalCost += info.costDelta;
-    }
-
-    // collect for action supervision
-    var xAct = fe.extract(env);
-    if (norm != null) xAct = norm.normalize(xAct, update: false);
-    final (thBool, lf, rt, probs, cAct) = policy.actGreedy(xAct);
-    actionCaches.add(cAct);
-    actionTurnTargets.add(uTeacher.left ? 0 : (uTeacher.right ? 2 : 1));
-    actionThrustTargets.add(uTeacher.thrust);
-
-    // dense reward: simple speed-min is OK here (or your PF hook if you want)
-    final vx = env.lander.vel.x.toDouble();
-    final vy = env.lander.vel.y.toDouble();
-    final v = math.sqrt(vx*vx + vy*vy);
-    pfAcc += -0.01 * v;
-
-    steps++;
-    framesLeft--;
-
-    // Enforce a minimum number of steps before allowing termination
-    if (steps < cfg.minSteps && env.status != et.GameStatus.playing) {
-      // If we crashed/landed too early, restart this micro-episode in-place:
-      env.reset(seed: rnd.nextInt(1 << 30));
-      _initHardApproachStart(env, rnd, cfg);
-      framesLeft = 0;
-      continue;
-    }
-
-    if (env.status != et.GameStatus.playing || steps > 900) {
-      landed = env.status == et.GameStatus.landed;
-      if (decisionRewards.isNotEmpty && pfAcc.abs() > 0) {
-        decisionRewards[decisionRewards.length - 1] += pfAcc;
-        pfAcc = 0.0;
-      }
-      break;
-    }
-  }
-
-  // Single update from this episode
-  policy.updateFromEpisode(
-    decisionCaches: decisionCaches,
-    intentChoices: intentChoices,
-    decisionReturns: decisionReturns,
-    alignLabels: alignLabels,
-    alignWeight: intentAlignWeight,
-    intentPgWeight: intentPgWeight,
-    lr: lr,
-    entropyBeta: 0.0,
-    valueBeta: 0.0,
-    huberDelta: 1.0,
-    intentMode: true,
-    actionCaches: actionCaches,
-    actionTurnTargets: actionTurnTargets,
-    actionThrustTargets: actionThrustTargets,
-    actionAlignWeight: actionAlignWeight,
-  );
-
-  if (cfg.verbose) {
-    final L = env.lander;
-    final gy = env.terrain.heightAt(L.pos.x.toDouble());
-    final h  = (gy - L.pos.y).toDouble();
-    print('[HARDAPP] vy=${L.vel.y.toStringAsFixed(1)} | h=${h.toStringAsFixed(1)} | steps=$steps');
-  }
-
-  return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: 0.0);
-}
-
 /* ----------------------------------- main ------------------------------------ */
 
 List<int> _parseHiddenList(String? s, {List<int> fallback = const [64, 64]}) {
@@ -1223,31 +932,48 @@ List<int> _parseHiddenList(String? s, {List<int> fallback = const [64, 64]}) {
 void main(List<String> argv) async {
   final args = _Args(argv);
 
+  // ---- Curriculum registry ----
+  final registry = CurriculumRegistry()
+    ..register('speedmin', () => SpeedMinCurriculum())
+    ..register('hardapp', () => HardApproach());
+
+  // ---- Common CLI ----
   final seed = args.getInt('seed', def: 7);
 
-  // ---- Optional load ----
+  // Optional load
   final loadPath = args.getStr('load_policy');
 
-  // ---- Consolidation (anti-forgetting) ----
+  // Consolidation (anti-forgetting)
   final anchorOnLoad = args.getFlag('anchor_on_load', def: false);
   final anchorAfterCurr = args.getFlag('anchor_after_curriculum', def: true);
   final lambdaTrunk = args.getDouble('consolidate_trunk', def: 1e-3);
   final lambdaHeads = args.getDouble('consolidate_heads', def: 5e-4);
 
-  // ---- Curriculum knobs (Stage 1) ----
-  final curIters = args.getInt('curriculum_iters', def: 0);
-  final curBatch = args.getInt('curriculum_batch', def: 1);
+  // NEW: choose curricula via --curricula="speedmin,hardapp"
+  String curriculaSpec = args.getStr('curricula', def: '') ?? '';
+
+  // Back-compat shim for older flags:
+  // --curriculum (bool), --lowalt_iters (maps to "speedmin"), --hardapp_iters (maps to "hardapp")
+  final legacyCurr = args.getFlag('curriculum', def: false);
+  final lowaltIters = args.getInt('lowalt_iters', def: 0);   // treat as speedmin
+  final hardappIters = args.getInt('hardapp_iters', def: 0); // treat as hardapp
+
+  if (curriculaSpec.isEmpty && (legacyCurr || lowaltIters > 0 || hardappIters > 0)) {
+    final keys = <String>[];
+    if (lowaltIters > 0) keys.add('speedmin');
+    if (hardappIters > 0) keys.add('hardapp');
+    if (keys.isEmpty) keys.add('speedmin'); // default if just --curriculum was passed
+    curriculaSpec = keys.join(',');
+  }
+
+  final curricula = registry.fromConfig(curriculaSpec);
+
+  // Global default iterations
+  int curIters = args.getInt('curriculum_iters', def: 0);
+
   final warmAfterCurr = args.getFlag('warm_norm_after_curriculum', def: true);
 
-  // ---- Micro-stage: hard approach ----
-  final hardAppIters = args.getInt('hardapp_iters', def: 0);
-  final hardAppBatch = args.getInt('hardapp_batch', def: 1);
-  final hardAppMinSteps = args.getInt('hardapp_min_steps', def: 10);
-  final hardAppVy = args.getDouble('hardapp_vy', def: 35.0);
-  final hardAppHmin = args.getDouble('hardapp_hmin', def: 16.0);
-  final hardAppHmax = args.getDouble('hardapp_hmax', def: 36.0);
-
-  // ---- Stage 2 (PF) ----
+  // Stage 2 (PF)
   final iters = args.getInt('train_iters', def: args.getInt('iters', def: 200));
   final batch = args.getInt('batch', def: 1);
   final lr = args.getDouble('lr', def: 3e-4);
@@ -1282,7 +1008,7 @@ void main(List<String> argv) async {
   final downThrAccel = args.getDouble('down_thr_accel', def: 0.30);
   final downThrBurn = args.getDouble('down_thr_burn', def: 10.0);
 
-  // PF reward CLI knobs (keep your prior values/flags)
+  // PF reward CLI knobs
   final pfAlign = args.getDouble('pf_align', def: 1.0);
   final pfVelDelta = args.getDouble('pf_vel_delta', def: 0.6);
   final pfVminClose = args.getDouble('pf_vmin_close', def: 8.0);
@@ -1359,22 +1085,6 @@ void main(List<String> argv) async {
       env: env,
       norm: null,
     );
-    if (args.getFlag('apply_loaded_norm', def: true)) {
-      try {
-        final raw = File(loadPath).readAsStringSync();
-        final j = json.decode(raw) as Map<String, dynamic>;
-        final nm = (j['norm'] as Map?)?.cast<String, dynamic>();
-        if (nm != null) {
-          final dim = (nm['dim'] as num?)?.toInt() ?? -1;
-          final mean = (nm['mean'] as List?)?.map((e) => (e as num).toDouble()).toList();
-          final var_ = (nm['var']  as List?)?.map((e) => (e as num).toDouble()).toList();
-          if (mean != null && var_ != null && dim == inDim) {
-            // will be copied to trainer.norm once trainer is created
-            print('Found saved feature norm in loaded policy.');
-          }
-        }
-      } catch (_) {}
-    }
     if (anchorOnLoad) {
       policy.captureConsolidationAnchor();
       policy.consolidateEnabled = true;
@@ -1385,23 +1095,9 @@ void main(List<String> argv) async {
     }
   }
 
-  // ===== PF reward hook =====
-  final pfCfg = PFShapingCfg(
-    wAlign: pfAlign,
-    wVelDelta: pfVelDelta,
-    vMinClose: pfVminClose,
-    vMaxFar: pfVmaxFar,
-    alpha: pfAlpha,
-    vmax: pfVmax,
-    xBias: pfXBias,
-    wAccAlign: pfAccAlign,
-    wAccErr: pfAccErr,
-    accEma: pfAccEma,
-    debug: pfDebug,
-  );
-  ai.ExternalRewardHook? pfHook; // assigned per-episode in Stage 2
+  // ===== Trainer (Stage 2 runtime container) =====
+  ai.ExternalRewardHook? pfHook; // captured by trainer closure
 
-  // ----- Trainer (Stage 2 runtime container) -----
   final trainer = Trainer(
     env: env,
     fe: fe,
@@ -1437,23 +1133,36 @@ void main(List<String> argv) async {
     print('Determinism probe: steps ${a.steps} vs ${b.steps} | cost ${a.cost.toStringAsFixed(6)} vs ${b.cost.toStringAsFixed(6)} => ${ok ? "OK" : "MISMATCH"}');
   }
 
-  // ----- CURRICULUM STAGE 1 (speed-min) -----
-  if (curIters > 0) {
-    print('=== Curriculum Stage 1: speed-min on hard-set vectors ===');
-    final rnd = math.Random(seed ^ 0xABCDEF);
-    for (int it = 0; it < curIters; it++) {
-      for (int b = 0; b < math.max(1, curBatch); b++) {
-        // (call your _runCurriculumEpisode from previous version)
-        // NOTE: keep exactly as your working code.
-        // Example (pseudo-call):
-        // final res = _runCurriculumEpisode(... same params as before ...);
-      }
-      if (gateVerbose && ((it + 1) % 100 == 0)) {
-        print('[TRAIN/CUR] iter=${it + 1}');
-      }
+  // ===== MODULAR CURRICULA (Stage 1/micro-stages) =====
+  if (curricula.isNotEmpty && (curIters > 0 || lowaltIters > 0 || hardappIters > 0)) {
+    print('=== Curricula: ${curricula.map((c) => c.key).join(", ")} ===');
+    for (final cur in curricula) {
+      final itersThis =
+      cur.key == 'hardapp'   && hardappIters > 0 ? hardappIters :
+      cur.key == 'speedmin'  && lowaltIters  > 0 ? lowaltIters  :
+      curIters; // fallback to global
+
+      if (itersThis <= 0) continue;
+
+      cur.configure(args.kv, args.flags);
+      await cur.run(
+        iters: itersThis,
+        env: env,
+        fe: fe,
+        policy: policy,
+        norm: trainer.norm,
+        planHold: planHold,
+        tempIntent: tempIntent,
+        gamma: 0.99,
+        lr: lr,
+        intentAlignWeight: intentAlignWeight,
+        intentPgWeight: intentPgWeight,
+        actionAlignWeight: actionAlignWeight,
+        gateVerbose: gateVerbose,
+        seed: seed,
+      );
     }
 
-    // Save intermediate policy snapshot
     _savePolicy(
       path: 'policy_curriculum.json',
       p: policy,
@@ -1462,75 +1171,19 @@ void main(List<String> argv) async {
       env: env,
       norm: trainer.norm,
     );
-    print('★ Curriculum Stage 1 complete → saved policy_curriculum.json');
+    print('★ Curricula complete → saved policy_curriculum.json');
 
     if (anchorAfterCurr) {
       policy.captureConsolidationAnchor();
       policy.consolidateEnabled = true;
       policy.consolidateTrunk = lambdaTrunk;
       policy.consolidateHeads = lambdaHeads;
-      print('Consolidation anchor captured after Stage 1. '
+      print('Consolidation anchor captured after curricula. '
           'λ_trunk=${policy.consolidateTrunk} λ_heads=${policy.consolidateHeads}');
     }
 
-    // Optional: re-warm norm after new behavior is learned
     if (warmAfterCurr) {
-      // _warmFeatureNorm(...); // keep your previous implementation if you liked it
-    }
-  }
-
-  // ----- Micro-stage: hard approach (optional) -----
-  if (hardAppIters > 0) {
-    print('=== Micro-stage: hard approach ===');
-    final rnd = math.Random(seed ^ 0xA11A);
-    final cfgHA = _HardAppCfg(
-      iters: hardAppIters,      // from CLI
-      batch: 1,
-      minSteps: 32,             // was 10; try 24–48
-      warmFrames: 12,           // gives it time to build descent
-      vyMin: 28.0,
-      vyMax: 36.0,
-      hMin: 120.0,
-      hMax: 320.0,
-      nearPadFrac: 0.08,
-      verbose: true,
-    );
-    for (int it = 0; it < cfgHA.iters; it++) {
-      for (int b = 0; b < math.max(1, cfgHA.batch); b++) {
-        final res = _runHardApproachEpisode(
-          env: env,
-          fe: fe,
-          policy: policy,
-          norm: trainer.norm,
-          rnd: rnd,
-          planHold: planHold,
-          tempIntent: tempIntent,
-          gamma: 0.99,
-          lr: lr,
-          intentAlignWeight: intentAlignWeight,
-          intentPgWeight: intentPgWeight,
-          actionAlignWeight: 0.25, // supervise action a bit stronger here
-          cfg: cfgHA,
-        );
-        if (gateVerbose && b == 0) {
-          final L = env.lander;
-          final gx = env.terrain.heightAt(L.pos.x.toDouble());
-          final h = (gx - L.pos.y).toDouble();
-          print('[HARDAPP] iter=${it + 1} | vy=${L.vel.y.toStringAsFixed(1)} | h=${h.toStringAsFixed(1)} | steps=${res.steps}');
-        }
-      }
-      if (gateVerbose && ((it + 1) % 100 == 0)) {
-        print('[TRAIN/HARDAPP] iter=${it + 1}');
-      }
-    }
-
-    // Optional anchor after micro-stage, if you want to lock that skill
-    if (args.getFlag('anchor_after_hardapp', def: false)) {
-      policy.captureConsolidationAnchor();
-      policy.consolidateEnabled = true;
-      policy.consolidateTrunk = lambdaTrunk;
-      policy.consolidateHeads = lambdaHeads;
-      print('Consolidation anchor captured after hard-approach.');
+      // Optionally re-warm feature norm here if you have a helper.
     }
   }
 
@@ -1572,6 +1225,20 @@ void main(List<String> argv) async {
   int terrAttempts = 0;
   int currentTerrainSeed = rnd.nextInt(1 << 30);
 
+  final pfCfg = PFShapingCfg(
+    wAlign: pfAlign,
+    wVelDelta: pfVelDelta,
+    vMinClose: pfVminClose,
+    vMaxFar: pfVmaxFar,
+    alpha: pfAlpha,
+    vmax: pfVmax,
+    xBias: pfXBias,
+    wAccAlign: pfAccAlign,
+    wAccErr: pfAccErr,
+    accEma: pfAccEma,
+    debug: pfDebug,
+  );
+
   for (int it = 0; it < iters; it++) {
     double lastCost = 0.0;
     int lastSteps = 0;
@@ -1583,7 +1250,8 @@ void main(List<String> argv) async {
         currentTerrainSeed = rnd.nextInt(1 << 30);
       }
       env.reset(seed: currentTerrainSeed);
-      pfHook = makePFRewardHook(env: env, cfg: pfCfg); // rebuild PF per episode
+      // Rebuild PF per episode so it matches terrain/pad
+      pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
       final res = trainer.runEpisode(
         train: true,
@@ -1671,34 +1339,12 @@ void main(List<String> argv) async {
     norm: trainer.norm,
   );
   print('Training done. Saved → policy_final.json');
+
+  // Helpful hint
+  if (curricula.isEmpty) {
+    print('Tip: you can run modular curricula with --curricula="speedmin,hardapp" '
+        'or legacy flags --curriculum --lowalt_iters=... --hardapp_iters=...');
+  } else {
+    print('Curricula used: ${curricula.map((c) => c.key).join(", ")}');
+  }
 }
-
-/* ----------------------------------- usage ------------------------------------
-
-Examples:
-
-1) Resume PF training with consolidation anchored to the loaded weights:
-  dart run lib/ai/train_agent.dart \
-    --load_policy=policy_curriculum.json \
-    --anchor_on_load \
-    --consolidate_trunk=1e-3 --consolidate_heads=5e-4 \
-    --hidden=96,96,64 --train_iters=400 --batch=1 --lr=0.0003 \
-    --plan_hold=1 --blend_policy=1.0 --intent_align=0.25 --intent_pg=0.6 \
-    --gate_min=0.0 --gate_landed \
-    --eval_every=20 --eval_episodes=120 --eval_parallel --eval_workers=20
-
-2) Run Stage 1, anchor, micro-stage hard approach, then Stage 2 with consolidation:
-  dart run lib/ai/train_agent.dart \
-    --curriculum_iters=3000 --curriculum_batch=1 \
-    --anchor_after_curriculum \
-    --hardapp_iters=600 --hardapp_batch=1 --hardapp_min_steps=12 \
-    --consolidate_trunk=1e-3 --consolidate_heads=5e-4 \
-    --train_iters=400 --batch=1 --lr=0.0003 \
-    --plan_hold=1 --intent_temp=1.0 \
-    --intent_align=0.25 --intent_pg=0.6 --action_align=0.0
-
-Notes:
-- Stage 1 saves an intermediate snapshot as policy_curriculum.json.
-- Consolidation (L2-SP) penalizes drifting away from the last anchor; tune λ’s.
-- Hard-approach now enforces a minimum number of steps to avoid 1-step episodes.
------------------------------------------------------------------------------- */
