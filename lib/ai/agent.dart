@@ -205,6 +205,32 @@ class FeatureExtractorRays {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                         PAD-RAY POLARITY (TRAINING)                         */
+/* -------------------------------------------------------------------------- */
+
+({double x, double y, bool valid}) _avgPadVectorFromRays({
+  required List<RayHit> rays,
+  required double px,
+  required double py,
+}) {
+  double sx = 0.0, sy = 0.0, wsum = 0.0;
+  for (final r in rays) {
+    if (r.kind != RayHitKind.pad) continue;
+    final dx = r.p.x - px;
+    final dy = r.p.y - py;
+    final d2 = dx * dx + dy * dy;
+    if (d2 <= 1e-9) continue;
+    final w = 1.0 / math.sqrt(d2 + 1e-6);
+    sx += w * dx;
+    sy += w * dy;
+    wsum += w;
+  }
+  if (wsum <= 0) return (x: 0.0, y: 0.0, valid: false);
+  final inv = 1.0 / wsum;
+  return (x: sx * inv, y: sy * inv, valid: true);
+}
+
+/* -------------------------------------------------------------------------- */
 /*                                CONTROLLERS                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -304,7 +330,7 @@ bool _needPreBoost({
   required double vCap,
   required eng.GameEngine env,
   double warnFrac = 0.85,      // trigger before cap at 80% of vCap
-  double tauReact = 1.0,      // seconds of look-ahead
+  double tauReact = 1.0,       // seconds of look-ahead
   double extraPad = 2.5,       // px/s extra safety margin
 }) {
   final vyNow   = env.lander.vel.y.toDouble();
@@ -840,20 +866,23 @@ class Trainer {
   final bool useLearnedController;
   final double blendPolicy; // probability-space blend for thrust
   final double intentAlignWeight;
-  final double intentPgWeight;     // PG strength
+  final double intentPgWeight;
   final double actionAlignWeight;
   final bool normalizeFeatures;
 
   // gating/logging
-  final double gateScoreMin;       // now compares mean PF reward
+  final double gateScoreMin;
   final bool gateOnlyLanded;
   final bool gateVerbose;
 
   // NEW: accept near-pad crashes (configurable)
   final bool gateAcceptNearPadCrashes;
-  final double gatePadFrac;            // |x - padCx| <= gatePadFrac * W
-  final double gatePadHeight;          // h (px) <= this
-  final double gateMaxImpactSpeed;     // sqrt(vx^2 + vy^2) <= this
+  final double gatePadFrac;
+  final double gatePadHeight;
+  final double gateMaxImpactSpeed;
+
+  // NEW: align teacher label polarity with pad rays (to mirror runtime fixer)
+  final bool alignPolarityWithPadRays;
 
   final RunningNorm? norm;
   int _epCounter = 0;
@@ -888,11 +917,14 @@ class Trainer {
     this.gateOnlyLanded = false,
     this.gateVerbose = true,
 
-    // NEW: near-pad crash acceptance
+    // near-pad crash acceptance
     this.gateAcceptNearPadCrashes = false,
     this.gatePadFrac = 0.12,
     this.gatePadHeight = 160.0,
     this.gateMaxImpactSpeed = 60.0,
+
+    // NEW: training-time polarity alignment
+    this.alignPolarityWithPadRays = true,
 
     this.externalRewardHook,
   }) : norm = RunningNorm(fe.inputSize, momentum: 0.995);
@@ -935,7 +967,7 @@ class Trainer {
 
     final decisionCaches = <ForwardCache>[];
     final intentChoices = <int>[];
-    final decisionReturns = <double>[]; // advantages
+    final decisionReturns = <double>[];
     final alignLabels = <int>[];
 
     env.reset(seed: r.nextInt(1 << 30));
@@ -959,9 +991,26 @@ class Trainer {
     while (true) {
       if (framesLeft <= 0) {
         var x = fe.extract(env);
-        final yTeacher = predictiveIntentLabelAdaptive(
+        int yTeacher = predictiveIntentLabelAdaptive(
           env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35,
         );
+
+        // ===== NEW: flip teacher left/right if pad-ray polarity disagrees =====
+        if (alignPolarityWithPadRays) {
+          final L = env.lander;
+          final rays = env.rays;
+          if (rays.isNotEmpty) {
+            final av = _avgPadVectorFromRays(rays: rays, px: L.pos.x.toDouble(), py: L.pos.y.toDouble());
+            if (av.valid) {
+              final padIsLeft = av.x < 0.0;
+              if (yTeacher == intentToIndex(Intent.goLeft) && !padIsLeft) {
+                yTeacher = intentToIndex(Intent.goRight);
+              } else if (yTeacher == intentToIndex(Intent.goRight) && padIsLeft) {
+                yTeacher = intentToIndex(Intent.goLeft);
+              }
+            }
+          }
+        }
 
         if (normalizeFeatures) {
           norm?.observe(x);

@@ -711,7 +711,7 @@ class RuntimeTwoStagePolicy {
         norm: norm,
         signature: sig,
         physics: physics,
-        fixPolarityWithPadRays: true,
+        fixPolarityWithPadRays: false,
         mirrorX: false,
         intentTemp: intentTemp,
         stochasticPlanner: stochasticPlanner,

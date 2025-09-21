@@ -10,6 +10,7 @@ import '../engine/raycast.dart'; // RayConfig
 
 import 'agent.dart' as ai; // FeatureExtractorRays, PolicyNetwork, Trainer, RunningNorm, kIntentNames, predictiveIntentLabelAdaptive
 import 'agent.dart';
+import 'curriculum/final_approach.dart';
 import 'nn_helper.dart' as nn;
 import 'potential_field.dart'; // buildPotentialField, PotentialField
 
@@ -83,6 +84,9 @@ Map<String, dynamic> _policyToJson({
   required bool kindsOneHot,
   required eng.GameEngine env,
   RunningNorm? norm,
+  // NEW: persist runtime hints so runtime_policy can pick sane defaults
+  bool fixPolarityWithPadRays = true,
+  double runtimeIntentTemp = 1.0,
 }) {
   final sig = _feSignature(
     inputSize: p.inputSize,
@@ -139,6 +143,12 @@ Map<String, dynamic> _policyToJson({
       'downThrBurn': t.downThrBurn,
     },
 
+    // NEW: give runtime defaults that match what we want at inference
+    'mode_hints': {
+      'fixPolarityWithPadRays': fixPolarityWithPadRays,
+      'intentTemp': runtimeIntentTemp,
+    },
+
     'signature': sig,
     'format': 'v2rays',
   };
@@ -176,6 +186,8 @@ void _savePolicy({
     kindsOneHot: kindsOneHot,
     env: env,
     norm: norm,
+    fixPolarityWithPadRays: true,
+    runtimeIntentTemp: 1.0,
   );
   f.writeAsStringSync(const JsonEncoder.withIndent('  ').convert(jsonMap));
   print('Saved policy → $path');
@@ -668,6 +680,10 @@ class PFShapingCfg {
   // Debug
   final bool debug;
 
+  // NEW: extra shaping weights (vy cap penalty & pad-toward reward)
+  final double wVyCap;   // penalty weight for exceeding adaptive vy cap
+  final double wPadTow;  // reward weight for lateral velocity toward pad
+
   const PFShapingCfg({
     // velocity
     this.wAlign = 1.0,
@@ -690,6 +706,9 @@ class PFShapingCfg {
     this.accEma = 0.2,
     // debug
     this.debug = false,
+    // NEW extras
+    this.wVyCap = 0.02,
+    this.wPadTow = 0.12,
   });
 }
 
@@ -720,7 +739,8 @@ ai.ExternalRewardHook makePFRewardHook({
 
     // Proximity to pad
     final padCx = env.terrain.padCenter.toDouble();
-    final dxAbs = (x - padCx).abs();
+    final dx = x - padCx;
+    final dxAbs = dx.abs();
     final W = env.cfg.worldW.toDouble();
     final gy = env.terrain.heightAt(x);
     final h  = (gy - y).toDouble().clamp(0.0, 1000.0);
@@ -854,9 +874,9 @@ ai.ExternalRewardHook makePFRewardHook({
     final touchTarget = cfg.vMinTouchdown.clamp(0.5, 15.0);
     const double touchWeight = 3.0;
     final bool inTouchBand = (h < 90.0) && (dxAbs < 0.12 * W);
-    final double vmagNow = math.sqrt(vx*vx + vy*vy) + 1e-9;
+    final double vmagNow2 = math.sqrt(vx*vx + vy*vy) + 1e-9;
     final double touchBonus = inTouchBand
-        ? touchWeight * (touchTarget - vmagNow) / (touchTarget + 1e-6)
+        ? touchWeight * (touchTarget - vmagNow2) / (touchTarget + 1e-6)
         : 0.0;
 
     // --- Acceleration (Δv) matching ---
@@ -910,8 +930,23 @@ ai.ExternalRewardHook makePFRewardHook({
       }
     }
 
+    // ===== NEW: adaptive vertical speed cap penalty (stronger near ground) =====
+    double vyCapDown = 10.0 + 1.0 * math.sqrt(h);
+    vyCapDown = vyCapDown.clamp(10.0, 45.0);
+    if (h < 120) vyCapDown = math.min(vyCapDown, 18.0);
+    if (h < 60)  vyCapDown = math.min(vyCapDown, 10.0);
+    final vyExcess = math.max(0.0, vy - vyCapDown); // vy positive = downward in engine
+    final rVyCap = -cfg.wVyCap * vyExcess; // penalize overspeed
+
+    // ===== NEW: lateral velocity toward pad center (polarity shaping) =====
+    // positive when moving toward pad; scaled by how far we are from pad
+    final double toward = (-dx.sign) * vx; // >0 when vx points toward pad center
+    final double farScale = (dxAbs / (0.25 * W)).clamp(0.0, 1.0); // emphasize when far
+    // normalize by ~120 px/s typical horizontal scale to keep small magnitude
+    final rPadTow = cfg.wPadTow * farScale * (toward / 120.0).clamp(-1.0, 1.0);
+
     // Total reward
-    final r = wAlignEff * align + touchBonus - wVelEff * vErr + rAcc;
+    final r = wAlignEff * align + touchBonus - wVelEff * vErr + rAcc + rVyCap + rPadTow;
     return r;
   };
 }
@@ -935,7 +970,8 @@ void main(List<String> argv) async {
   // ---- Curriculum registry ----
   final registry = CurriculumRegistry()
     ..register('speedmin', () => SpeedMinCurriculum())
-    ..register('hardapp', () => HardApproach());
+    ..register('hardapp', () => HardApproach())
+    ..register('final', () => FinalApproach());
 
   // ---- Common CLI ----
   final seed = args.getInt('seed', def: 7);
@@ -1020,6 +1056,10 @@ void main(List<String> argv) async {
   final pfAccErr   = args.getDouble('pf_acc_err',   def: 1.0);
   final pfAccEma   = args.getDouble('pf_acc_ema',   def: 0.2);
   final pfDebug    = args.getFlag('pf_debug',       def: false);
+
+  // NEW: extra shaping CLI (vy cap penalty & pad-toward reward)
+  final pfVyCapW = args.getDouble('pf_vy_cap_w', def: 0.02);
+  final pfPadTowW = args.getDouble('pf_pad_tow_w', def: 0.12);
 
   // attempts per terrain + eval cadence/size + parallel + debug
   final attemptsPerTerrain = _iclamp(args.getInt('attempts_per_terrain', def: 1), 1, 1000000);
@@ -1237,6 +1277,8 @@ void main(List<String> argv) async {
     wAccErr: pfAccErr,
     accEma: pfAccEma,
     debug: pfDebug,
+    wVyCap: pfVyCapW,   // NEW
+    wPadTow: pfPadTowW, // NEW
   );
 
   for (int it = 0; it < iters; it++) {
