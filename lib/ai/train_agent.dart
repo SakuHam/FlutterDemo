@@ -494,6 +494,14 @@ void main(List<String> argv) async {
   final gateOnlyLanded = args.getFlag('gate_landed', def: false);
   final gateVerbose = args.getFlag('gate_verbose', def: true);
 
+  // ---------------------- NEW: probabilistic gating CLI ----------------------
+  final gateProbEnabled      = args.getFlag('gate_prob', def: true);          // --gate_prob (set false = hard gate)
+  final gateProbK            = args.getDouble('gate_prob_k', def: 8.0);
+  final gateProbMin          = args.getDouble('gate_prob_min', def: 0.05);
+  final gateProbMax          = args.getDouble('gate_prob_max', def: 0.95);
+  final gateProbLandedBoost  = args.getDouble('gate_prob_landed_boost', def: 0.15);
+  final gateProbNearPadBoost = args.getDouble('gate_prob_nearpad_boost', def: 0.10);
+
   // ---------------------- Hebbian CLI knobs (new) ----------------------
   final hebbOn       = args.getFlag('hebbian', def: false);
   final hebbEta      = args.getDouble('hebb_eta', def: 3e-4);
@@ -588,9 +596,21 @@ void main(List<String> argv) async {
     intentPgWeight: intentPgWeight,
     actionAlignWeight: actionAlignWeight,
     normalizeFeatures: true,
+
+    // Gate core
     gateScoreMin: gateScoreMin,
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
+
+    // NEW: probabilistic gating wiring
+    gateProbEnabled: gateProbEnabled,
+    gateProbK: gateProbK,
+    gateProbMin: gateProbMin,
+    gateProbMax: gateProbMax,
+    gateProbLandedBoost: gateProbLandedBoost,
+    gateProbNearPadBoost: gateProbNearPadBoost,
+
+    // external dense reward hook (PF)
     externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
       return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
     }),

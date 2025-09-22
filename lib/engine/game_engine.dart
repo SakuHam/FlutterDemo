@@ -72,27 +72,70 @@ class GameEngine {
       );
     }
 
-    // Spawn X (random or fixed fraction)
-    final double fracX = cfg.randomSpawnX
-        ? (() {
+    // ---- Spawn X (avoid spawning over pad) ----
+    // Find pad horizontal bounds from terrain polygon edges
+    double padMinX = double.infinity, padMaxX = -double.infinity;
+    for (final e in terrain.poly.edges) {
+      if (e.kind == PolyEdgeKind.pad) {
+        padMinX = math.min(padMinX, math.min(e.a.x, e.b.x));
+        padMaxX = math.max(padMaxX, math.max(e.a.x, e.b.x));
+      }
+    }
+    final bool hasPadBounds = padMinX.isFinite && padMaxX.isFinite;
+
+    // Safety margin so “above the pad” includes its immediate neighborhood
+    const double _spawnExclMarginPx = 8.0;
+    final double exclMin = hasPadBounds
+        ? (padMinX - _spawnExclMarginPx).clamp(0.0, cfg.worldW.toDouble())
+        : -1.0;
+    final double exclMax = hasPadBounds
+        ? (padMaxX + _spawnExclMarginPx).clamp(0.0, cfg.worldW.toDouble())
+        : -2.0;
+
+    double _sampleFracX() {
       final a = cfg.spawnXMin.clamp(0.0, 1.0);
       final b = cfg.spawnXMax.clamp(0.0, 1.0);
       final lo = math.min(a, b), hi = math.max(a, b);
       return lo + _rnd.nextDouble() * (hi - lo);
-    })()
-        : cfg.spawnX;
+    }
+
+    double _pickSpawnX() {
+      // If we don't know pad bounds, fall back to the legacy behavior.
+      if (!hasPadBounds) {
+        final fracLegacy = cfg.randomSpawnX ? _sampleFracX() : cfg.spawnX;
+        return cfg.worldW * fracLegacy;
+      }
+
+      // Try a few times to get an X outside the pad exclusion interval.
+      const int maxTries = 16;
+      for (int i = 0; i < maxTries; i++) {
+        final frac = cfg.randomSpawnX ? _sampleFracX() : cfg.spawnX;
+        final x = cfg.worldW * frac;
+        if (x < exclMin || x > exclMax) return x;
+      }
+
+      // Fallback: snap just outside the exclusion band, keeping within world
+      final frac = cfg.randomSpawnX ? _sampleFracX() : cfg.spawnX;
+      final x0 = cfg.worldW * frac;
+      final mid = (exclMin + exclMax) * 0.5;
+      return (x0 < mid)
+          ? (exclMin - 1.0).clamp(0.0, cfg.worldW.toDouble())
+          : (exclMax + 1.0).clamp(0.0, cfg.worldW.toDouble());
+    }
+
+    final double spawnX = _pickSpawnX();
 
     // Lander init (lockSpawn keeps Y/vel/angle)
     if (cfg.lockSpawn) {
       lander = LanderState(
-        pos: Vector2(cfg.worldW * fracX, cfg.spawnY),
+        pos: Vector2(spawnX, cfg.spawnY),
         vel: Vector2(cfg.spawnVx, cfg.spawnVy),
         angle: cfg.spawnAngle,
         fuel: cfg.t.maxFuel,
       );
     } else {
       lander = LanderState(
-        pos: Vector2(cfg.worldW * fracX, cfg.spawnY),
+        pos: Vector2(spawnX, cfg.spawnY),
         vel: Vector2(0, 0),
         angle: 0.0,
         fuel: cfg.t.maxFuel,

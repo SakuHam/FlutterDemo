@@ -1075,6 +1075,14 @@ class Trainer {
   final bool gateOnlyLanded;
   final bool gateVerbose;
 
+  // probabilistic gate knobs (NEW)
+  final bool gateProbEnabled;
+  final double gateProbK;
+  final double gateProbMin;
+  final double gateProbMax;
+  final double gateProbLandedBoost;
+  final double gateProbNearPadBoost;
+
   // accept near-pad crashes (configurable)
   final bool gateAcceptNearPadCrashes;
   final double gatePadFrac;
@@ -1126,6 +1134,14 @@ class Trainer {
     this.gateScoreMin = -double.infinity,
     this.gateOnlyLanded = false,
     this.gateVerbose = true,
+
+    // probabilistic gate defaults (enabled by default -> set false to get hard gate)
+    this.gateProbEnabled = true,
+    this.gateProbK = 8.0,
+    this.gateProbMin = 0.05,
+    this.gateProbMax = 0.95,
+    this.gateProbLandedBoost = 0.15,
+    this.gateProbNearPadBoost = 0.10,
 
     // near-pad crash acceptance
     this.gateAcceptNearPadCrashes = false,
@@ -1236,7 +1252,7 @@ class Trainer {
         }
 
         final (idxGreedy, p, cache) = policy.actIntentGreedy(x);
-        // Optional tiny exploration to avoid deadlocks:
+        // Optional tiny exploration (disabled by default):
         // final eps = 0.03;
         // final smoothed = List<double>.generate(p.length, (i) => (1 - eps) * p[i] + eps / p.length);
         // final idx = greedy ? idxGreedy : _sampleCategorical(smoothed, r, tempIntent);
@@ -1438,9 +1454,35 @@ class Trainer {
               (speed <= gateMaxImpactSpeed);
     }
 
-    bool accept = true;
-    if (gateOnlyLanded && !landed && !nearPadCrashOK) accept = false;
-    if (segMean < gateScoreMin) accept = false;
+    // Probabilistic gate (with hard-landed constraint if requested)
+    bool accept;
+    double sampledP = 1.0; // for logging
+    if (gateOnlyLanded && !landed && !nearPadCrashOK) {
+      accept = false;
+      sampledP = 0.0;
+    } else if (!gateProbEnabled) {
+      // Legacy hard gate
+      accept = segMean >= gateScoreMin;
+      sampledP = accept ? 1.0 : 0.0;
+    } else {
+      // p = min + (max-min) * sigmoid(k*(segMean - gateScoreMin))
+      final z = gateProbK * (segMean - gateScoreMin);
+      final s = 1.0 / (1.0 + math.exp(-z));
+      double p = gateProbMin + (gateProbMax - gateProbMin) * s;
+      if (landed)         p = (p + gateProbLandedBoost ).clamp(gateProbMin, gateProbMax);
+      if (nearPadCrashOK) p = (p + gateProbNearPadBoost).clamp(gateProbMin, gateProbMax);
+      sampledP = p;
+      accept = (math.Random(seed ^ (_epCounter << 7) ^ steps).nextDouble() < p);
+    }
+
+    if (gateVerbose) {
+      final tag = landed ? 'L' : (nearPadCrashOK ? 'NP' : 'NL');
+      final decisionMsg = accept ? 'ACCEPT' : 'DROP';
+      print('[GATE] segMean=${segMean.toStringAsFixed(3)} '
+          'thr=${gateScoreMin.toStringAsFixed(3)} '
+          'p=${sampledP.toStringAsFixed(3)} '
+          'result=$decisionMsg [$tag] steps=$steps');
+    }
 
     if (train) {
       if (accept && (decisionCaches.isNotEmpty || actionCaches.isNotEmpty)) {
