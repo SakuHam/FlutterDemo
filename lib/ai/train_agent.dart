@@ -291,9 +291,9 @@ void _loadPolicyIntoNetwork({
 
 et.EngineConfig makeConfig({
   int seed = 42,
-  bool lockTerrain = true,
-  bool lockSpawn = true,
-  bool randomSpawnX = false,
+  bool lockTerrain = false,
+  bool lockSpawn = false,
+  bool randomSpawnX = true,
   double worldW = 800,
   double worldH = 600,
   double? maxFuel,

@@ -1,6 +1,12 @@
 import 'dart:math' as math;
 
-/* --------------------------- tiny init / activations --------------------------- */
+/* =========================== tiny init / activations =========================== */
+
+double _randn(math.Random r) {
+  final u1 = r.nextDouble().clamp(1e-12, 1.0);
+  final u2 = r.nextDouble();
+  return math.sqrt(-2.0 * math.log(u1)) * math.cos(2 * math.pi * u2);
+}
 
 List<List<double>> _xavier(int outDim, int inDim, int seed) {
   final r = math.Random(seed);
@@ -8,6 +14,15 @@ List<List<double>> _xavier(int outDim, int inDim, int seed) {
   return List.generate(
     outDim,
         (_) => List<double>.generate(inDim, (_) => (r.nextDouble() * 2 - 1) * lim),
+  );
+}
+
+List<List<double>> _kaiming(int outDim, int inDim, int seed) {
+  final r = math.Random(seed);
+  final std = math.sqrt(2.0 / inDim);
+  return List.generate(
+    outDim,
+        (_) => List<double>.generate(inDim, (_) => std * _randn(r)),
   );
 }
 
@@ -19,7 +34,7 @@ double _tanh(double x) {
   return x.isNegative ? -t : t;
 }
 
-// SiLU / Swish: x * sigmoid(x) — friendlier in noisy regimes than tanh
+// SiLU / Swish: x * sigmoid(x)
 double silu(double x) {
   if (x >= 0) {
     final e = math.exp(-x);
@@ -31,6 +46,7 @@ double silu(double x) {
 }
 
 enum Activation { tanh, silu }
+enum InitKind { xavier, kaiming }
 
 /* ------------------------------------ Ops ------------------------------------ */
 
@@ -60,7 +76,7 @@ class Ops {
     }
   }
 
-  /// d L / d logits for CE with softmax: (p - y)
+  /// dL/dlogits for CE with softmax: (p - y_onehot)
   static List<double> crossEntropyGrad(List<double> p, int y, {int? numClasses}) {
     final k = numClasses ?? p.length;
     final out = List<double>.filled(k, 0.0);
@@ -70,7 +86,19 @@ class Ops {
     return out;
   }
 
-  /// BCE grad wrt logit: σ(z) - y (equivalently: dL/dz)
+  /// Label-smoothed variant (ε distributes small prob mass to non-targets).
+  static List<double> crossEntropyGradSmoothed(List<double> p, int y, double eps) {
+    final k = p.length;
+    final out = List<double>.filled(k, 0.0);
+    final u = eps / k;
+    for (int i = 0; i < k; i++) {
+      final target = (i == y) ? (1.0 - eps + u) : u;
+      out[i] = p[i] - target; // dL/dz = p - y_smooth
+    }
+    return out;
+  }
+
+  /// BCE grad wrt logit: σ(z) - y
   static double bceGradFromLogit(double logit, double y) {
     return sigmoid(logit) - y;
   }
@@ -87,8 +115,10 @@ class Linear {
   List<List<double>> W; // [out][in]
   List<double> b;       // [out]
 
-  Linear(int inDim, int outDim, {int seed = 0})
-      : W = _xavier(outDim, inDim, seed),
+  Linear(int inDim, int outDim, {int seed = 0, InitKind init = InitKind.xavier})
+      : W = (init == InitKind.xavier)
+      ? _xavier(outDim, inDim, seed)
+      : _kaiming(outDim, inDim, seed),
         b = List<double>.filled(outDim, 0.0);
 
   int get inDim => W.isEmpty ? 0 : W[0].length;
@@ -108,9 +138,6 @@ class Linear {
   }
 
   /// Backward wrt inputs, and **accumulate** grads into provided gW/gb buffers.
-  /// - x: input vector used in forward
-  /// - dOut: gradient wrt layer outputs (same length as outDim ideally)
-  /// - gW/gb: external accumulators (shape must match W/b). Safe if over-sized.
   List<double> backward({
     required List<double> x,
     required List<double> dOut,
@@ -142,13 +169,38 @@ class Linear {
   }
 }
 
+/* ---------------------------------- RMSNorm ---------------------------------- */
+
+class RMSNorm {
+  final int dim;
+  final double eps;
+  final List<double> g; // gain
+
+  RMSNorm(this.dim, {this.eps = 1e-6})
+      : g = List<double>.filled(dim, 1.0);
+
+  List<double> forward(List<double> x) {
+    double ss = 0.0;
+    for (final xi in x) ss += xi * xi;
+    final inv = 1.0 / math.sqrt((ss / x.length) + eps);
+    final out = List<double>.filled(x.length, 0.0);
+    for (int i = 0; i < x.length && i < g.length; i++) {
+      out[i] = x[i] * inv * g[i];
+    }
+    return out;
+  }
+}
+
 /* ---------------------------------- MLP trunk -------------------------------- */
 
 /*
- * Additions for noisy environments:
- *  - trainNoiseStd: Gaussian noise on pre-activations z (train only)
- *  - dropoutProb: inverted-scaling dropout on activations a (train only)
- *  - activation: tanh (default) or SiLU
+ * Noise-robust trunk:
+ *  - Kaiming init when activation == SiLU (Xavier for tanh).
+ *  - Exact SiLU derivative (cache z).
+ *  - Optional RMSNorm per layer (before activation).
+ *  - Gaussian noise on pre-activations (train only).
+ *  - Inverted-dropout on activations (train only).
+ *  - Optional input noise + clipping at the first layer (train only).
  *
  * Backprop respects dropout masks so dropped units get zero gradient.
  */
@@ -157,12 +209,19 @@ class MLPTrunk {
 
   // knobs (can be changed after construction)
   Activation activation;
-  double trainNoiseStd;     // e.g., 0.01 .. 0.05
+  double trainNoiseStd;     // e.g., 0.01 .. 0.05 (z-noise)
   double dropoutProb;       // e.g., 0.05 .. 0.2
   bool trainMode;           // set true during rollout/training, false for eval
 
-  // internal: store last dropout masks per layer for correct backprop
+  // normalization & input robustness
+  bool useRmsNorm;          // apply RMSNorm before activation per layer
+  double inputNoiseStd;     // e.g., 0.001 .. 0.02
+  double inputClip;         // e.g., 5.0 (±clip). <=0 disables
+
+  // internal caches
   List<List<double>> _lastDropMasks = const []; // 1.0 keep, 0.0 drop (scaled)
+  List<List<double>> _lastZs = const [];        // pre-activations per layer
+  late final List<RMSNorm?> _norms;
 
   MLPTrunk({
     required int inputSize,
@@ -172,56 +231,73 @@ class MLPTrunk {
     this.trainNoiseStd = 0.0,
     this.dropoutProb = 0.0,
     this.trainMode = false,
-  }) : layers = _build(inputSize, hiddenSizes, seed);
+    this.useRmsNorm = true,
+    this.inputNoiseStd = 0.0,
+    this.inputClip = 0.0,
+  }) : layers = _build(inputSize, hiddenSizes, seed, activation),
+        _norms = List<RMSNorm?>.filled(hiddenSizes.length, null) {
+    if (useRmsNorm) {
+      for (int i = 0; i < hiddenSizes.length; i++) {
+        _norms[i] = RMSNorm(hiddenSizes[i]);
+      }
+    }
+  }
 
-  static List<Linear> _build(int input, List<int> hidden, int seed) {
+  static List<Linear> _build(int input, List<int> hidden, int seed, Activation act) {
     final l = <Linear>[];
     var inDim = input;
+    final init = (act == Activation.silu) ? InitKind.kaiming : InitKind.xavier;
     for (int i = 0; i < hidden.length; i++) {
       final h = hidden[i];
-      l.add(Linear(inDim, h, seed: seed ^ (0xA5A5 + i)));
+      l.add(Linear(inDim, h, seed: seed ^ (0xA5A5 + i), init: init));
       inDim = h;
     }
     return l;
   }
 
-  // deterministic RNG used for noise/dropout so results are repeatable per call if desired
+  // deterministic RNG used for noise/dropout (can be swapped for a trainer-provided RNG)
   math.Random? _rng;
+  void _ensureRng() => _rng ??= math.Random(0xBEEFCAFE);
 
-  void _ensureRng() {
-    _rng ??= math.Random(0xBEEFCAFE);
-  }
+  double _act(double z) => (activation == Activation.silu) ? silu(z) : _tanh(z);
 
-  double _act(double z) {
-    switch (activation) {
-      case Activation.silu: return silu(z);
-      case Activation.tanh:
-      default: return _tanh(z);
+  // Optional input pre-processing for robustness
+  List<double> _noisyClippedInput(List<double> x) {
+    if (!trainMode && inputClip <= 0 && inputNoiseStd <= 0) return x;
+    final out = List<double>.from(x);
+    if (trainMode && inputNoiseStd > 0) {
+      _ensureRng();
+      for (int i = 0; i < out.length; i++) out[i] += inputNoiseStd * _randn(_rng!);
     }
+    if (inputClip > 0) {
+      final c = inputClip;
+      for (int i = 0; i < out.length; i++) out[i] = out[i].clamp(-c, c);
+    }
+    return out;
   }
 
   /// Returns activations for each layer: [a1, a2, ... aL].
   /// If trainMode=true, applies Gaussian noise to z and dropout to a.
   List<List<double>> forwardAll(List<double> x) {
-    var h = x;
+    var h = _noisyClippedInput(x);
     final acts = <List<double>>[];
+    final zs   = <List<double>>[];
     final masks = <List<double>>[];
 
-    for (final lin in layers) {
+    for (int li = 0; li < layers.length; li++) {
       // pre-activation
-      var z = lin.forward(h);
+      var z = layers[li].forward(h);
+
+      // optionally normalize pre-acts
+      if (useRmsNorm && _norms[li] != null) {
+        z = _norms[li]!.forward(z);
+      }
 
       // Gaussian noise on z (train only)
       if (trainMode && trainNoiseStd > 0) {
         _ensureRng();
         final std = trainNoiseStd;
-        for (int i = 0; i < z.length; i++) {
-          // Box-Muller
-          final u1 = (_rng!.nextDouble().clamp(1e-12, 1.0));
-          final u2 = _rng!.nextDouble();
-          final g = math.sqrt(-2.0 * math.log(u1)) * math.cos(2 * math.pi * u2);
-          z[i] += std * g;
-        }
+        for (int i = 0; i < z.length; i++) z[i] += std * _randn(_rng!);
       }
 
       // activation
@@ -246,10 +322,12 @@ class MLPTrunk {
       }
 
       acts.add(a);
+      zs.add(z);
       h = a;
     }
 
     _lastDropMasks = masks;
+    _lastZs = zs;
     return acts;
   }
 
@@ -270,6 +348,7 @@ class MLPTrunk {
     for (int li = layers.length - 1; li >= 0; li--) {
       final lin = layers[li];
       final a   = acts[li];
+      final z   = (li < _lastZs.length) ? _lastZs[li] : a; // fallback to a if z missing
 
       // apply dropout mask to upstream gradient (train-time only)
       final mask = (li < _lastDropMasks.length) ? _lastDropMasks[li] : null;
@@ -277,21 +356,20 @@ class MLPTrunk {
         for (int i = 0; i < d.length && i < mask.length; i++) d[i] *= mask[i];
       }
 
-      // dL/dz = dL/da * activation'(z); we only have 'a', so:
-      // tanh: 1 - a^2,  SiLU: derivative = σ(x) + x*σ(x)*(1-σ(x))
+      // dL/dz = dL/da * activation'(z)
       final dz = List<double>.filled(a.length, 0.0);
       final n = math.min(a.length, d.length);
+
       if (activation == Activation.tanh) {
+        // tanh'(z) = 1 - a^2 (we have a)
         for (int i = 0; i < n; i++) dz[i] = d[i] * (1.0 - a[i] * a[i]);
       } else {
-        // For SiLU we don't have z cached; approximate using a and x~a (works well in practice)
-        // Better: recompute z by inverse of activation; here we use a cheap local approx:
-        // Use local slope using a’ ≈ sigmoid(z) * (1 + z * (1 - sigmoid(z)))
-        // As a robust fallback, treat derivative as <= 1 and use 0.5..1 scaling based on a.
+        // exact SiLU derivative using cached z
         for (int i = 0; i < n; i++) {
-          final ai = a[i];
-          final slope = 0.5 + 0.5 / (1.0 + (ai*ai)); // heuristic slope in (0.5,1]
-          dz[i] = d[i] * slope;
+          final zi = (i < z.length) ? z[i] : 0.0;
+          final s  = Ops.sigmoid(zi);
+          final grad = s + zi * s * (1.0 - s);
+          dz[i] = d[i] * grad;
         }
       }
 
@@ -300,7 +378,7 @@ class MLPTrunk {
 
       // accumulate grads + compute next d (wrt inputs)
       d = lin.backward(x: inp, dOut: dz, gW: gW[li], gb: gb[li]);
-      // d is dL/d(input_of_this_layer)
+      // d is now dL/d(input_of_this_layer)
     }
   }
 }
@@ -314,8 +392,52 @@ class PolicyHeads {
   final Linear val;    // 1 value
 
   PolicyHeads(int hiddenSize, {int intents = 5, int seed = 0})
-      : intent = Linear(hiddenSize, intents, seed: seed ^ 0x11),
-        turn   = Linear(hiddenSize, 3,      seed: seed ^ 0x22),
-        thr    = Linear(hiddenSize, 1,      seed: seed ^ 0x33),
-        val    = Linear(hiddenSize, 1,      seed: seed ^ 0x44);
+      : intent = Linear(hiddenSize, intents, seed: seed ^ 0x11,
+      init: InitKind.xavier), // heads often fine with Xavier
+        turn   = Linear(hiddenSize, 3,      seed: seed ^ 0x22,
+            init: InitKind.xavier),
+        thr    = Linear(hiddenSize, 1,      seed: seed ^ 0x33,
+            init: InitKind.xavier),
+        val    = Linear(hiddenSize, 1,      seed: seed ^ 0x44,
+            init: InitKind.xavier);
+}
+
+/* ----------------------------- Training utilities ---------------------------- */
+
+/// Global L2 gradient clipping.
+void clipGradsL2(List<List<List<double>>> gW, List<List<double>> gb, double maxNorm) {
+  if (maxNorm <= 0) return;
+  double ss = 0.0;
+  for (final gw in gW) {
+    for (final row in gw) {
+      for (final v in row) ss += v * v;
+    }
+  }
+  for (final gb1 in gb) {
+    for (final v in gb1) ss += v * v;
+  }
+  final norm = math.sqrt(ss);
+  if (norm > maxNorm && norm > 0) {
+    final s = maxNorm / norm;
+    for (final gw in gW) {
+      for (final row in gw) {
+        for (int j = 0; j < row.length; j++) row[j] *= s;
+      }
+    }
+    for (final gb1 in gb) {
+      for (int j = 0; j < gb1.length; j++) gb1[j] *= s;
+    }
+  }
+}
+
+/// Decoupled weight decay (AdamW-style): apply after the gradient step or
+/// multiply weights by (1 - lr*wd) each update.
+void applyWeightDecay(List<List<List<double>>> W, double lr, double wd) {
+  if (wd <= 0) return;
+  final decay = 1.0 - lr * wd;
+  for (final wLayer in W) {
+    for (final row in wLayer) {
+      for (int j = 0; j < row.length; j++) row[j] *= decay;
+    }
+  }
 }

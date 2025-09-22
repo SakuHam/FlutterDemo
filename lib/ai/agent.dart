@@ -291,30 +291,29 @@ int predictiveIntentLabelAdaptive(
     }) {
   final L = env.lander;
   final T = env.terrain;
-  final W = env.cfg.worldW.toDouble();
-  final padCx = T.padCenter.toDouble();
+  final cfg = env.cfg;
+  final W = cfg.worldW.toDouble();
 
+  // --- State ---
   final px = L.pos.x.toDouble();
   final py = L.pos.y.toDouble();
   final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
-
+  final padCx = T.padCenter.toDouble();
   final gy = T.heightAt(px);
-  final h  = (gy - py).toDouble();
+  final h  = (gy - py).toDouble().clamp(0.0, 1e9);
   final dx = px - padCx;
 
-  // Predict ~1 sec ahead depending on height
+  // --- Height-adaptive lookahead τ ---
   final hNorm = (h / 320.0).clamp(0.0, 1.6);
   final tau = (baseTauSec * (0.7 + 0.5 * hNorm)).clamp(minTauSec, maxTauSec);
 
-  final g = env.cfg.t.gravity;
-  final dxF = dx + vx * tau;
+  // --- Predict future (x, vy) ignoring lateral accel (RC(S) small) ---
+  final g  = cfg.t.gravity;
+  final xF = px + vx * tau;
   final vyF = vy + g * tau;
 
-  final padEnter = 0.08 * W;
-  final padExit  = 0.14 * W;
-
-  // --- Vertical emergency 'brakeUp' (tight window) ---
+  // --- Quick risk gates -------------------------------------------------------
   final vCapStrong = (0.07 * h + 6.0).clamp(6.0, 16.0);
   final tooLow      = h < 140.0;
   final tooFastDown = vyF > math.max(40.0, vCapStrong + 10.0);
@@ -324,25 +323,102 @@ int predictiveIntentLabelAdaptive(
     return intentToIndex(Intent.brakeUp);
   }
 
+  // If we’re very close to center laterally, prefer vertical management.
+  final padEnter = 0.08 * W;
   if (dx.abs() <= padEnter) {
     if (vx > 25.0)  return intentToIndex(Intent.brakeRight);
     if (vx < -25.0) return intentToIndex(Intent.brakeLeft);
     return intentToIndex(Intent.descendSlow);
   }
 
-  if (dxF.abs() > padExit) {
-    // If we're right of center (dxF > 0), we should go LEFT toward the pad.
-    return dxF > 0 ? intentToIndex(Intent.goLeft)
-        : intentToIndex(Intent.goRight);
+  // --- Build a to-pad vector (fallback to purely horizontal if pad rays absent)
+  // Try rays-averaged pad vector first (more robust when pad is off-screen).
+  ({double x, double y, bool valid}) padVec = (x: padCx - px, y: T.heightAt(padCx) - py, valid: true);
+  final rays = env.rays;
+  if (rays.isNotEmpty) {
+    double sx = 0.0, sy = 0.0, wsum = 0.0;
+    for (final r in rays) {
+      if (r.kind != RayHitKind.pad) continue;
+      final dxp = r.p.x - px;
+      final dyp = r.p.y - py;
+      final d2 = dxp*dxp + dyp*dyp;
+      if (d2 <= 1e-9) continue;
+      final w = 1.0 / math.sqrt(d2 + 1e-6);
+      sx += w * dxp; sy += w * dyp; wsum += w;
+    }
+    if (wsum > 0) {
+      final inv = 1.0 / wsum;
+      padVec = (x: sx * inv, y: sy * inv, valid: true);
+    } else {
+      // keep default (center-based) but mark valid false so we can fall back later if needed
+      padVec = (x: padCx - px, y: 0.0, valid: false);
+    }
   }
 
+  // --- Future-velocity vector (predict short reaction ahead)
+  final vF = (x: vx, y: vyF);
+
+  // Helper: signed 2D "cross" (z-component) and dot
+  double crossZ(double ax, double ay, double bx, double by) => ax*by - ay*bx;
+  double dot(double ax, double ay, double bx, double by) => ax*bx + ay*by;
+
+  // --- Crossing & drift tests -------------------------------------------------
+  // 1) Will our *lateral position* cross pad center within τ?
+  final dxF = xF - padCx;
+  final crossesCenter = (dx * dxF) < 0.0; // opposite signs → will pass over center soon
+
+  // 2) Are we drifting away from pad (|dxF| > |dx|) ?
+  final driftingAway = dxF.abs() > dx.abs() + 2.0; // small bias to avoid chatter
+
+  // 3) If we have a pad vector, measure orientation between vF and toPad.
+  //    If the signed angle is large, steer (goLeft/right) to reduce it.
+  Intent? steerByPadVector() {
+    if (!padVec.valid) return null;
+    final cp = crossZ(vF.x, vF.y, padVec.x, padVec.y); // >0 : pad is to the left of velocity
+    final dp = dot(vF.x, vF.y, padVec.x, padVec.y);
+    // angle ~ atan2(cp, dp). Use thresholds without trigs: large |cp| and small/negative dp ⇒ big misalignment
+    final misaligned = (cp.abs() > 200.0) || (dp < -200.0);
+    if (!misaligned) return null;
+
+    // If pad is to the left of velocity, we need to push LEFTwards (i.e., goLeft).
+    return cp > 0 ? Intent.goLeft : Intent.goRight;
+  }
+
+  // --- Decisions --------------------------------------------------------------
+
+  // Prioritize crossing: if we’ll pass over the center soon, bleed lateral speed.
+  if (crossesCenter) {
+    if (vx > 12.0)  return intentToIndex(Intent.brakeRight);
+    if (vx < -12.0) return intentToIndex(Intent.brakeLeft);
+    // Already slow laterally → descend
+    return intentToIndex(Intent.descendSlow);
+  }
+
+  // If drifting away from pad, actively move toward pad.
+  if (driftingAway) {
+    return dx > 0 ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
+  }
+
+  // If we can see/estimate the pad vector, use geometric steering vs future velocity.
+  final steer = steerByPadVector();
+  if (steer != null) return intentToIndex(steer);
+
+  // If pad vector is unreliable (not visible) and we’re getting fast or close, bias to safety (go up).
+  if (!padVec.valid) {
+    final vCapHover = (0.06 * h + 6.0).clamp(6.0, 18.0);
+    final needUp = (vy > vCapHover) || (vyF > 0.85 * vCapHover);
+    if (needUp) return intentToIndex(Intent.brakeUp);
+  }
+
+  // Small outward velocity near the lateral boundary? Nudge back toward pad.
+  final padExit = 0.14 * W;
   final willExitSoon = (dxF.abs() > padEnter) && (dx.abs() <= padEnter);
-  final vxIsOutward  = (dx.sign == vx.sign) && vx.abs() > 20.0;
+  final vxIsOutward  = (dx.sign == vx.sign) && vx.abs() > 18.0;
   if ((willExitSoon || vxIsOutward) && h > 90) {
-    return dx >= 0 ? intentToIndex(Intent.goLeft)
-        : intentToIndex(Intent.goRight);
+    return dx >= 0 ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
   }
 
+  // Default: gentle descent management.
   return intentToIndex(Intent.descendSlow);
 }
 

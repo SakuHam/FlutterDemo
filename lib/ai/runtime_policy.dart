@@ -588,7 +588,7 @@ class RuntimeTwoStagePolicy {
     this.fixPolarityWithPadRays = false,
     this.mirrorX = false,
     this.intentTemp = 1.0,
-    this.stochasticPlanner = false,
+    this.stochasticPlanner = true,
     math.Random? rnd,
   }) : _rnd = rnd ?? math.Random(0xC0FFEE);
 
@@ -598,7 +598,7 @@ class RuntimeTwoStagePolicy {
         int planHold = 1,
         // NEW knobs (optional)
         double intentTemp = 1.0,
-        bool stochasticPlanner = false,
+        bool stochasticPlanner = true,
         math.Random? rnd,
       }) {
     final Map<String, dynamic> j = json.decode(jsonString);

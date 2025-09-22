@@ -76,6 +76,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   Offset? _vecPF;      // raw PF suggestion
   Offset? _vecPolicy;  // policy's preferred velocity (shaped)
 
+  // ===== NEW: ray alignment toggle (FWD vs WORLD) =====
+  bool _forwardAligned = true;
+
   @override
   void initState() {
     super.initState();
@@ -150,10 +153,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       );
 
       _engine = GameEngine(cfg);
-      _engine!.rayCfg = const RayConfig(
+      _engine!.rayCfg = RayConfig(
         rayCount: 180,
         includeFloor: false,
-        forwardAligned: false,
+        forwardAligned: _forwardAligned, // ← ship-forward aligned by default
       );
 
       final p = _policy;
@@ -162,6 +165,12 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _rebuildPF(); // build once on init/resize
       setState(() {});
     }
+  }
+
+  void _syncRayAlignmentToEngine() {
+    final e = _engine;
+    if (e == null) return;
+    e.rayCfg = e.rayCfg.copyWith(forwardAligned: _forwardAligned);
   }
 
   void _rebuildPF() {
@@ -246,7 +255,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final W = e.cfg.worldW.toDouble();
 
     // PF base suggestion
-    // (Use your training defaults; tweak here if you changed the CLI.)
     final base = pf.suggestVelocity(
       x, y,
       vMinClose: 8.0,
@@ -280,9 +288,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final kMag = (magTarget / magNow).clamp(0.0, 1.0);
     svx *= kMag; svy *= kMag;
 
-    // --- Feasibility clamp: don’t ask more Δv than a single frame can do ---
-    final aMax = e.cfg.t.thrustAccel * 0.05 * e.cfg.stepScale; // px/s^2 per real second
-    final dt = 1 / e.cfg.stepScale; // your engine’s real seconds per step (approx)
+    // --- Feasibility clamp ---
+    final aMax = e.cfg.t.thrustAccel * 0.05 * e.cfg.stepScale;
+    final dt = 1 / e.cfg.stepScale;
     final feasiness = 0.75;
     final dvxNeed = svx - vx;
     final dvyNeed = svy - vy;
@@ -306,12 +314,11 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     if (nearL > 0.0 && nearL >= nearR) inwardX = 1.0;
     if (nearR > 0.0 && nearR >  nearL) inwardX = -1.0;
 
-    final vInward = 40.0;           // inward target at wall
+    final vInward = 40.0;
     final blendIn = 0.60 * borderProx;
     final vxWall = inwardX * vInward;
 
     svx = (1.0 - blendIn) * svx + blendIn * vxWall;
-    // svy unchanged
 
     _vecPolicy = Offset(svx, svy);
   }
@@ -554,6 +561,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       // NEW: pass vectors to draw
                       vecPF: _vecPF,
                       vecPolicy: _vecPolicy,
+                      // NEW: pass a hint for painter (to draw forward axis only when useful)
+                      showForwardAxis: _visMode == DebugVisMode.rays,
                     ),
                   ),
                 ),
@@ -594,6 +603,25 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             ),
                           ),
                           const SizedBox(width: 8),
+
+                          // NEW: forward/world ray alignment toggle
+                          /*
+                          Tooltip(
+                            message: 'Ray alignment: ${_forwardAligned ? "Forward (ship frame)" : "World"}',
+                            child: FilterChip(
+                              label: Text(_forwardAligned ? 'Rays: FWD' : 'Rays: WORLD'),
+                              selected: _forwardAligned,
+                              onSelected: (v) {
+                                setState(() {
+                                  _forwardAligned = v;
+                                  _syncRayAlignmentToEngine();
+                                });
+                              },
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+
+                           */
 
                           ElevatedButton.icon(
                             onPressed: _reset,
@@ -803,6 +831,9 @@ class GamePainter extends CustomPainter {
   final Offset? vecPF;
   final Offset? vecPolicy;
 
+  // NEW: painter hint to draw forward axis when looking at rays
+  final bool showForwardAxis;
+
   GamePainter({
     required this.lander,
     required this.terrain,
@@ -814,6 +845,7 @@ class GamePainter extends CustomPainter {
     required this.visMode,
     required this.vecPF,
     required this.vecPolicy,
+    required this.showForwardAxis,
   });
 
   @override
@@ -1175,6 +1207,16 @@ class GamePainter extends CustomPainter {
       pos + rot(const Offset(halfW, halfH)),
       legs,
     );
+
+    // NEW: draw a short forward-axis line (from the nose) to visualize ship heading
+    if (showForwardAxis) {
+      final nose = pos + rot(const Offset(0, -halfH));
+      final forward = Offset(-math.sin(lander.angle), math.cos(lander.angle));
+      final axisPaint = Paint()
+        ..color = Colors.amberAccent
+        ..strokeWidth = 2;
+      canvas.drawLine(nose, nose + forward * 26.0, axisPaint);
+    }
   }
 
   @override
@@ -1188,6 +1230,7 @@ class GamePainter extends CustomPainter {
         old.pf != pf ||
         old.visMode != visMode ||
         old.vecPF != vecPF ||
-        old.vecPolicy != vecPolicy;
+        old.vecPolicy != vecPolicy ||
+        old.showForwardAxis != showForwardAxis;
   }
 }

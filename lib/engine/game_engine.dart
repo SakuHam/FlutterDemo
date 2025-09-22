@@ -154,6 +154,37 @@ class GameEngine {
     );
   }
 
+  // === NEW: helpers for pad/upward desired direction & velocity-alignment cost ===
+
+  // Desired approach direction: toward pad if visible; else straight up.
+  Vector2 _desiredDirection(Vector2 pos) {
+    final ps = padSummary(); // uses _rays from the last sensor cast
+    // ps.visible in [0,1], ps.bearing is bearing from ship frame (already computed by RayCaster)
+    if (ps.visible > 0.0) {
+      // Aim to pad center in world frame
+      final padCx = terrain.padCenter.toDouble();
+      final padCy = terrain.heightAt(padCx);
+      final dx = padCx - pos.x;
+      final dy = padCy - pos.y;
+      final len = math.sqrt(dx*dx + dy*dy);
+      if (len > 1e-6) return Vector2(dx/len, dy/len);
+    }
+    // Default: go up (negative Y in screen coordinates)
+    return Vector2(0.0, -1.0);
+  }
+
+  // Alignment penalty between a velocity and a desired unit direction.
+  // Returns 0 when perfectly aligned, up to 2 when exactly opposite.
+  double _alignPenalty(Vector2 vel, Vector2 desiredUnit) {
+    final sp = vel.length;
+    if (sp < 1e-6) return 0.0; // no direction if nearly stopped
+    final vx = vel.x / sp, vy = vel.y / sp;
+    double dot = vx*desiredUnit.x + vy*desiredUnit.y;
+    if (dot.isNaN) dot = 0.0;
+    dot = dot.clamp(-1.0, 1.0);
+    return 1.0 - dot; // ∈ [0,2]
+  }
+
   /// Physics step + contact resolution + shaping cost. `dt` in seconds.
   /// Uses adaptive sub-stepping to avoid tunneling through thin terrain edges.
   StepInfo step(double dt, ControlInput u) {
@@ -206,10 +237,6 @@ class GameEngine {
       final rot = t.rotSpeed * 0.5;
       if (u.left && !u.right) angle -= rot * dtk;
       if (u.right && !u.left) angle += rot * dtk;
-      if (!(u.left ^ u.right)) {
-        final pull = (_rotFriction * dtk);
-        if (pull > 0.0) angle -= angle * pull.clamp(0.0, 0.5);
-      }
 
       // ----- Auto-level & flare assists -----
       final gyNow = terrain.heightAt(lander.pos.x);
@@ -224,7 +251,6 @@ class GameEngine {
       }
 
       // ----- Acceleration & fuel burn -----
-      // Keep your global accel scale.
       final double thrustA = t.thrustAccel * 0.05; // EQUALIZED THRUST POWER
       Vector2 accel = Vector2(0, t.gravity * 0.05);
       double fuel = lander.fuel;
@@ -258,7 +284,6 @@ class GameEngine {
           accel.x += ax;
           accel.y += ay;
 
-          // Burn per active side thruster (so both pressed = 2x burn)
           final int activeSides = (l ? 1 : 0) + (r ? 1 : 0);
           fuel = (fuel - (20.0 * activeSides) * dtk).clamp(0.0, t.maxFuel);
         }
@@ -266,7 +291,6 @@ class GameEngine {
 
       // "Top" thruster (pushes downward) — equal power & equal burn to main
       if (t.downThrEnabled && u.downThrust && fuel > 0.0) {
-        // opposite vector to main engine
         accel.x += -math.sin(angle) * thrustA;
         accel.y +=  math.cos(angle) * thrustA;
         fuel = (fuel - 20.0 * dtk).clamp(0.0, t.maxFuel);
@@ -336,6 +360,7 @@ class GameEngine {
       double stepCost = 0.0;
       if (power > 0) stepCost += cfg.effortCost * power * dtk;
 
+      // Base scoring
       final score = Scoring.apply(
         cfg: cfg,
         terrain: terrain,
@@ -348,6 +373,67 @@ class GameEngine {
         intentIdx: u.intentIdx,
       );
       stepCost += score.cost;
+
+      // --- Directional pad-toward shaping (robust, symmetric) ---
+          {
+        final double x = lander.pos.x.toDouble();
+        final double y = lander.pos.y.toDouble();
+        final double vxNow = lander.vel.x.toDouble();
+        final double W = cfg.worldW.toDouble();
+
+        // height above local ground
+        final gy = terrain.heightAt(x);
+        final h  = (gy - y).toDouble().clamp(0.0, 1e9);
+
+        // pad rays summary: minD, bearing (rad, +right), visible∈[0,1]
+        final ps = padSummary();
+        final bool padSeen = ps.visible > 0.05; // tune
+        final double s = padSeen
+            ? (ps.bearing >= 0 ? 1.0 : -1.0)   // +right, -left
+            : ((W * 0.5 - x) >= 0 ? 1.0 : -1.0);
+
+        // desirables: gently head toward pad, but fade near touchdown
+        final double vTargetFar = 12.0;   // px/s
+        final double vTargetNear = 4.0;   // px/s
+        final double a = (h / 300.0).clamp(0.0, 1.0);  // far→near blend
+        final double vTarget = vTargetNear + a * (vTargetFar - vTargetNear);
+
+        // weight by visibility/height; weaker when pad unseen
+        final double baseW = padSeen ? 1.0 : 0.35;
+        final double w = baseW * math.exp(- (h * h) / (220.0 * 220.0 + 1e-6));
+
+        // penalty if moving away (vx*s positive means moving away from pad center)
+        final double away = (vxNow * s - (-vTarget)).clamp(0.0, 1e9);
+        final double lambdaDir = 0.002; // start tiny; 0.001–0.006 works well
+        stepCost += lambdaDir * w * away;
+      }
+
+      // === NEW: velocity alignment shaping w.r.t pad / upward ===
+          {
+        // Desired unit direction (pad if visible else up)
+        final Vector2 dHat = _desiredDirection(pos);
+
+        // Current and short-horizon future velocities
+        final double tauPredict = 0.35; // s
+        final Vector2 vNow = vel;
+        final Vector2 vFuture = Vector2(
+          vel.x + accel.x * tauPredict * s,
+          vel.y + accel.y * tauPredict * s,
+        );
+
+        // Alignment penalties (0 good → 2 bad)
+        final double pNow = _alignPenalty(vNow, dHat);
+        final double pFut = _alignPenalty(vFuture, dHat);
+
+        // Weights (tunable)
+        const double kNow   = 0.45;
+        const double kFut   = 0.80;
+
+        // Blend scales with substep duration so it’s time-consistent
+        final double w = dtk;
+        stepCost += w * (kNow * pNow + kFut * pFut);
+      }
+      // === END NEW ===
 
       // Commit microstep physics
       lander = LanderState(pos: pos, vel: vel, angle: angle, fuel: fuel);
