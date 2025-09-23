@@ -202,6 +202,7 @@ class HardApproach extends Curriculum {
     required double intentPgWeight,
     required double actionAlignWeight,
     required double curNearFrac,
+    int? fixedSeed, // ✅ if set, reuse terrain by resetting with same seed
   }) {
     policy.trunk.trainMode = true;
 
@@ -216,7 +217,8 @@ class HardApproach extends Curriculum {
     final actionTurnTargets   = <int>[];
     final actionThrustTargets = <bool>[];
 
-    env.reset(seed: rnd.nextInt(1 << 30));
+    // ✅ Respect fixedSeed to keep terrain identical across retries
+    env.reset(seed: fixedSeed ?? rnd.nextInt(1 << 30));
     _initStart(env, rnd, cfg, curNearFrac);
 
     int framesLeft = 0;
@@ -335,7 +337,7 @@ class HardApproach extends Curriculum {
       // Enforce a minimum number of steps before allowing termination
       if (steps < cfg.minSteps && env.status != et.GameStatus.playing) {
         // If we crashed/landed too early, restart this micro-episode in-place.
-        env.reset(seed: rnd.nextInt(1 << 30));
+        env.reset(seed: fixedSeed ?? rnd.nextInt(1 << 30));
         _initStart(env, rnd, cfg, curNearFrac);
         framesLeft = 0;
         continue;
@@ -385,7 +387,7 @@ class HardApproach extends Curriculum {
     return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: 0.0);
   }
 
-// At class scope:
+  // At class scope:
   double _emaLand = 0.0;
   int _noChangeWindows = 0;
 
@@ -464,7 +466,11 @@ class HardApproach extends Curriculum {
 
     for (int it = 0; it < iters; it++) {
       for (int b = 0; b < cfg.batch; b++) {
-        final res = _runEpisode(
+        // Pick a base seed for terrain for this (it,b) attempt:
+        final terrainSeed = rnd.nextInt(1 << 30);
+
+        // First attempt on this terrain
+        EpisodeResult res = _runEpisode(
           env: env,
           fe: fe,
           policy: policy,
@@ -478,8 +484,41 @@ class HardApproach extends Curriculum {
           intentPgWeight: intentPgWeight,
           actionAlignWeight: 0.25, // supervise action a bit stronger here
           curNearFrac: _curNearFrac,
+          fixedSeed: terrainSeed, // ✅ lock terrain
         );
         _maybeAdaptDifficulty(landed: res.landed);
+
+        // If failed to land, retry up to 100 times on the SAME terrain
+        if (!res.landed) {
+          if (cfg.verbose) {
+            print('[HARDAPP/RETRY] no landing → retrying same terrain up to 100x');
+          }
+          for (int k = 0; k < 100; k++) {
+            res = _runEpisode(
+              env: env,
+              fe: fe,
+              policy: policy,
+              norm: norm,
+              rnd: rnd,
+              planHold: planHold,
+              tempIntent: tempIntent,
+              gamma: gamma,
+              lr: lr,
+              intentAlignWeight: intentAlignWeight,
+              intentPgWeight: intentPgWeight,
+              actionAlignWeight: 0.25,
+              curNearFrac: _curNearFrac,
+              fixedSeed: terrainSeed, // ✅ exact same terrain again
+            );
+            _maybeAdaptDifficulty(landed: res.landed);
+            if (res.landed) {
+              if (cfg.verbose) {
+                print('[HARDAPP/RETRY] landed on retry ${k + 1}');
+              }
+              break;
+            }
+          }
+        }
       }
       if (gateVerbose && ((it + 1) % verboseEvery == 0)) {
         print('[CUR/hardapp] iter=${it + 1}/$iters '
