@@ -612,9 +612,15 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
   switch (intent) {
     case Intent.brakeUp: {
-      final need = vy > vCapBrake || needUp(vCapBrake, tau: 1.35, warn: 0.75, pad: 3.0);
-      thr = need;
-      break;
+      final vCap = _vCapBrakeUp(h); // (0.07*h + 6)..16
+      final needUp = vy > (0.9 * vCap) || _needPreBoost(
+          vCap: vCap, env: env, warnFrac: 0.75, tauReact: 1.6, extraPad: 4.0);
+      return et.ControlInput(
+        thrust: needUp,
+        left: false, right: false,
+        sideLeft: false, sideRight: false,
+        downThrust: false,
+      );
     }
 
     case Intent.descendSlow: {

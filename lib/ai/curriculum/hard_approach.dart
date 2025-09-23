@@ -351,24 +351,27 @@ class HardApproach extends Curriculum {
       }
     }
 
-    // Single update from this episode
-    policy.updateFromEpisode(
-      decisionCaches: decisionCaches,
-      intentChoices: intentChoices,
-      decisionReturns: decisionReturns,
-      alignLabels: alignLabels,
-      alignWeight: intentAlignWeight,
-      intentPgWeight: intentPgWeight,
-      lr: lr,
-      entropyBeta: 0.0,
-      valueBeta: 0.0,
-      huberDelta: 1.0,
-      intentMode: true,
-      actionCaches: actionCaches,
-      actionTurnTargets: actionTurnTargets,
-      actionThrustTargets: actionThrustTargets,
-      actionAlignWeight: actionAlignWeight,
-    );
+    final bool accept = landed; //!cfg.gateOnlyLanded || landed;
+    if (accept) {
+      // Single update from this episode
+      policy.updateFromEpisode(
+        decisionCaches: decisionCaches,
+        intentChoices: intentChoices,
+        decisionReturns: decisionReturns,
+        alignLabels: alignLabels,
+        alignWeight: intentAlignWeight,
+        intentPgWeight: intentPgWeight,
+        lr: lr,
+        entropyBeta: 0.0,
+        valueBeta: 0.0,
+        huberDelta: 1.0,
+        intentMode: true,
+        actionCaches: actionCaches,
+        actionTurnTargets: actionTurnTargets,
+        actionThrustTargets: actionThrustTargets,
+        actionAlignWeight: actionAlignWeight,
+      );
+    }
 
     if (cfg.verbose) {
       final L = env.lander;
@@ -382,6 +385,10 @@ class HardApproach extends Curriculum {
     return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: 0.0);
   }
 
+// At class scope:
+  double _emaLand = 0.0;
+  int _noChangeWindows = 0;
+
   void _maybeAdaptDifficulty({required bool landed}) {
     if (!cfg.adaptDifficulty) return;
 
@@ -391,20 +398,40 @@ class HardApproach extends Curriculum {
     if (_winCount >= cfg.adaptWindow) {
       final rate = _winLanded / _winCount.toDouble();
 
+      // --- EMA smoothing so single bad window doesn't kill momentum ---
+      final alpha = 0.25; // responsiveness (0.1..0.3 works well)
+      _emaLand = (_emaLand == 0.0) ? rate : (1 - alpha) * _emaLand + alpha * rate;
+
       double next = _curNearFrac;
-      if (rate >= cfg.promoteAt) {
-        next = (next + cfg.nearFracStepUp).clamp(0.0, cfg.nearFracMax);
-      } else if (cfg.demoteAt >= 0.0 && rate < cfg.demoteAt) {
+      final old = _curNearFrac;
+
+      // --- Proportional widen: more above target ⇒ larger step ---
+      if (_emaLand >= cfg.promoteAt) {
+        final margin = (_emaLand - cfg.promoteAt).clamp(0.0, 0.5); // 0..0.5
+        final k = 1.0 + 2.0 * margin; // 1x..2x step
+        next = (next + k * cfg.nearFracStepUp).clamp(0.0, cfg.nearFracMax);
+        _noChangeWindows = 0;
+      } else if (cfg.demoteAt >= 0.0 && _emaLand < cfg.demoteAt) {
         next = (next - cfg.nearFracStepDown).clamp(0.0, cfg.nearFracMax);
+        _noChangeWindows = 0;
+      } else {
+        // Neither promote nor demote ⇒ count as "no change"
+        _noChangeWindows++;
+        // Stuck lifter: after N windows, creep up a tiny bit anyway.
+        if (_noChangeWindows >= 4 && next < cfg.nearFracMax) {
+          next = (next + 0.5 * cfg.nearFracStepUp).clamp(0.0, cfg.nearFracMax);
+          _noChangeWindows = 0;
+        }
       }
 
       if (cfg.verbose) {
-        print('[HARDAPP/ADAPT] window=$_winCount landed=$_winLanded '
-            'rate=${rate.toStringAsFixed(2)} '
+        print('[HARDAPP/ADAPT] win=$_winCount landed=$_winLanded '
+            'rate=${rate.toStringAsFixed(2)} ema=${_emaLand.toStringAsFixed(2)} '
             'nearFrac ${_curNearFrac.toStringAsFixed(3)} -> ${next.toStringAsFixed(3)}');
       }
 
-      _curNearFrac = next;
+      if ((next - old).abs() > 1e-6) _curNearFrac = next;
+
       _winCount = 0;
       _winLanded = 0;
     }
