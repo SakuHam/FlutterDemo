@@ -5,6 +5,7 @@ import 'package:flutter/services.dart' show rootBundle;
 
 // UI types
 import 'package:flutter/material.dart' show Offset;
+import '../engine/game_engine.dart';
 import '../engine/types.dart' show LanderState, Terrain, RayHitKind;
 import '../engine/raycast.dart' show RayHit, RayHitKind; // for ray-based FE
 
@@ -958,23 +959,13 @@ class RuntimeTwoStagePolicy {
             field: field,
             g: physics.gravity,
           );
-          PlanBus.instance.push(planPts);
-        }
-        /*
-        else {
-          // keep your previous curved (non-PF) plan as a fallback:
-          final planPts = _buildCurvedPlanPolyline(
-            lander: lander,
+          final widths = _makeUncertaintyWidths(
+            pts: planPts,
             terrain: terrain,
-            worldW: worldW,
-            worldH: worldH,
-            rays: rays,
-            intent: intent,
+            lander: lander,
           );
-          PlanBus.instance.push(points: planPts, source: 'fallback');
+          PlanBus.instance.push(points: planPts, widths: widths, source: 'pf');
         }
-
-         */
       } catch (_) {
         // ignore planning errors (don’t crash gameplay)
       }
@@ -1233,5 +1224,99 @@ class RuntimeTwoStagePolicy {
       while (pts.length < 8) pts.add(last);
     }
     return pts;
+  }
+
+  List<double> _makeUncertaintyWidths({
+    required LanderState lander,
+    required Terrain terrain,
+    required List<Offset> pts,
+  }) {
+    if (pts.isEmpty) return const [];
+
+    // speed & height right now (for base width)
+    final vx = lander.vel.x.toDouble();
+    final vy = lander.vel.y.toDouble();
+    final sp = math.sqrt(vx * vx + vy * vy);
+
+    final gy = terrain.heightAt(lander.pos.x.toDouble());
+    final h0 = (gy - lander.pos.y).toDouble().clamp(0.0, 800.0);
+
+    // base width depends a bit on speed & height
+    final base = (6.0 + 0.05 * sp + 0.015 * h0).clamp(6.0, 38.0);
+
+    final n = pts.length;
+    final out = List<double>.filled(n, 0.0);
+
+    for (int i = 0; i < n; i++) {
+      final t = (n <= 1) ? 0.0 : (i / (n - 1)); // 0 at craft, 1 at pad/future
+      // grow from skinny near the craft to wider toward the pad
+      final grow = 0.45 + 0.75 * t;
+      out[i] = base * grow;
+    }
+
+    if (n >= 2) {
+      out[0] *= 0.35;        // tight at the craft
+      out[n - 1] *= 1.10;    // a touch wider at the end
+    }
+
+    // quick smoothing
+    for (int i = 1; i < n - 1; i++) {
+      out[i] = (out[i - 1] + out[i] + out[i + 1]) / 3.0;
+    }
+    return out;
+  }
+
+  List<double> _makePlanWidths({
+    required List<Offset> pts,
+    required Terrain terrain,
+    required pf.PotentialField field,
+    required double worldW,
+    required double worldH,
+  }) {
+    if (pts.isEmpty) return const [];
+    final n = pts.length;
+    final w = List<double>.filled(n, 0.0);
+
+    double distToEnd = 0.0;
+    // precompute cumulative backward distance
+    final dist = List<double>.filled(n, 0.0);
+    for (int i = n - 2; i >= 0; i--) {
+      distToEnd += (pts[i + 1] - pts[i]).distance;
+      dist[i] = distToEnd;
+    }
+
+    for (int i = 0; i < n; i++) {
+      final p = pts[i];
+      // PF magnitude as “confidence”; lower mag ⇒ flatter potential ⇒ more uncertainty
+      double conf;
+      try {
+        final f = field.sampleFlow(p.dx, p.dy);
+        conf = f.mag; // 0..?
+      } catch (_) {
+        conf = 1.0;
+      }
+      // normalize-ish
+      conf = conf.clamp(0.0, 8.0) / 8.0; // ~[0..1]
+      final invConf = 1.0 - conf;
+
+      // base width
+      double base = 6.0;
+      // widen with distance remaining
+      base += (dist[i] / 300.0).clamp(0.0, 14.0); // up to +14px far away
+      // widen near walls
+      final margin = 0.10 * worldW;
+      final nearWall = (p.dx < margin) ? (1.0 - p.dx / margin)
+          : (p.dx > worldW - margin) ? (1.0 - (worldW - p.dx) / margin)
+          : 0.0;
+      base += 10.0 * nearWall;
+      // widen when PF is weak / ambiguous
+      base += 14.0 * invConf;
+
+      // taper at the very end (touchdown)
+      final t = (i / (n - 1)).clamp(0.0, 1.0);
+      final taper = 1.0 - math.pow(t, 2.0) as double; // bigger earlier, smaller near pad
+      w[i] = (base * taper).clamp(3.0, 32.0);
+    }
+    return w;
   }
 }
