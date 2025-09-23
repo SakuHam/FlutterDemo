@@ -1,5 +1,5 @@
 // lib/ai/curriculum/hard_approach.dart
-// Micro-stage: “hard approach” extracted from your monolith (same logic, polished)
+// Micro-stage: “hard approach” with adaptive lateral spawn difficulty.
 
 import 'dart:math' as math;
 
@@ -17,8 +17,19 @@ class HardApproachCfg {
   final double vyMax;      // maximum downward start speed
   final double hMin;       // minimum spawn height
   final double hMax;       // maximum spawn height
-  final double nearPadFrac;// spawn near pad horizontally (fraction of W)
+
+  // Spawn band around pad center (fraction of W)
+  final double nearPadFrac;        // starting band (tight)
   final bool verbose;
+
+  // === Adaptive difficulty knobs ===
+  final bool adaptDifficulty;      // enable auto-widening of spawn band
+  final double nearFracMax;        // cap for widening
+  final double nearFracStepUp;     // step to widen on good performance
+  final double nearFracStepDown;   // step to tighten (if you want to punish regressions)
+  final int    adaptWindow;        // evaluate every N episodes
+  final double promoteAt;          // widen if land% >= this
+  final double demoteAt;           // tighten if land% < this (set <0 to disable)
 
   const HardApproachCfg({
     this.batch = 1,
@@ -28,8 +39,16 @@ class HardApproachCfg {
     this.vyMax = 36.0,
     this.hMin = 120.0,
     this.hMax = 320.0,
-    this.nearPadFrac = 0.08,
+    this.nearPadFrac = 0.04,       // start very close to pad center
     this.verbose = true,
+
+    this.adaptDifficulty = true,
+    this.nearFracMax = 0.22,
+    this.nearFracStepUp = 0.02,
+    this.nearFracStepDown = 0.01,
+    this.adaptWindow = 40,
+    this.promoteAt = 0.65,
+    this.demoteAt = 0.35,
   });
 
   HardApproachCfg copyWith({
@@ -42,16 +61,32 @@ class HardApproachCfg {
     double? hMax,
     double? nearPadFrac,
     bool? verbose,
+
+    bool? adaptDifficulty,
+    double? nearFracMax,
+    double? nearFracStepUp,
+    double? nearFracStepDown,
+    int? adaptWindow,
+    double? promoteAt,
+    double? demoteAt,
   }) => HardApproachCfg(
-    batch: batch ?? this.batch,
-    minSteps: minSteps ?? this.minSteps,
-    warmFrames: warmFrames ?? this.warmFrames,
-    vyMin: vyMin ?? this.vyMin,
-    vyMax: vyMax ?? this.vyMax,
-    hMin: hMin ?? this.hMin,
-    hMax: hMax ?? this.hMax,
-    nearPadFrac: nearPadFrac ?? this.nearPadFrac,
-    verbose: verbose ?? this.verbose,
+    batch:            batch ?? this.batch,
+    minSteps:         minSteps ?? this.minSteps,
+    warmFrames:       warmFrames ?? this.warmFrames,
+    vyMin:            vyMin ?? this.vyMin,
+    vyMax:            vyMax ?? this.vyMax,
+    hMin:             hMin ?? this.hMin,
+    hMax:             hMax ?? this.hMax,
+    nearPadFrac:      nearPadFrac ?? this.nearPadFrac,
+    verbose:          verbose ?? this.verbose,
+
+    adaptDifficulty:  adaptDifficulty ?? this.adaptDifficulty,
+    nearFracMax:      nearFracMax ?? this.nearFracMax,
+    nearFracStepUp:   nearFracStepUp ?? this.nearFracStepUp,
+    nearFracStepDown: nearFracStepDown ?? this.nearFracStepDown,
+    adaptWindow:      adaptWindow ?? this.adaptWindow,
+    promoteAt:        promoteAt ?? this.promoteAt,
+    demoteAt:         demoteAt ?? this.demoteAt,
   );
 }
 
@@ -60,6 +95,13 @@ class HardApproach extends Curriculum {
   String get key => 'hardapp';
 
   HardApproachCfg cfg = const HardApproachCfg();
+
+  // Current adaptive spawn band (starts at cfg.nearPadFrac; widens over time)
+  double _curNearFrac = 0.04;
+
+  // Rolling landing stats for adaptation
+  int _winCount = 0;
+  int _winLanded = 0;
 
   @override
   Curriculum configure(Map<String, String?> kv, Set<String> flags) {
@@ -72,19 +114,39 @@ class HardApproach extends Curriculum {
       vyMax:      cli.getDouble('hardapp_vy_max',   def: 36.0),
       hMin:       cli.getDouble('hardapp_hmin',     def: 120.0),
       hMax:       cli.getDouble('hardapp_hmax',     def: 320.0),
-      nearPadFrac:cli.getDouble('hardapp_near_frac',def: 0.08),
+      nearPadFrac:cli.getDouble('hardapp_near_frac',def: 0.04),
       verbose:    cli.getFlag('hardapp_verbose',    def: true),
+
+      adaptDifficulty:  cli.getFlag('hardapp_adapt',        def: true),
+      nearFracMax:      cli.getDouble('hardapp_near_max',   def: 0.22),
+      nearFracStepUp:   cli.getDouble('hardapp_near_step',  def: 0.02),
+      nearFracStepDown: cli.getDouble('hardapp_near_down',  def: 0.01),
+      adaptWindow:      cli.getInt('hardapp_adapt_win',     def: 40),
+      promoteAt:        cli.getDouble('hardapp_promote_at', def: 0.65),
+      demoteAt:         cli.getDouble('hardapp_demote_at',  def: 0.35),
     );
+    _curNearFrac = cfg.nearPadFrac.clamp(0.0, cfg.nearFracMax);
+    _winCount = 0; _winLanded = 0;
     return this;
   }
 
-  static void _initStart(eng.GameEngine env, math.Random r, HardApproachCfg c) {
+  static void _initStart(
+      eng.GameEngine env,
+      math.Random r,
+      HardApproachCfg c,
+      double curNearFrac,
+      ) {
     final padCx = env.terrain.padCenter.toDouble();
     final W = env.cfg.worldW.toDouble();
-    final x = (padCx + (r.nextDouble() * 2 - 1) * (c.nearPadFrac * W)).clamp(10.0, W - 10.0);
-    final h = (c.hMin + (c.hMax - c.hMin) * r.nextDouble());
-    double vy = c.vyMin + (c.vyMax - c.vyMin) * r.nextDouble();
+
+    // Spawn X within ±curNearFrac * W around pad center; clamp to world
+    final x = (padCx + (r.nextDouble() * 2 - 1) * (curNearFrac * W))
+        .clamp(10.0, W - 10.0);
+
+    final h  = (c.hMin + (c.hMax - c.hMin) * r.nextDouble());
+    final vy = c.vyMin + (c.vyMax - c.vyMin) * r.nextDouble();
     final vx = (r.nextDouble() * 16.0) - 8.0;
+
     final gy = env.terrain.heightAt(x);
 
     env.lander
@@ -139,6 +201,7 @@ class HardApproach extends Curriculum {
     required double intentAlignWeight,
     required double intentPgWeight,
     required double actionAlignWeight,
+    required double curNearFrac,
   }) {
     policy.trunk.trainMode = true;
 
@@ -154,7 +217,7 @@ class HardApproach extends Curriculum {
     final actionThrustTargets = <bool>[];
 
     env.reset(seed: rnd.nextInt(1 << 30));
-    _initStart(env, rnd, cfg);
+    _initStart(env, rnd, cfg, curNearFrac);
 
     int framesLeft = 0;
     int currentIntentIdx = intentToIndex(Intent.descendSlow);
@@ -170,8 +233,15 @@ class HardApproach extends Curriculum {
     while (true) {
       // Refresh intent decision when plan window expires
       if (framesLeft <= 0) {
-        var x = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
+        var x = fe.extract(
+          lander: env.lander,
+          terrain: env.terrain,
+          worldW: env.cfg.worldW,
+          worldH: env.cfg.worldH,
+          rays: env.rays,
+        );
         final yTeacher = predictiveIntentLabelAdaptive(env);
+
         if (norm != null) {
           norm.observe(x);
           x = norm.normalize(x, update: false);
@@ -239,7 +309,13 @@ class HardApproach extends Curriculum {
       totalCost += info.costDelta;
 
       // action head supervision
-      var xAct = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
+      var xAct = fe.extract(
+        lander: env.lander,
+        terrain: env.terrain,
+        worldW: env.cfg.worldW,
+        worldH: env.cfg.worldH,
+        rays: env.rays,
+      );
       if (norm != null) xAct = norm.normalize(xAct, update: false);
       final (_, __, ___, ____, cAct) = policy.actGreedy(xAct);
       actionCaches.add(cAct);
@@ -252,7 +328,7 @@ class HardApproach extends Curriculum {
       final v = math.sqrt(vx * vx + vy * vy);
       accReward += -0.01 * v;
 
-      // ✅ real progression + decision window countdown
+      // ✅ progression + decision window countdown
       steps++;
       framesLeft--;
 
@@ -260,7 +336,7 @@ class HardApproach extends Curriculum {
       if (steps < cfg.minSteps && env.status != et.GameStatus.playing) {
         // If we crashed/landed too early, restart this micro-episode in-place.
         env.reset(seed: rnd.nextInt(1 << 30));
-        _initStart(env, rnd, cfg);
+        _initStart(env, rnd, cfg, curNearFrac);
         framesLeft = 0;
         continue;
       }
@@ -298,10 +374,40 @@ class HardApproach extends Curriculum {
       final L = env.lander;
       final gx = env.terrain.heightAt(L.pos.x.toDouble());
       final h  = (gx - L.pos.y).toDouble();
-      print('[HARDAPP] steps=$steps landed=${landed ? "Y" : "N"} vy=${L.vel.y.toStringAsFixed(1)} h=${h.toStringAsFixed(1)}');
+      print('[HARDAPP] steps=$steps landed=${landed ? "Y" : "N"} '
+          'vy=${L.vel.y.toStringAsFixed(1)} h=${h.toStringAsFixed(1)} '
+          'nearFrac=${curNearFrac.toStringAsFixed(3)}');
     }
 
     return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: 0.0);
+  }
+
+  void _maybeAdaptDifficulty({required bool landed}) {
+    if (!cfg.adaptDifficulty) return;
+
+    _winCount++;
+    if (landed) _winLanded++;
+
+    if (_winCount >= cfg.adaptWindow) {
+      final rate = _winLanded / _winCount.toDouble();
+
+      double next = _curNearFrac;
+      if (rate >= cfg.promoteAt) {
+        next = (next + cfg.nearFracStepUp).clamp(0.0, cfg.nearFracMax);
+      } else if (cfg.demoteAt >= 0.0 && rate < cfg.demoteAt) {
+        next = (next - cfg.nearFracStepDown).clamp(0.0, cfg.nearFracMax);
+      }
+
+      if (cfg.verbose) {
+        print('[HARDAPP/ADAPT] window=$_winCount landed=$_winLanded '
+            'rate=${rate.toStringAsFixed(2)} '
+            'nearFrac ${_curNearFrac.toStringAsFixed(3)} -> ${next.toStringAsFixed(3)}');
+      }
+
+      _curNearFrac = next;
+      _winCount = 0;
+      _winLanded = 0;
+    }
   }
 
   @override
@@ -324,10 +430,14 @@ class HardApproach extends Curriculum {
     final rnd = math.Random(seed ^ 0xA11A);
     final verboseEvery = 25;
 
-    if (gateVerbose) print('[CUR/hardapp] start iters=$iters batch=${cfg.batch}');
+    if (gateVerbose) {
+      print('[CUR/hardapp] start iters=$iters batch=${cfg.batch} '
+          'nearStart=${_curNearFrac.toStringAsFixed(3)} max=${cfg.nearFracMax}');
+    }
+
     for (int it = 0; it < iters; it++) {
       for (int b = 0; b < cfg.batch; b++) {
-        _runEpisode(
+        final res = _runEpisode(
           env: env,
           fe: fe,
           policy: policy,
@@ -340,10 +450,13 @@ class HardApproach extends Curriculum {
           intentAlignWeight: intentAlignWeight,
           intentPgWeight: intentPgWeight,
           actionAlignWeight: 0.25, // supervise action a bit stronger here
+          curNearFrac: _curNearFrac,
         );
+        _maybeAdaptDifficulty(landed: res.landed);
       }
       if (gateVerbose && ((it + 1) % verboseEvery == 0)) {
-        print('[CUR/hardapp] iter=${it + 1}/$iters');
+        print('[CUR/hardapp] iter=${it + 1}/$iters '
+            'nearFrac=${_curNearFrac.toStringAsFixed(3)}');
       }
     }
     if (gateVerbose) print('[CUR/hardapp] done iters=$iters');

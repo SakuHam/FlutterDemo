@@ -203,7 +203,7 @@ class FeatureExtractorRays {
   final bool kindsOneHot;
   FeatureExtractorRays({required this.rayCount, this.kindsOneHot = true});
 
-  int get inputSize => 6 + rayCount * (kindsOneHot ? 4 : 1);
+  int get inputSize => 5 + rayCount * (kindsOneHot ? 4 : 1);
 
 // In runtime_policy.dart, inside _RuntimeFE_Rays.extract(...)
 
@@ -386,133 +386,137 @@ int predictiveIntentLabelAdaptive(
   final L = env.lander;
   final T = env.terrain;
   final cfg = env.cfg;
-  final W = cfg.worldW.toDouble();
 
-  // --- State ---
+  // ---- State (world space) ----
   final px = L.pos.x.toDouble();
   final py = L.pos.y.toDouble();
   final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
+
   final padCx = T.padCenter.toDouble();
   final gy = T.heightAt(px);
   final h  = (gy - py).toDouble().clamp(0.0, 1e9);
-  final dx = px - padCx;
+  final W  = cfg.worldW.toDouble();
 
-  // --- Height-adaptive lookahead τ ---
+  // ---- Height-adaptive look-ahead (reaction horizon) ----
   final hNorm = (h / 320.0).clamp(0.0, 1.6);
-  final tau = (baseTauSec * (0.7 + 0.5 * hNorm)).clamp(minTauSec, maxTauSec);
+  final tau   = (baseTauSec * (0.7 + 0.5 * hNorm)).clamp(minTauSec, maxTauSec);
 
-  // --- Predict future (x, vy) ignoring lateral accel (RC(S) small) ---
-  final g  = cfg.t.gravity;
-  final xF = px + vx * tau;
+  // ---- Predict short-term future (ignore lateral accel) ----
+  final g   = cfg.t.gravity;
+  final xF  = px + vx * tau;
   final vyF = vy + g * tau;
 
-  // --- Quick risk gates -------------------------------------------------------
-  final vCapStrong = (0.07 * h + 6.0).clamp(6.0, 16.0);
-  final tooLow      = h < 140.0;
-  final tooFastDown = vyF > math.max(40.0, vCapStrong + 10.0);
-  final nearPadLat  = dx.abs() <= 0.18 * W;
+  // ---- Build a to-pad vector (prefer rays, fall back to center) ----
+  // Try rays-averaged pad vector (weighted by 1/d) for robustness.
+  double pdx = 0.0, pdy = 0.0; bool padVecValid = false;
+  double sx = 0.0, sy = 0.0, wsum = 0.0;
+  for (final r in env.rays) {
+    if (r.kind != RayHitKind.pad) continue;
+    final dx = r.p.x - px;
+    final dy = r.p.y - py;
+    final d2 = dx*dx + dy*dy;
+    if (d2 <= 1e-9) continue;
+    final w = 1.0 / math.sqrt(d2 + 1e-6);
+    sx += w * dx; sy += w * dy; wsum += w;
+  }
+  if (wsum > 0.0) {
+    final inv = 1.0 / wsum;
+    pdx = sx * inv; pdy = sy * inv;
+    padVecValid = true;
+  } else {
+    // Fallback: use horizontal to the pad center; keep vertical neutral to avoid bias.
+    pdx = (padCx - px);
+    pdy = 0.0;
+    padVecValid = false;
+  }
 
+  // ---- Helper math ----
+  double crossZ(double ax, double ay, double bx, double by) => ax*by - ay*bx; // sign = “B is to the left of A”
+  double dot   (double ax, double ay, double bx, double by) => ax*bx + ay*by;
+
+  // Normalize reference only for angle tests (keep raw for dot/cross thresholds):
+  final padLen = math.sqrt(pdx*pdx + pdy*pdy);
+  final pnx = padLen > 1e-6 ? (pdx / padLen) : 0.0;
+  final pny = padLen > 1e-6 ? (pdy / padLen) : 0.0;
+
+  // Future-velocity vector & speed
+  final vFx = vx;
+  final vFy = vyF;
+  final vFmag = math.sqrt(vFx*vFx + vFy*vFy) + 1e-9;
+
+  // ---- Quick vertical safety (emergency brake) ----
+  double _vCapBrakeUp(double hh) => (0.07 * hh + 6.0).clamp(6.0, 16.0);
+  final vCapStrong   = _vCapBrakeUp(h);
+  final tooLow       = h < 140.0;
+  final tooFastDown  = vyF > math.max(40.0, vCapStrong + 10.0);
+  final nearPadLat   = (px - padCx).abs() <= 0.18 * W;
   if (tooLow && tooFastDown && nearPadLat) {
     return intentToIndex(Intent.brakeUp);
   }
 
-  // If we’re very close to center laterally, prefer vertical management.
+  // ---- If centered laterally, manage vertical and lateral braking locally ----
   final padEnter = 0.08 * W;
-  if (dx.abs() <= padEnter) {
-    if (vx > 25.0)  return intentToIndex(Intent.brakeRight);
+  final dxNow    = px - padCx;
+  if (dxNow.abs() <= padEnter) {
+    if (vx >  25.0) return intentToIndex(Intent.brakeRight);
     if (vx < -25.0) return intentToIndex(Intent.brakeLeft);
     return intentToIndex(Intent.descendSlow);
   }
 
-  // --- Build a to-pad vector (fallback to purely horizontal if pad rays absent)
-  // Try rays-averaged pad vector first (more robust when pad is off-screen).
-  ({double x, double y, bool valid}) padVec = (x: padCx - px, y: T.heightAt(padCx) - py, valid: true);
-  final rays = env.rays;
-  if (rays.isNotEmpty) {
-    double sx = 0.0, sy = 0.0, wsum = 0.0;
-    for (final r in rays) {
-      if (r.kind != RayHitKind.pad) continue;
-      final dxp = r.p.x - px;
-      final dyp = r.p.y - py;
-      final d2 = dxp*dxp + dyp*dyp;
-      if (d2 <= 1e-9) continue;
-      final w = 1.0 / math.sqrt(d2 + 1e-6);
-      sx += w * dxp; sy += w * dyp; wsum += w;
-    }
-    if (wsum > 0) {
-      final inv = 1.0 / wsum;
-      padVec = (x: sx * inv, y: sy * inv, valid: true);
-    } else {
-      // keep default (center-based) but mark valid false so we can fall back later if needed
-      padVec = (x: padCx - px, y: 0.0, valid: false);
-    }
-  }
-
-  // --- Future-velocity vector (predict short reaction ahead)
-  final vF = (x: vx, y: vyF);
-
-  // Helper: signed 2D "cross" (z-component) and dot
-  double crossZ(double ax, double ay, double bx, double by) => ax*by - ay*bx;
-  double dot(double ax, double ay, double bx, double by) => ax*bx + ay*by;
-
-  // --- Crossing & drift tests -------------------------------------------------
-  // 1) Will our *lateral position* cross pad center within τ?
+  // ---- Will we cross pad center soon? (x sign flip within τ) ----
   final dxF = xF - padCx;
-  final crossesCenter = (dx * dxF) < 0.0; // opposite signs → will pass over center soon
+  final crossesCenter = (dxNow * dxF) < 0.0;
 
-  // 2) Are we drifting away from pad (|dxF| > |dx|) ?
-  final driftingAway = dxF.abs() > dx.abs() + 2.0; // small bias to avoid chatter
-
-  // 3) If we have a pad vector, measure orientation between vF and toPad.
-  //    If the signed angle is large, steer (goLeft/right) to reduce it.
-  Intent? steerByPadVector() {
-    if (!padVec.valid) return null;
-    final cp = crossZ(vF.x, vF.y, padVec.x, padVec.y); // >0 : pad is to the left of velocity
-    final dp = dot(vF.x, vF.y, padVec.x, padVec.y);
-    // angle ~ atan2(cp, dp). Use thresholds without trigs: large |cp| and small/negative dp ⇒ big misalignment
-    final misaligned = (cp.abs() > 200.0) || (dp < -200.0);
-    if (!misaligned) return null;
-
-    // If pad is to the left of velocity, we need to push LEFTwards (i.e., goLeft).
-    return cp > 0 ? Intent.goLeft : Intent.goRight;
-  }
-
-  // --- Decisions --------------------------------------------------------------
-
-  // Prioritize crossing: if we’ll pass over the center soon, bleed lateral speed.
   if (crossesCenter) {
-    if (vx > 12.0)  return intentToIndex(Intent.brakeRight);
+    // Prioritize killing lateral speed so we don’t overshoot the pad.
+    if (vx >  12.0) return intentToIndex(Intent.brakeRight);
     if (vx < -12.0) return intentToIndex(Intent.brakeLeft);
-    // Already slow laterally → descend
     return intentToIndex(Intent.descendSlow);
   }
 
-  // If drifting away from pad, actively move toward pad.
+  // ---- Drifting away from pad? (|dx| growing) -> steer toward pad ----
+  final driftingAway = dxF.abs() > dxNow.abs() + 2.0; // small hysteresis
   if (driftingAway) {
-    return dx > 0 ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
+    return (dxNow > 0.0) ? intentToIndex(Intent.goLeft)
+        : intentToIndex(Intent.goRight);
   }
 
-  // If we can see/estimate the pad vector, use geometric steering vs future velocity.
-  final steer = steerByPadVector();
-  if (steer != null) return intentToIndex(steer);
+  // ---- If we have a usable pad vector, compare it with future velocity ----
+  // Use signed cross to decide left/right; require meaningful misalignment.
+  if (padVecValid) {
+    final cp = crossZ(vFx, vFy, pdx, pdy);   // >0: pad is to the LEFT of vF
+    final dp = dot   (vFx, vFy, pdx, pdy);
 
-  // If pad vector is unreliable (not visible) and we’re getting fast or close, bias to safety (go up).
-  if (!padVec.valid) {
-    final vCapHover = (0.06 * h + 6.0).clamp(6.0, 18.0);
-    final needUp = (vy > vCapHover) || (vyF > 0.85 * vCapHover);
+    // Scale thresholds with speed so decisions are stable across regimes.
+    // “cpThresh” ~ how far off-axis we tolerate; “dpBad” ~ going mostly away.
+    final cpThresh = 0.015 * vFmag * (padLen > 1.0 ? padLen : 1.0); // proportional to |vF| and distance
+    final dpBad    = -0.030 * vFmag * (padLen > 1.0 ? padLen : 1.0);
+
+    final misaligned = (cp.abs() > cpThresh) || (dp < dpBad);
+    if (misaligned) {
+      // If pad lies to the left of our future velocity, yaw/translate LEFT.
+      return (cp > 0.0) ? intentToIndex(Intent.goLeft)
+          : intentToIndex(Intent.goRight);
+    }
+  } else {
+    // No reliable pad vector — bias to safety: slow descent if getting fast.
+    double _vCapHover(double hh) => (0.06 * hh + 6.0).clamp(6.0, 18.0);
+    final vCapHover = _vCapHover(h);
+    final needUp    = (vy > vCapHover) || (vyF > 0.85 * vCapHover);
     if (needUp) return intentToIndex(Intent.brakeUp);
   }
 
-  // Small outward velocity near the lateral boundary? Nudge back toward pad.
-  final padExit = 0.14 * W;
-  final willExitSoon = (dxF.abs() > padEnter) && (dx.abs() <= padEnter);
-  final vxIsOutward  = (dx.sign == vx.sign) && vx.abs() > 18.0;
-  if ((willExitSoon || vxIsOutward) && h > 90) {
-    return dx >= 0 ? intentToIndex(Intent.goLeft) : intentToIndex(Intent.goRight);
+  // ---- Boundary guard: if moving outward near lateral boundary, nudge inward ----
+  final padExit     = 0.14 * W;
+  final willExitSoon = (dxF.abs() > padEnter) && (dxNow.abs() <= padEnter);
+  final vxIsOutward  = (dxNow.sign == vx.sign) && vx.abs() > 18.0;
+  if ((willExitSoon || vxIsOutward) && h > 90.0) {
+    return (dxNow >= 0.0) ? intentToIndex(Intent.goLeft)
+        : intentToIndex(Intent.goRight);
   }
 
-  // Default: gentle descent management.
+  // ---- Default: keep a controlled descent ----
   return intentToIndex(Intent.descendSlow);
 }
 
@@ -568,108 +572,134 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
 
-  bool rcsLeft = false, rcsRight = false;
+  // Distance to pad center
+  final padCx = T.padCenter.toDouble();
+  final dx    = (px - padCx);
 
-  // Generic altitude-hold helper used by many intents
-  bool _altHold() {
-    // Make the descent cap a bit stricter near ground
-    final vCapSoft = math.min(_vCapDesc(h), (0.085 * h + 9.0).clamp(8.0, 22.0));
-    return _needPreBoost(vCap: vCapSoft, env: env, warnFrac: 0.80, tauReact: 1.35, extraPad: 2.0);
+  // Height-adaptive vertical caps
+  double vCapDesc   = (0.11 * h +  9.0).clamp( 9.0, 24.0);
+  double vCapHover  = (0.07 * h +  7.0).clamp( 7.0, 18.0);
+  double vCapBrake  = (0.07 * h +  6.0).clamp( 6.0, 16.0);
+
+  // Lateral target profile: far → faster, near → slower
+  // |vxt| in [vMin..vMax] scaled by |dx|/W
+  final W = env.cfg.worldW.toDouble();
+  final far = (dx.abs() / (0.45 * W)).clamp(0.0, 1.0); // 0 at center, 1 at ~0.45W
+  final vMin = 12.0, vMax = 45.0;
+  final vxt = (vMin + (vMax - vMin) * far) * (dx > 0 ? -1.0 : 1.0); // sign points TOWARD pad
+
+  // Helper: vertical pre-boost check (predict a bit ahead)
+  bool needUp(double cap, {double tau = 1.0, double warn = 0.80, double pad = 2.0}) {
+    final g = env.cfg.t.gravity;
+    final vyNext = vy + g * tau;
+    final warnCap = cap * warn;
+    return (vy > warnCap - pad) || (vyNext > warnCap);
   }
+
+  // Prefer world-frame RCS if available; if not, tilt+main
+  final tcfg = env.cfg.t as dynamic;
+  final rcsEnabled   = (tcfg.rcsEnabled ?? false) == true;
+  final rcsBodyFrame = (tcfg.rcsBodyFrame ?? true) == true;
+
+  // Common altitude hold for all intents (slightly relaxed while translating)
+  bool altHold({double relax = 1.0}) {
+    final cap = math.min(vCapDesc * relax, (0.085 * h + 9.0) * relax);
+    return needUp(cap, tau: 1.2, warn: 0.80, pad: 2.0);
+  }
+
+  // Build outputs
+  bool thr=false, left=false, right=false, sL=false, sR=false, dT=false;
 
   switch (intent) {
     case Intent.brakeUp: {
-      // Strong emergency gate, but react earlier with look-ahead
-      final vCap = _vCapBrakeUp(h);
-      final needUp = vy > vCap || _needPreBoost(vCap: vCap, env: env, warnFrac: 0.75, tauReact: 1.40, extraPad: 3.0);
-      return et.ControlInput(
-        thrust: needUp, left: false, right: false,
-        sideLeft: false, sideRight: false,
-        downThrust: false,
-      );
+      final need = vy > vCapBrake || needUp(vCapBrake, tau: 1.35, warn: 0.75, pad: 3.0);
+      thr = need;
+      break;
     }
 
     case Intent.descendSlow: {
-      // Gentle descent with proactive pre-boost; use DOWN thruster if rising/too slow
-      final vCap     = _vCapDesc(h);
-      final vWarnOK  = _needPreBoost(vCap: vCap, env: env, warnFrac: 0.80, tauReact: 1.35, extraPad: 2.0);
-
-      final t = (env.cfg.t as dynamic);
-      final downEnabled = (t.downThrEnabled ?? false) == true;
-      final needUp      = (vy > vCap) || vWarnOK;
-      final needDown    = downEnabled && (vy < 0.6 * vCap); // actively push down if too slow/rising
-
-      return et.ControlInput(
-        thrust: needUp, left: false, right: false,
-        sideLeft: false, sideRight: false,
-        downThrust: needDown,
-      );
+      final need = vy > vCapDesc || needUp(vCapDesc, tau: 1.3, warn: 0.80, pad: 2.0);
+      // Optionally push down if too slow and down-thruster exists
+      final downEn = ((tcfg.downThrEnabled ?? false) == true);
+      dT = downEn && (vy < 0.55 * vCapDesc);
+      thr = need;
+      break;
     }
 
-    case Intent.brakeLeft: {
-      final wantTiltRight   = (vx < -4.0);
-      final allowTranslate  = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsLeft = true; // push right
-      final needAltHold = _altHold();      // pre-boost if vy trending too down
-      return et.ControlInput(
-        thrust: (allowTranslate && !rcsLeft && wantTiltRight) || needAltHold,
-        left: false, right: (!rcsLeft && wantTiltRight),
-        sideLeft: rcsLeft, sideRight: false,
-        downThrust: false,
-      );
+    case Intent.brakeLeft: { // want vxt <= 0 (moving right → brake rightward)
+      // Brake rule: if vx > -2, just align; otherwise push right to reduce |vx|
+      final allowTranslate = (h > 90.0 && h < 360.0) && (vy < 42.0);
+      if (rcsEnabled && !rcsBodyFrame && allowTranslate) {
+        // world-frame strafing right to reduce leftward drift
+        sL = true; // RCS pushing to the right (your engine: sideLeft => +X if rcsBodyFrame=false)
+        thr = altHold(relax: 1.08);
+      } else {
+        // tilt left or right as needed; while braking, tilt opposite vx
+        final wantTiltRight = (vx < -3.0);
+        left  = false;
+        right = wantTiltRight;
+        thr = altHold(relax: wantTiltRight ? 1.10 : 1.0);
+      }
+      break;
     }
 
     case Intent.brakeRight: {
-      final wantTiltLeft    = (vx >  4.0);
-      final allowTranslate  = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsRight = true; // push left
-      final needAltHold = _altHold();
-      return et.ControlInput(
-        thrust: (allowTranslate && !rcsRight && wantTiltLeft) || needAltHold,
-        left: (!rcsRight && wantTiltLeft), right: false,
-        sideLeft: false, sideRight: rcsRight,
-        downThrust: false,
-      );
+      final allowTranslate = (h > 90.0 && h < 360.0) && (vy < 42.0);
+      if (rcsEnabled && !rcsBodyFrame && allowTranslate) {
+        sR = true; // push left
+        thr = altHold(relax: 1.08);
+      } else {
+        final wantTiltLeft = (vx > 3.0);
+        left  = wantTiltLeft;
+        right = false;
+        thr = altHold(relax: wantTiltLeft ? 1.10 : 1.0);
+      }
+      break;
     }
 
     case Intent.goLeft: {
-      final translate = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsRight = true; // push left
-      final needAltHold = _altHold();
-      return et.ControlInput(
-        thrust: (translate && !rcsRight) || needAltHold,
-        left: !rcsRight, right: false,
-        sideLeft: false, sideRight: rcsRight,
-        downThrust: false,
-      );
+      final allowTranslate = (h > 90.0 && h < 360.0) && (vy < 42.0);
+      // Track the target vxt (negative) — aggressively if far
+      final err = vx - vxt;
+      final strong = far > 0.4 || dx.abs() > 0.18 * W;
+      if (rcsEnabled && !rcsBodyFrame && allowTranslate) {
+        sR = true; // push left
+        thr = altHold(relax: strong ? 1.12 : 1.06);
+      } else {
+        // no RCS: lean left and keep thrust on to keep altitude while sliding
+        left = true;
+        thr  = altHold(relax: strong ? 1.12 : 1.06);
+      }
+      break;
     }
 
     case Intent.goRight: {
-      final translate = (h > 110 && h < 300) && (vy < 35);
-      if (_canStrafe(env)) rcsLeft = true; // push right
-      final needAltHold = _altHold();
-      return et.ControlInput(
-        thrust: (translate && !rcsLeft) || needAltHold,
-        left: false, right: !rcsLeft,
-        sideLeft: rcsLeft, sideRight: false,
-        downThrust: false,
-      );
+      final allowTranslate = (h > 90.0 && h < 360.0) && (vy < 42.0);
+      final err = vx - vxt;
+      final strong = far > 0.4 || dx.abs() > 0.18 * W;
+      if (rcsEnabled && !rcsBodyFrame && allowTranslate) {
+        sL = true; // push right
+        thr = altHold(relax: strong ? 1.12 : 1.06);
+      } else {
+        right = true;
+        thr   = altHold(relax: strong ? 1.12 : 1.06);
+      }
+      break;
     }
 
     case Intent.hover:
     default: {
-      // Hover with predictive pre-boost, a bit stricter near ground
-      final vCap = math.min(_vCapHover(h), (0.075 * h + 7.0).clamp(7.0, 18.0));
-      final needUp = (vy > vCap) || _needPreBoost(vCap: vCap, env: env, warnFrac: 0.80, tauReact: 1.35, extraPad: 2.0);
-      return et.ControlInput(
-        thrust: needUp, left: false, right: false,
-        sideLeft: false, sideRight: false,
-        downThrust: false,
-      );
+      thr = needUp(vCapHover, tau: 1.2, warn: 0.80, pad: 2.0);
+      break;
     }
   }
-}
 
+  return et.ControlInput(
+    thrust: thr, left: left, right: right,
+    sideLeft: sL, sideRight: sR,
+    downThrust: dT,
+  );
+}
 /* -------------------------------------------------------------------------- */
 /*                               POLICY NETWORK                                */
 /* -------------------------------------------------------------------------- */
@@ -1009,6 +1039,14 @@ class PolicyNetwork {
         final h = c.acts.last;
         final y = alignLabels[n].clamp(0, PolicyNetwork.kIntents - 1);
         final dLog = nn.Ops.crossEntropyGrad(c.intentProbs, y); // (p - y)
+        // Entropy grad wrt logits: dH = -β * ( (1 + log p) - ⟨1 + log p⟩ ), but we can use a simpler:
+        // ∂( -Σ p log p )/∂logit = β * (p * (log p + 1) - const).
+        // A simple practical version is to add β * p to the gradient (pushes toward uniform).
+        if (entropyBeta > 0) {
+          for (int i = 0; i < dLog.length; i++) {
+            dLog[i] += entropyBeta * c.intentProbs[i]; // small push to spread mass
+          }
+        }
         final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
         trunk.backwardFromTopGrad(
           dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x,
