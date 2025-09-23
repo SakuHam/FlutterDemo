@@ -1,5 +1,9 @@
 // lib/ai/curriculum/hard_approach.dart
-// Micro-stage: “hard approach” with adaptive lateral spawn difficulty.
+// Micro-stage: “hard approach” with adaptive lateral spawn difficulty + escalating retries.
+// - Retries reuse the SAME terrain + spawn
+// - Intent selection is NEVER greedy (temperature + entropy floor)
+// - Exploration escalates across retries (temp, ε-action noise, lateral bias flips, assist)
+// - Cohorts (terrain+spawn) count ONCE toward nearFrac adaptation (retries are "(nc)")
 
 import 'dart:math' as math;
 
@@ -9,6 +13,22 @@ import '../agent.dart';
 import '../nn_helper.dart' as nn;
 import 'core.dart';
 
+/// ===== Utility records (top-level; Dart doesn't support nested classes) =====
+class SpawnSetup {
+  final double x;
+  final double h;
+  final double vy;
+  final double vx;
+  const SpawnSetup({required this.x, required this.h, required this.vy, required this.vx});
+}
+
+class EpisodeWithSpawn {
+  final EpisodeResult res;
+  final SpawnSetup spawn;
+  const EpisodeWithSpawn(this.res, this.spawn);
+}
+
+/// =============================== Config =====================================
 class HardApproachCfg {
   final int batch;
   final int minSteps;      // do at least this many steps before allowing early termination
@@ -31,6 +51,15 @@ class HardApproachCfg {
   final double promoteAt;          // widen if land% >= this
   final double demoteAt;           // tighten if land% < this (set <0 to disable)
 
+  // === Retry escalation knobs (make controls try harder on repeat) ===
+  final int    retryMax;           // how many times to retry same terrain+spawn
+  final double retryTempStep;      // add to intent temperature each retry (multiplier on base)
+  final double retryActionEpsBase; // ε for random action flips (thrust/turn) at k=0
+  final double retryActionEpsStep; // ε increment per retry
+  final double retryLatBias;       // logit bonus toward pad-aligned lateral intent (±)
+  final double retryPlanHoldBump;  // add % to planHold after 20th retry, ramps up slowly
+  final bool   retryTeacherAssist; // progressively stronger flare/brake assist
+
   const HardApproachCfg({
     this.batch = 1,
     this.minSteps = 32,
@@ -49,6 +78,14 @@ class HardApproachCfg {
     this.adaptWindow = 40,
     this.promoteAt = 0.65,
     this.demoteAt = 0.35,
+
+    this.retryMax = 100,
+    this.retryTempStep = 0.25,
+    this.retryActionEpsBase = 0.02,
+    this.retryActionEpsStep = 0.02,
+    this.retryLatBias = 0.20,
+    this.retryPlanHoldBump = 0.4,
+    this.retryTeacherAssist = true,
   });
 
   HardApproachCfg copyWith({
@@ -69,6 +106,14 @@ class HardApproachCfg {
     int? adaptWindow,
     double? promoteAt,
     double? demoteAt,
+
+    int? retryMax,
+    double? retryTempStep,
+    double? retryActionEpsBase,
+    double? retryActionEpsStep,
+    double? retryLatBias,
+    double? retryPlanHoldBump,
+    bool? retryTeacherAssist,
   }) => HardApproachCfg(
     batch:            batch ?? this.batch,
     minSteps:         minSteps ?? this.minSteps,
@@ -87,9 +132,18 @@ class HardApproachCfg {
     adaptWindow:      adaptWindow ?? this.adaptWindow,
     promoteAt:        promoteAt ?? this.promoteAt,
     demoteAt:         demoteAt ?? this.demoteAt,
+
+    retryMax:         retryMax ?? this.retryMax,
+    retryTempStep:    retryTempStep ?? this.retryTempStep,
+    retryActionEpsBase: retryActionEpsBase ?? this.retryActionEpsBase,
+    retryActionEpsStep: retryActionEpsStep ?? this.retryActionEpsStep,
+    retryLatBias:     retryLatBias ?? this.retryLatBias,
+    retryPlanHoldBump: retryPlanHoldBump ?? this.retryPlanHoldBump,
+    retryTeacherAssist: retryTeacherAssist ?? this.retryTeacherAssist,
   );
 }
 
+/// ============================== Curriculum ==================================
 class HardApproach extends Curriculum {
   @override
   String get key => 'hardapp';
@@ -124,28 +178,36 @@ class HardApproach extends Curriculum {
       adaptWindow:      cli.getInt('hardapp_adapt_win',     def: 40),
       promoteAt:        cli.getDouble('hardapp_promote_at', def: 0.65),
       demoteAt:         cli.getDouble('hardapp_demote_at',  def: 0.35),
+
+      retryMax:         cli.getInt('hardapp_retry_max',     def: 100),
+      retryTempStep:    cli.getDouble('hardapp_retry_tstep',def: 0.25),
+      retryActionEpsBase: cli.getDouble('hardapp_retry_eps',def: 0.02),
+      retryActionEpsStep: cli.getDouble('hardapp_retry_eps_step', def: 0.02),
+      retryLatBias:     cli.getDouble('hardapp_retry_latbias', def: 0.20),
+      retryPlanHoldBump:cli.getDouble('hardapp_retry_planbump', def: 0.4),
+      retryTeacherAssist: cli.getFlag('hardapp_retry_assist', def: true),
     );
     _curNearFrac = cfg.nearPadFrac.clamp(0.0, cfg.nearFracMax);
     _winCount = 0; _winLanded = 0;
     return this;
   }
 
-  static void _initStart(
+  // -------------------- Spawn helpers --------------------
+  SpawnSetup _applyStart(
       eng.GameEngine env,
       math.Random r,
       HardApproachCfg c,
-      double curNearFrac,
-      ) {
+      double curNearFrac, {
+        SpawnSetup? fixed,
+      }) {
     final padCx = env.terrain.padCenter.toDouble();
     final W = env.cfg.worldW.toDouble();
 
-    // Spawn X within ±curNearFrac * W around pad center; clamp to world
-    final x = (padCx + (r.nextDouble() * 2 - 1) * (curNearFrac * W))
-        .clamp(10.0, W - 10.0);
-
-    final h  = (c.hMin + (c.hMax - c.hMin) * r.nextDouble());
-    final vy = c.vyMin + (c.vyMax - c.vyMin) * r.nextDouble();
-    final vx = (r.nextDouble() * 16.0) - 8.0;
+    final double x = fixed?.x ??
+        (padCx + (r.nextDouble() * 2 - 1) * (curNearFrac * W)).clamp(10.0, W - 10.0);
+    final double h  = fixed?.h  ?? (c.hMin + (c.hMax - c.hMin) * r.nextDouble());
+    final double vy = fixed?.vy ?? (c.vyMin + (c.vyMax - c.vyMin) * r.nextDouble());
+    final double vx = fixed?.vx ?? ((r.nextDouble() * 16.0) - 8.0);
 
     final gy = env.terrain.heightAt(x);
 
@@ -156,6 +218,8 @@ class HardApproach extends Curriculum {
       ..vel.y = vy   // NOTE: positive is downward in this engine
       ..angle = 0.0
       ..fuel = env.cfg.t.maxFuel;
+
+    return SpawnSetup(x: x, h: h, vy: vy, vx: vx);
   }
 
   static et.ControlInput _teacherWarm(Intent intent, eng.GameEngine env, HardApproachCfg cfg) {
@@ -188,7 +252,71 @@ class HardApproach extends Curriculum {
     return vy + g * tauReact;
   }
 
-  EpisodeResult _runEpisode({
+  // -------- Retry escalation helpers --------
+  double _retryTempFor(int k, double baseTemp) {
+    // Start at least 0.8, ramp more aggressively; cap to 4.0 to avoid chaos
+    final t = math.max(0.8, baseTemp) * (1.0 + cfg.retryTempStep * (k + 1));
+    return t.clamp(0.8, 4.0);
+  }
+
+  double _retryEpsFor(int k) {
+    // Start at 0.05 and grow to 0.35
+    final e = math.max(0.05, cfg.retryActionEpsBase) + cfg.retryActionEpsStep * (k + 1);
+    return e.clamp(0.05, 0.35);
+  }
+
+  double _retryEtaFor(int k) {
+    // Entropy floor: mixture with uniform (keeps exploration alive)
+    return (0.05 + 0.01 * k).clamp(0.05, 0.35);
+  }
+
+  double _retryPlanHoldScaleFor(int k) {
+    if (k < 20) return 1.0;
+    final frac = ((k - 20) / 60.0).clamp(0.0, 1.0);
+    return 1.0 + cfg.retryPlanHoldBump * frac;
+  }
+
+  void _applyLateralBiasToLogits(
+      List<double> logits,
+      eng.GameEngine env, {
+        required double biasMag,
+        required int goLeftIdx,
+        required int goRightIdx,
+        required bool alternateSign,
+      }) {
+    if (biasMag <= 1e-9) return;
+    final L = env.lander;
+    final padX = env.terrain.padCenter.toDouble();
+    final dx = (padX - L.pos.x.toDouble());
+    double s = (dx >= 0) ? 1.0 : -1.0;
+    if (alternateSign) s = -s; // flip on odd retries to escape symmetry traps
+    logits[goRightIdx] += s > 0 ? biasMag : -biasMag * 0.25;
+    logits[goLeftIdx]  += s < 0 ? biasMag : -biasMag * 0.25;
+  }
+
+  // === Sample from logits with temperature + entropy floor (never greedy) ===
+  int _sampleWithEntropyFloor({
+    required List<double> logits,   // unnormalized
+    required double temp,           // temperature
+    required double eta,            // mix weight with uniform (0..0.5 typically)
+    required math.Random rnd,
+  }) {
+    final K = logits.length;
+    final z = List<double>.from(logits);
+    final T = temp.clamp(1e-6, 10.0);
+    for (int i = 0; i < K; i++) z[i] /= T;
+    final sm = nn.Ops.softmax(z);               // softmax(z/T)
+    final mix = 1.0 - eta;
+    final p = List<double>.filled(K, 0.0);
+    for (int i = 0; i < K; i++) p[i] = mix * sm[i] + eta * (1.0 / K);
+
+    final u = rnd.nextDouble();
+    double acc = 0.0;
+    for (int i = 0; i < K; i++) { acc += p[i]; if (u <= acc) return i; }
+    return K - 1;
+  }
+
+  EpisodeWithSpawn _runEpisode({
     required eng.GameEngine env,
     required FeatureExtractorRays fe,
     required PolicyNetwork policy,
@@ -202,11 +330,26 @@ class HardApproach extends Curriculum {
     required double intentPgWeight,
     required double actionAlignWeight,
     required double curNearFrac,
-    int? fixedSeed, // ✅ if set, reuse terrain by resetting with same seed
+    int? fixedSeed,
+    SpawnSetup? fixedSpawn,
+
+    // Escalation knobs for this attempt
+    double? tempOverride,
+    double actionEps = 0.0,
+    double latBias = 0.0,
+    bool altBiasSign = false,
+    int assistLevel = 0,
+    double planHoldScale = 1.0,
+
+    // Retry index for logs/schedules: 0 = first attempt, 1..N = retries
+    int retryIndex = 0,
+
+    // Logging controls
+    String logPrefix = '',
+    bool countedForAdapt = true,
   }) {
     policy.trunk.trainMode = true;
 
-    // Per-episode containers (intent + action heads)
     final decisionRewards = <double>[];
     final decisionCaches  = <ForwardCache>[];
     final intentChoices   = <int>[];
@@ -217,9 +360,9 @@ class HardApproach extends Curriculum {
     final actionTurnTargets   = <int>[];
     final actionThrustTargets = <bool>[];
 
-    // ✅ Respect fixedSeed to keep terrain identical across retries
+    // Terrain + spawn (fixed if provided)
     env.reset(seed: fixedSeed ?? rnd.nextInt(1 << 30));
-    _initStart(env, rnd, cfg, curNearFrac);
+    final usedSpawn = _applyStart(env, rnd, cfg, curNearFrac, fixed: fixedSpawn);
 
     int framesLeft = 0;
     int currentIntentIdx = intentToIndex(Intent.descendSlow);
@@ -230,7 +373,12 @@ class HardApproach extends Curriculum {
     bool landed = false;
     double totalCost = 0.0;
 
-    double _vCapLoose(double h) => (0.12 * h + 10.0).clamp(10.0, 30.0);
+    double _vCapLoose(double h) {
+      // stronger braking on higher assist levels
+      final base = 0.12, add = (assistLevel == 0) ? 0.0 : (assistLevel == 1 ? 0.03 : 0.06);
+      final off  = (assistLevel == 0) ? 10.0 : (assistLevel == 1 ? 12.0 : 14.0);
+      return ((base + add) * h + off).clamp(10.0, 36.0);
+    }
 
     while (true) {
       // Refresh intent decision when plan window expires
@@ -248,19 +396,22 @@ class HardApproach extends Curriculum {
           norm.observe(x);
           x = norm.normalize(x, update: false);
         }
-        final (idxGreedy, p, cache) = policy.actIntentGreedy(x);
 
-        int pick;
-        if (tempIntent <= 1e-6) {
-          pick = idxGreedy;
-        } else {
-          final z = p.map((pp) => math.log(pp.clamp(1e-12, 1.0))).toList();
-          for (int i = 0; i < z.length; i++) z[i] /= tempIntent;
-          final sm = nn.Ops.softmax(z);
-          final u = rnd.nextDouble();
-          double acc = 0.0; pick = sm.length - 1;
-          for (int i = 0; i < sm.length; i++) { acc += sm[i]; if (u <= acc) { pick = i; break; } }
-        }
+        // --- Intent policy forward with optional lateral bias & temperature ---
+        final (_greedyIdx, p, cache) = policy.actIntentGreedy(x);
+
+        // Use probs to get "logits"; if raw logits available, use those instead.
+        final logits = p.map((pp) => math.log(pp.clamp(1e-12, 1.0))).toList();
+        _applyLateralBiasToLogits(
+          logits, env,
+          biasMag: latBias,
+          goLeftIdx: intentToIndex(Intent.goLeft),
+          goRightIdx: intentToIndex(Intent.goRight),
+          alternateSign: altBiasSign,
+        );
+        final Tuse = (tempOverride ?? tempIntent);
+        final eta  = _retryEtaFor(retryIndex);
+        final pick = _sampleWithEntropyFloor(logits: logits, temp: Tuse, eta: eta, rnd: rnd);
         currentIntentIdx = pick;
 
         decisionCaches.add(cache);
@@ -270,43 +421,70 @@ class HardApproach extends Curriculum {
         accReward = 0.0;
 
         // compute decision-window advantages
-        final T = decisionRewards.length;
-        final tmp = List<double>.filled(T, 0.0);
+        final tn = decisionRewards.length;
+        final tmp = List<double>.filled(tn, 0.0);
         double G = 0.0;
-        for (int i = T - 1; i >= 0; i--) { G = decisionRewards[i] + gamma * G; tmp[i] = G; }
-        double mean = 0.0; for (final v in tmp) mean += v; mean /= math.max(1, T);
+        for (int i = tn - 1; i >= 0; i--) { G = decisionRewards[i] + gamma * G; tmp[i] = G; }
+        double mean = 0.0; for (final v in tmp) mean += v; mean /= math.max(1, tn);
         double var0 = 0.0; for (final v in tmp) { final d = v - mean; var0 += d * d; }
-        var0 = (var0 / math.max(1, T)).clamp(1e-9, double.infinity);
+        var0 = (var0 / math.max(1, tn)).clamp(1e-9, double.infinity);
         final std = math.sqrt(var0);
         decisionReturns
           ..clear()
           ..addAll(tmp.map((v) => (v - mean) / std));
 
-        framesLeft = planHold;
+        framesLeft = math.max(1, (planHold * planHoldScale).round());
       }
 
       final intent = indexToIntent(currentIntentIdx);
       final useWarm = (steps < cfg.warmFrames);
       final uTeacher = useWarm ? _teacherWarm(intent, env, cfg) : controllerForIntent(intent, env);
 
-      // Step the env (optionally override thrust for loose vertical cap)
+      // --- Optional ε-noise on actions to "try more" ---
+      et.ControlInput uTry = uTeacher;
+      if (!useWarm && actionEps > 1e-9) {
+        // random thrust toggle with small probability
+        if (rnd.nextDouble() < actionEps) {
+          uTry = et.ControlInput(
+            thrust: !uTry.thrust,
+            left: uTry.left, right: uTry.right,
+            sideLeft: uTry.sideLeft, sideRight: uTry.sideRight,
+            downThrust: uTry.downThrust,
+          );
+        }
+        // small chance to flip a lateral choice or engage side thrusters
+        if (rnd.nextDouble() < actionEps) {
+          final flipLR = rnd.nextBool();
+          final left  = flipLR ? !uTry.left  : uTry.left;
+          final right = flipLR ? !uTry.right : uTry.right;
+          final sl = uTry.sideLeft  || (!uTry.sideRight && rnd.nextDouble() < 0.33);
+          final sr = uTry.sideRight || (!uTry.sideLeft  && rnd.nextDouble() < 0.33);
+          uTry = et.ControlInput(
+            thrust: uTry.thrust, left: left, right: right,
+            sideLeft: sl, sideRight: sr, downThrust: uTry.downThrust,
+          );
+        }
+      }
+
+      // Step the env (with stronger flare assist if configured)
       et.StepInfo info;
       if (!useWarm && intent == Intent.descendSlow) {
         final L = env.lander;
         final gy = env.terrain.heightAt(L.pos.x);
         final h  = (gy - L.pos.y).toDouble().clamp(0.0, 1e9);
         final vCap = _vCapLoose(h);
-        final vyNext = _vyPredictNoThrust(env, tauReact: 0.6);
+        final tau = (assistLevel >= 2) ? 0.75 : 0.6;
+        final vyNext = _vyPredictNoThrust(env, tauReact: tau);
         final needUp = (L.vel.y > vCap) || (vyNext > 0.9 * vCap);
         final u2 = et.ControlInput(
-          thrust: needUp,
-          left: uTeacher.left, right: uTeacher.right,
-          sideLeft: uTeacher.sideLeft, sideRight: uTeacher.sideRight,
-          downThrust: uTeacher.downThrust,
+          thrust: uTry.thrust || needUp,
+          left: uTry.left, right: uTry.right,
+          sideLeft: uTry.sideLeft, sideRight: uTry.sideRight,
+          downThrust: uTry.downThrust,
         );
         info = env.step(1 / 60.0, u2);
       } else {
-        info = env.step(1 / 60.0, uTeacher);
+        info = env.step(1 / 60.0, uTry);
       }
       totalCost += info.costDelta;
 
@@ -324,21 +502,21 @@ class HardApproach extends Curriculum {
       actionTurnTargets.add(uTeacher.left ? 0 : (uTeacher.right ? 2 : 1));
       actionThrustTargets.add(uTeacher.thrust);
 
-      // dense reward: simple speed-min is OK here
+      // dense reward: simple speed-min
       final vx = env.lander.vel.x.toDouble();
       final vy = env.lander.vel.y.toDouble();
       final v = math.sqrt(vx * vx + vy * vy);
       accReward += -0.01 * v;
 
-      // ✅ progression + decision window countdown
+      // progression + decision window countdown
       steps++;
       framesLeft--;
 
       // Enforce a minimum number of steps before allowing termination
       if (steps < cfg.minSteps && env.status != et.GameStatus.playing) {
-        // If we crashed/landed too early, restart this micro-episode in-place.
+        // Restart same micro-episode with the exact same terrain + spawn.
         env.reset(seed: fixedSeed ?? rnd.nextInt(1 << 30));
-        _initStart(env, rnd, cfg, curNearFrac);
+        _applyStart(env, rnd, cfg, curNearFrac, fixed: usedSpawn);
         framesLeft = 0;
         continue;
       }
@@ -353,7 +531,7 @@ class HardApproach extends Curriculum {
       }
     }
 
-    final bool accept = landed; //!cfg.gateOnlyLanded || landed;
+    final bool accept = landed;
     if (accept) {
       // Single update from this episode
       policy.updateFromEpisode(
@@ -379,15 +557,25 @@ class HardApproach extends Curriculum {
       final L = env.lander;
       final gx = env.terrain.heightAt(L.pos.x.toDouble());
       final h  = (gx - L.pos.y).toDouble();
-      print('[HARDAPP] steps=$steps landed=${landed ? "Y" : "N"} '
+      final nc = countedForAdapt ? '' : ' (nc)'; // <-- not counted
+      final Tuse = (tempOverride ?? tempIntent);
+      final eta  = _retryEtaFor(retryIndex);
+      print('${logPrefix}[HARDAPP$nc] steps=$steps landed=${landed ? "Y" : "N"} '
           'vy=${L.vel.y.toStringAsFixed(1)} h=${h.toStringAsFixed(1)} '
-          'nearFrac=${curNearFrac.toStringAsFixed(3)}');
+          'nearFrac=${curNearFrac.toStringAsFixed(3)} '
+          'spawn=(x=${usedSpawn.x.toStringAsFixed(1)}, h=${usedSpawn.h.toStringAsFixed(1)}, '
+          'vy=${usedSpawn.vy.toStringAsFixed(1)}, vx=${usedSpawn.vx.toStringAsFixed(1)})'
+          '${nc.isNotEmpty ? " [temp=${Tuse.toStringAsFixed(2)} eta=${eta.toStringAsFixed(2)} "
+          "eps=${actionEps.toStringAsFixed(2)} assist=$assistLevel]" : ""}');
     }
 
-    return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: 0.0);
+    return EpisodeWithSpawn(
+      EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: 0.0),
+      usedSpawn,
+    );
   }
 
-  // At class scope:
+  // ---- Difficulty adaptation (counted ONCE per cohort) ----
   double _emaLand = 0.0;
   int _noChangeWindows = 0;
 
@@ -400,26 +588,23 @@ class HardApproach extends Curriculum {
     if (_winCount >= cfg.adaptWindow) {
       final rate = _winLanded / _winCount.toDouble();
 
-      // --- EMA smoothing so single bad window doesn't kill momentum ---
-      final alpha = 0.25; // responsiveness (0.1..0.3 works well)
+      // EMA smoothing
+      final alpha = 0.25;
       _emaLand = (_emaLand == 0.0) ? rate : (1 - alpha) * _emaLand + alpha * rate;
 
       double next = _curNearFrac;
       final old = _curNearFrac;
 
-      // --- Proportional widen: more above target ⇒ larger step ---
       if (_emaLand >= cfg.promoteAt) {
-        final margin = (_emaLand - cfg.promoteAt).clamp(0.0, 0.5); // 0..0.5
-        final k = 1.0 + 2.0 * margin; // 1x..2x step
+        final margin = (_emaLand - cfg.promoteAt).clamp(0.0, 0.5);
+        final k = 1.0 + 2.0 * margin;
         next = (next + k * cfg.nearFracStepUp).clamp(0.0, cfg.nearFracMax);
         _noChangeWindows = 0;
       } else if (cfg.demoteAt >= 0.0 && _emaLand < cfg.demoteAt) {
         next = (next - cfg.nearFracStepDown).clamp(0.0, cfg.nearFracMax);
         _noChangeWindows = 0;
       } else {
-        // Neither promote nor demote ⇒ count as "no change"
         _noChangeWindows++;
-        // Stuck lifter: after N windows, creep up a tiny bit anyway.
         if (_noChangeWindows >= 4 && next < cfg.nearFracMax) {
           next = (next + 0.5 * cfg.nearFracStepUp).clamp(0.0, cfg.nearFracMax);
           _noChangeWindows = 0;
@@ -439,6 +624,7 @@ class HardApproach extends Curriculum {
     }
   }
 
+  // =============================== Run loop ==================================
   @override
   Future<void> run({
     required int iters,
@@ -466,60 +652,118 @@ class HardApproach extends Curriculum {
 
     for (int it = 0; it < iters; it++) {
       for (int b = 0; b < cfg.batch; b++) {
-        // Pick a base seed for terrain for this (it,b) attempt:
+        // Fixed terrain+spawn cohort
         final terrainSeed = rnd.nextInt(1 << 30);
 
-        // First attempt on this terrain
-        EpisodeResult res = _runEpisode(
-          env: env,
-          fe: fe,
-          policy: policy,
-          norm: norm,
-          rnd: rnd,
-          planHold: planHold,
-          tempIntent: tempIntent,
-          gamma: gamma,
-          lr: lr,
-          intentAlignWeight: intentAlignWeight,
-          intentPgWeight: intentPgWeight,
-          actionAlignWeight: 0.25, // supervise action a bit stronger here
-          curNearFrac: _curNearFrac,
-          fixedSeed: terrainSeed, // ✅ lock terrain
+        // ----- First attempt (COUNTED) -----
+        EpisodeWithSpawn ep = _runEpisode(
+          env: env, fe: fe, policy: policy, norm: norm, rnd: rnd,
+          planHold: planHold, tempIntent: tempIntent, gamma: gamma, lr: lr,
+          intentAlignWeight: intentAlignWeight, intentPgWeight: intentPgWeight,
+          actionAlignWeight: 0.25, curNearFrac: _curNearFrac,
+          fixedSeed: terrainSeed, fixedSpawn: null,
+          tempOverride: tempIntent, actionEps: _retryEpsFor(0),
+          latBias: cfg.retryLatBias, altBiasSign: false,
+          assistLevel: cfg.retryTeacherAssist ? 0 : 0,
+          planHoldScale: _retryPlanHoldScaleFor(0),
+          retryIndex: 0,
+          logPrefix: '', countedForAdapt: true,
         );
-        _maybeAdaptDifficulty(landed: res.landed);
 
-        // If failed to land, retry up to 100 times on the SAME terrain
-        if (!res.landed) {
+        bool landedAny = ep.res.landed;
+        final fixedSpawn = ep.spawn;
+
+        // Capture signature after the attempt (for stuck detection)
+        int? lastSteps = ep.res.steps;
+        bool? lastLanded = ep.res.landed;
+        double? lastVy, lastH;
+        {
+          final L = env.lander;
+          final gy = env.terrain.heightAt(L.pos.x.toDouble());
+          final h = (gy - L.pos.y).toDouble();
+          lastVy = L.vel.y.toDouble();
+          lastH  = h;
+        }
+        int stuckCount = 0;
+
+        // ----- Retries (NOT COUNTED) -----
+        if (!ep.res.landed) {
           if (cfg.verbose) {
-            print('[HARDAPP/RETRY] no landing → retrying same terrain up to 100x');
+            print('  [HARDAPP/RETRY] no landing → escalating controls up to ${cfg.retryMax}x (nc)');
           }
-          for (int k = 0; k < 100; k++) {
-            res = _runEpisode(
-              env: env,
-              fe: fe,
-              policy: policy,
-              norm: norm,
-              rnd: rnd,
-              planHold: planHold,
-              tempIntent: tempIntent,
-              gamma: gamma,
-              lr: lr,
-              intentAlignWeight: intentAlignWeight,
-              intentPgWeight: intentPgWeight,
-              actionAlignWeight: 0.25,
-              curNearFrac: _curNearFrac,
-              fixedSeed: terrainSeed, // ✅ exact same terrain again
+          for (int k = 1; k <= cfg.retryMax; k++) {
+            // Default escalation schedules
+            bool altSign = (k % 2 == 1);
+            int assist = cfg.retryTeacherAssist ? (k < 10 ? 0 : (k < 35 ? 1 : 2)) : 0;
+            double tempK = _retryTempFor(k, tempIntent);
+            double epsK  = _retryEpsFor(k);
+            double planScaleK = _retryPlanHoldScaleFor(k);
+
+            // Run retry
+            ep = _runEpisode(
+              env: env, fe: fe, policy: policy, norm: norm, rnd: rnd,
+              planHold: planHold, tempIntent: tempIntent, gamma: gamma, lr: lr,
+              intentAlignWeight: intentAlignWeight, intentPgWeight: intentPgWeight,
+              actionAlignWeight: 0.25, curNearFrac: _curNearFrac,
+              fixedSeed: terrainSeed, fixedSpawn: fixedSpawn,
+              tempOverride: tempK,
+              actionEps: epsK,
+              latBias: cfg.retryLatBias, altBiasSign: altSign,
+              assistLevel: assist, planHoldScale: planScaleK,
+              retryIndex: k,
+              logPrefix: '  ', countedForAdapt: false, // <-- indented + not counted
             );
-            _maybeAdaptDifficulty(landed: res.landed);
-            if (res.landed) {
+
+            landedAny = landedAny || ep.res.landed;
+
+            // --- Stuck-buster: compare signatures; if identical, jack exploration for NEXT retry
+            final L = env.lander; // state at end of retry
+            final gy = env.terrain.heightAt(L.pos.x.toDouble());
+            final h  = (gy - L.pos.y).toDouble();
+            final sigSame = (lastSteps == ep.res.steps) && (lastLanded == ep.res.landed);
+            final sameVy  = (lastVy != null && (L.vel.y.toDouble() - lastVy!).abs() < 1e-9);
+            final sameH   = (lastH  != null && (h - lastH!).abs() < 1e-9);
+            final isStuck = sigSame && sameVy && sameH;
+
+            if (cfg.verbose) {
+              final etaK = _retryEtaFor(k);
+              print('  [HARDAPP/EXP (nc)] retry=$k temp=${tempK.toStringAsFixed(2)} '
+                  'eta=${etaK.toStringAsFixed(2)} eps=${epsK.toStringAsFixed(2)} '
+                  'assist=$assist altBias=${altSign ? "flip" : "norm"} '
+                  '${isStuck ? "→ STUCK" : ""}');
+            }
+
+            if (isStuck) {
+              stuckCount++;
+              // For the NEXT retry, push to max exploration immediately
+              altSign = !altSign;
+              assist = 2;
+              tempK = 3.5;
+              epsK = 0.35;
+              planScaleK = 1.0 + cfg.retryPlanHoldBump;
+            } else {
+              stuckCount = 0;
+            }
+
+            // Update "last" signature
+            lastSteps  = ep.res.steps;
+            lastLanded = ep.res.landed;
+            lastVy     = L.vel.y.toDouble();
+            lastH      = h;
+
+            if (ep.res.landed) {
               if (cfg.verbose) {
-                print('[HARDAPP/RETRY] landed on retry ${k + 1}');
+                print('  [HARDAPP/RETRY] landed on retry $k (nc)');
               }
               break;
             }
           }
         }
+
+        // ✅ Count ONCE per cohort using aggregate success
+        _maybeAdaptDifficulty(landed: landedAny);
       }
+
       if (gateVerbose && ((it + 1) % verboseEvery == 0)) {
         print('[CUR/hardapp] iter=${it + 1}/$iters '
             'nearFrac=${_curNearFrac.toStringAsFixed(3)}');
