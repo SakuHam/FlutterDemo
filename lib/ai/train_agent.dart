@@ -545,13 +545,13 @@ void main(List<String> argv) async {
   final env = eng.GameEngine(cfg);
 
   // Rays active (forward-aligned)
-  env.rayCfg = const RayConfig(rayCount: 180, includeFloor: false, forwardAligned: false);
+  env.rayCfg = const RayConfig(rayCount: 180, includeFloor: false, forwardAligned: true);
 
   // FE probe
   final fe = FeatureExtractorRays(rayCount: env.rayCfg.rayCount);
   env.reset(seed: seed ^ 0xC0FFEE);
   env.step(1 / 60.0, const et.ControlInput(thrust: false, left: false, right: false));
-  final inDim = fe.extract(env).length;
+  final inDim = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays).length;
   final kindsOneHot = (inDim == 6 + env.rayCfg.rayCount * 4);
 
   // ----- Policy -----

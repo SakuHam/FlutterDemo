@@ -205,32 +205,112 @@ class FeatureExtractorRays {
 
   int get inputSize => 6 + rayCount * (kindsOneHot ? 4 : 1);
 
-  List<double> extract(eng.GameEngine env) {
-    final L = env.lander;
-    final W = env.cfg.worldW.toDouble();
-    final H = env.cfg.worldH.toDouble();
+// In runtime_policy.dart, inside _RuntimeFE_Rays.extract(...)
 
-    final px = (L.pos.x.toDouble() / W);
-    final py = (L.pos.y.toDouble() / H);
-    final vx = (L.vel.x.toDouble() / 200.0).clamp(-3.0, 3.0);
-    final vy = (L.vel.y.toDouble() / 200.0).clamp(-3.0, 3.0);
-    final ang = (L.angle.toDouble() / math.pi).clamp(-2.0, 2.0);
-    final fuel = (L.fuel / (env.cfg.t.maxFuel > 0 ? env.cfg.t.maxFuel : 1.0)).clamp(0.0, 1.0);
+  @override
+  List<double> extract({
+    required et.LanderState lander,
+    required et.Terrain terrain,
+    required double worldW,
+    required double worldH,
+    required List<RayHit>? rays,
+    double uiMaxFuel = 100.0,
+  }) {
+    if (rays == null) {
+      throw StateError('Runtime FE (rays) requires a rays list. Pass engine.rays.');
+    }
 
-    final out = <double>[px, py, vx, vy, ang, fuel];
-    final maxD = math.sqrt(W * W + H * H);
-    final rays = env.rays;
+    // --- Position / angle / fuel (same as before) ---
+    final px = (lander.pos.x / worldW);
+    final py = (lander.pos.y / worldH);
+    final ang = (lander.angle / math.pi).clamp(-2.0, 2.0);
+    final fuel = (lander.fuel / (uiMaxFuel > 0 ? uiMaxFuel : 1.0)).clamp(0.0, 1.0);
 
-    for (int i = 0; i < rayCount; i++) {
+    // --- height-normalized vertical speed ---
+    final gy = terrain.heightAt(lander.pos.x);
+    final h  = (gy - lander.pos.y).toDouble().clamp(0.0, 1e9);
+    // smooth cap that grows with height (same family used in controllers)
+    double vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);         // px/s
+    final hnVy  = (lander.vel.y.toDouble() / (vCap > 1e-6 ? vCap : 1.0)).clamp(-3.0, 3.0);
+
+    // --- Polar velocity representation ---
+    final vx = lander.vel.x.toDouble();
+    final vy = lander.vel.y.toDouble();
+    double speed = math.sqrt(vx * vx + vy * vy);
+    // soft clip speed and normalize to ~[0,1]
+    final sClip = 140.0;
+    speed = (speed / sClip).clamp(0.0, 1.5);
+
+    final heading = math.atan2(vy, vx); // [-pi, pi]
+    final sinH = math.sin(heading);
+    final cosH = math.cos(heading);
+
+    // --- Pad vector + alignment (robust to visibility) ---
+    final padCx = (terrain.padX1 + terrain.padX2) * 0.5;
+    final padCy = terrain.heightAt(padCx);
+    double pxToPad = padCx - lander.pos.x;
+    double pyToPad = padCy - lander.pos.y;
+
+    // Try rays-averaged pad vector if available (weighted by 1/d)
+    double sx = 0.0, sy = 0.0, wsum = 0.0;
+    for (final r in rays) {
+      if (r.kind != RayHitKind.pad) continue;
+      final dx = r.p.x - lander.pos.x;
+      final dy = r.p.y - lander.pos.y;
+      final d2 = dx*dx + dy*dy;
+      if (d2 <= 1e-9) continue;
+      final w = 1.0 / math.sqrt(d2 + 1e-6);
+      sx += w * dx; sy += w * dy; wsum += w;
+    }
+    bool padVecValid = false;
+    if (wsum > 0) {
+      final inv = 1.0 / wsum;
+      pxToPad = sx * inv; pyToPad = sy * inv;
+      padVecValid = true;
+    }
+
+    // normalize pad dir
+    double padLen = math.sqrt(pxToPad*pxToPad + pyToPad*pyToPad);
+    double pnx = 0.0, pny = 0.0;
+    if (padLen > 1e-6) { pnx = pxToPad / padLen; pny = pyToPad / padLen; }
+
+    // velocity dir (if speed very small, keep 0 to avoid NaNs)
+    double vnx = (speed > 1e-6) ? cosH : 0.0;
+    double vny = (speed > 1e-6) ? sinH : 0.0;
+
+    // alignment features
+    final cosDelta = vnx * pnx + vny * pny;            // ∈ [-1,1]
+    final sinDelta = vnx * pny - vny * pnx;            // >0: pad is to the left of v̂
+    final padVis = padVecValid ? 1.0 : 0.0;            // visibility flag
+
+    // --- Assemble base features (6 → now 7) ---
+    final out = <double>[
+//      px,                      // 0..1
+//      py,                      // 0..1
+      speed,                   // ~0..1.5 clipped
+      hnVy,
+//      sinH,                    // -1..1
+//      cosH,                    // -1..1
+      ang,                     // -2..2
+//      fuel,                    // 0..1
+      // alignment block:
+      cosDelta,                // -1..1
+      sinDelta,                // -1..1
+      padVis,                  // 0/1
+    ];
+
+    // --- Rays channels, same as before ---
+    final maxD = math.sqrt(worldW * worldW + worldH * worldH);
+    final int n = rayCount;
+    for (int i = 0; i < n; i++) {
       RayHit? rh = (i < rays.length) ? rays[i] : null;
-
       double d;
       if (rh == null) {
         d = maxD;
       } else {
-        final dx = rh.p.x - L.pos.x;
-        final dy = rh.p.y - L.pos.y;
-        d = math.sqrt(dx * dx + dy * dy).toDouble();
+        final dx = rh.p.x - lander.pos.x;
+        final dy = rh.p.y - lander.pos.y;
+        d = math.sqrt(dx * dx + dy * dy);
       }
       final dN = (d / maxD).clamp(0.0, 1.0);
 
@@ -1300,7 +1380,7 @@ class Trainer {
 
     while (true) {
       if (framesLeft <= 0) {
-        var x = fe.extract(env);
+        var x = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
         int yTeacher = predictiveIntentLabelAdaptive(
           env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35,
         );
@@ -1398,7 +1478,7 @@ class Trainer {
       final intent = indexToIntent(currentIntentIdx);
       final uTeacher = controllerForIntent(intent, env);
 
-      var xAct = fe.extract(env);
+      var xAct = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
       xAct = norm?.normalize(xAct, update: false) ?? xAct;
 
       // Hebbian-aware forward (for activations)

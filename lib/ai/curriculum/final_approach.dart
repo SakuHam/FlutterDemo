@@ -252,7 +252,7 @@ class FinalApproach extends Curriculum {
 
     while (true) {
       if (framesLeft <= 0) {
-        var x = fe.extract(env);
+        var x = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
         final yTeacher = predictiveIntentLabelAdaptive(env);
         if (norm != null) {
           norm.observe(x);
@@ -300,7 +300,7 @@ class FinalApproach extends Curriculum {
       totalCost += info.costDelta;
 
       // Action supervision
-      var xAct = fe.extract(env);
+      var xAct = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
       if (norm != null) xAct = norm.normalize(xAct, update: false);
       final (_, __, ___, ____, cAct) = policy.actGreedy(xAct);
       actionCaches.add(cAct);

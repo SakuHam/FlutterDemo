@@ -83,7 +83,7 @@ class SpeedMinCurriculum extends Curriculum {
         // minimal teacher: choose descendSlow or brakeUp depending on vcap
         for (int it = 0; it < iters; it++) {
           // intent step every planHold frames
-          final xVec = (norm != null) ? norm.normalize(fe.extract(env), update: true) : fe.extract(env);
+          final xVec = (norm != null) ? norm.normalize(fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays), update: true) : fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
           final (idxGreedy, p, cacheIntent) = policy.actIntentGreedy(xVec);
 
           final intent = indexToIntent(idxGreedy);
@@ -93,7 +93,7 @@ class SpeedMinCurriculum extends Curriculum {
           totalReward += _speedPenalty(env);
 
           // supervise action head weakly (optional)
-          final xAct = (norm != null) ? norm.normalize(fe.extract(env), update: false) : fe.extract(env);
+          final xAct = (norm != null) ? norm.normalize(fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays), update: false) : fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
           final (_, __, ___, ____ , cacheAct) = policy.actGreedy(xAct);
           policy.updateFromEpisode(
             decisionCaches: [cacheIntent],

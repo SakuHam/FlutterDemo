@@ -149,12 +149,13 @@ class _RuntimeFE_Legacy implements _RuntimeFE {
   }
 }
 
-/// -------- Ray-based (lander stats + ray channels) --------
+/// -------- Ray-based FE (MATCHES training FeatureExtractorRays) --------
 class _RuntimeFE_Rays implements _RuntimeFE {
   final int rayCount;
   final bool kindsOneHot;
   const _RuntimeFE_Rays({required this.rayCount, required this.kindsOneHot});
 
+  // 6 base scalars + ray channels
   @override
   int get inputSize => 6 + rayCount * (kindsOneHot ? 4 : 1);
 
@@ -165,33 +166,83 @@ class _RuntimeFE_Rays implements _RuntimeFE {
     required double worldW,
     required double worldH,
     List<RayHit>? rays,
-    double uiMaxFuel = 100.0,
+    double uiMaxFuel = 100.0, // unused here, kept for iface parity
   }) {
     if (rays == null) {
-      throw StateError(
-          'Runtime FE (rays) requires a rays list. Pass engine.rays into actWithIntent(..., rays: engine.rays).');
+      throw StateError('Runtime FE (rays) requires rays; pass engine.rays.');
     }
 
-    // Base 6
-    final px = (lander.pos.x / worldW);
-    final py = (lander.pos.y / worldH);
-    final vx = (lander.vel.x / 200.0).clamp(-3.0, 3.0);
-    final vy = (lander.vel.y / 200.0).clamp(-3.0, 3.0);
+    // --- angle ([-pi,pi] → [-2,2] approx like training) ---
     final ang = (lander.angle / math.pi).clamp(-2.0, 2.0);
-    final fuel = (lander.fuel / (uiMaxFuel > 0 ? uiMaxFuel : 1.0)).clamp(0.0, 1.0);
 
-    final out = <double>[px, py, vx, vy, ang, fuel];
+    // --- height-normalized vertical speed (hnVy) ---
+    final gy = terrain.heightAt(lander.pos.x);
+    final h  = (gy - lander.pos.y).toDouble().clamp(0.0, 1e9);
+    double vCap = (0.10 * h + 8.0).clamp(8.0, 26.0); // same as training
+    final hnVy  = (lander.vel.y.toDouble() / (vCap > 1e-6 ? vCap : 1.0)).clamp(-3.0, 3.0);
 
-    // distance normalized by world diagonal
+    // --- polar velocity: speed clip + heading dir ---
+    final vx = lander.vel.x.toDouble();
+    final vy = lander.vel.y.toDouble();
+    double speed = math.sqrt(vx * vx + vy * vy);
+    const sClip = 140.0;                  // must match training
+    speed = (speed / sClip).clamp(0.0, 1.5);
+    final heading = math.atan2(vy, vx);   // [-pi, pi]
+    final sinH = math.sin(heading);
+    final cosH = math.cos(heading);
+
+    // --- pad vector (avg from rays if visible; else geometric center) ---
+    final padCx = (terrain.padX1 + terrain.padX2) * 0.5;
+    final padCy = terrain.heightAt(padCx);
+    double pxToPad = padCx - lander.pos.x;
+    double pyToPad = padCy - lander.pos.y;
+
+    double sx = 0.0, sy = 0.0, wsum = 0.0;
+    for (final r in rays) {
+      if (r.kind != RayHitKind.pad) continue;
+      final dx = r.p.x - lander.pos.x;
+      final dy = r.p.y - lander.pos.y;
+      final d2 = dx*dx + dy*dy;
+      if (d2 <= 1e-9) continue;
+      final w = 1.0 / math.sqrt(d2 + 1e-6);
+      sx += w * dx; sy += w * dy; wsum += w;
+    }
+    bool padVecValid = false;
+    if (wsum > 0) {
+      final inv = 1.0 / wsum;
+      pxToPad = sx * inv; pyToPad = sy * inv;
+      padVecValid = true;
+    }
+
+    // normalize pad dir
+    final padLen = math.sqrt(pxToPad*pxToPad + pyToPad*pyToPad);
+    double pnx = 0.0, pny = 0.0;
+    if (padLen > 1e-6) { pnx = pxToPad / padLen; pny = pyToPad / padLen; }
+
+    // velocity unit (if nearly zero, use 0s)
+    final hasV = speed > 1e-6;
+    final vnx = hasV ? cosH : 0.0;
+    final vny = hasV ? sinH : 0.0;
+
+    // alignment features (exactly as training)
+    final cosDelta = vnx * pnx + vny * pny;          // [-1,1]
+    final sinDelta = vnx * pny - vny * pnx;          // [-1,1] (pad left/right of v̂)
+    final padVis   = padVecValid ? 1.0 : 0.0;        // 0/1 (float)
+
+    // --- Assemble base features in THIS ORDER (must match training) ---
+    final out = <double>[
+      speed,      // ~0..1.5 clipped
+      hnVy,       // ~[-3,3]
+      ang,        // ~[-2,2]
+      cosDelta,   // [-1,1]
+      sinDelta,   // [-1,1]
+      padVis,     // 0/1
+    ];
+
+    // --- Ray channels (distance + one-hot kind if enabled) ---
     final maxD = math.sqrt(worldW * worldW + worldH * worldH);
-
-    // deterministic size
-    final int n = rayCount;
-    for (int i = 0; i < n; i++) {
-      RayHit? rh;
-      if (i < rays.length) {
-        rh = rays[i];
-      }
+    for (int i = 0; i < rayCount; i++) {
+      RayHit? rh = (i < rays.length) ? rays[i] : null;
       double d;
       if (rh == null) {
         d = maxD;
@@ -208,15 +259,9 @@ class _RuntimeFE_Rays implements _RuntimeFE {
         double tTerr = 0, tPad = 0, tWall = 0;
         if (rh != null) {
           switch (rh.kind) {
-            case RayHitKind.terrain:
-              tTerr = 1;
-              break;
-            case RayHitKind.pad:
-              tPad = 1;
-              break;
-            case RayHitKind.wall:
-              tWall = 1;
-              break;
+            case RayHitKind.terrain: tTerr = 1; break;
+            case RayHitKind.pad:     tPad  = 1; break;
+            case RayHitKind.wall:    tWall = 1; break;
           }
         }
         out.addAll([dN, tTerr, tPad, tWall]);
