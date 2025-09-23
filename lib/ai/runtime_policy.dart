@@ -10,6 +10,9 @@ import '../engine/raycast.dart' show RayHit, RayHitKind; // for ray-based FE
 
 // Intent bus (runtime)
 import 'intent_bus.dart';
+// Plan bus (runtime overlay)
+import 'plan_bus.dart';
+import 'potential_field.dart' as pf;
 
 /* =============================================================================
    Physics bundle loaded from policy JSON (used by runtime controls)
@@ -602,6 +605,13 @@ class RuntimeTwoStagePolicy {
   // Loaded physics (NEW)
   final RuntimePhysics physics;
 
+  pf.PotentialField? _pf; // ← current PF (optional)
+
+  // Call this from GamePage whenever you (re)build the PF
+  void setPotentialField(pf.PotentialField? field) {
+    _pf = field;
+  }
+
   // Planner state
   int _framesLeft = 0;
   int _currentIntentIdx = -1;
@@ -922,6 +932,53 @@ class RuntimeTwoStagePolicy {
         }
       }
 
+      // === NEW: publish a plan preview for the overlay ===
+      final intentForPreview = Intent.values[_currentIntentIdx];
+
+      // Use extended controller to include side/down thrusters according to physics
+      final uExt = _controllerForIntentExt(
+        intentForPreview,
+        lander: lander,
+        terrain: terrain,
+        worldW: worldW,
+        worldH: worldH,
+        phys: physics,
+      );
+
+      final intentNow = Intent.values[_currentIntentIdx];
+      // --- Publish a PF-guided plan if we have a field; fallback to old plan otherwise.
+      try {
+        final field = _pf;
+        if (field != null) {
+          final planPts = _buildPFPlanPolyline(
+            lander: lander,
+            terrain: terrain,
+            worldW: worldW,
+            worldH: worldH,
+            field: field,
+            g: physics.gravity,
+          );
+          PlanBus.instance.push(planPts);
+        }
+        /*
+        else {
+          // keep your previous curved (non-PF) plan as a fallback:
+          final planPts = _buildCurvedPlanPolyline(
+            lander: lander,
+            terrain: terrain,
+            worldW: worldW,
+            worldH: worldH,
+            rays: rays,
+            intent: intent,
+          );
+          PlanBus.instance.push(points: planPts, source: 'fallback');
+        }
+
+         */
+      } catch (_) {
+        // ignore planning errors (don’t crash gameplay)
+      }
+
       IntentBus.instance.publishIntent(
         IntentEvent(
           intent: kIntentNames[_currentIntentIdx],
@@ -1037,5 +1094,144 @@ class RuntimeTwoStagePolicy {
     idxNow,
     legacy.$5
     );
+  }
+
+// Acceleration-limited plan that follows the PF vector field toward the pad.
+  List<Offset> _buildPFPlanPolyline({
+    required LanderState lander,
+    required Terrain terrain,
+    required double worldW,
+    required double worldH,
+    required pf.PotentialField field,
+    required double g, // gravity (downward +)
+  }) {
+    double x  = lander.pos.x.toDouble();
+    double y  = lander.pos.y.toDouble();
+    double vx = lander.vel.x.toDouble();
+    double vy = lander.vel.y.toDouble();
+
+    final padCx = (terrain.padX1 + terrain.padX2) * 0.5;
+    final padCy = terrain.heightAt(padCx);
+
+    // rollout params
+    const int    maxSteps = 220;  // long enough to reach the pad
+    const double dt       = 0.035;
+    const double aMax     = 120.0;   // px/s^2 accel budget
+    const double vMinTD   =  2.0;    // min near touchdown
+    const double vMaxPF   = 95.0;    // global cap
+    const double wallK    = 0.16;    // side-wall inward bias
+    const double wallFrac = 0.12;    // wall margin (fraction of world width)
+
+    // flare shaping (prefer gentler vertical as we get close)
+    double _flare(double dxAbs, double h) {
+      final W = worldW.toDouble();
+      final tightX = 0.10 * W;
+      final px = math.exp(- (dxAbs*dxAbs) / (tightX*tightX + 1e-6));
+      final ph = math.exp(- (h*h) / (140.0*140.0 + 1e-6));
+      final prox = (px * ph).clamp(0.0, 1.0);
+      return (1.0 - 0.80 * prox); // 1 far → 0.2 near
+    }
+
+    double _inwardVX(double xx) {
+      final W = worldW.toDouble();
+      final margin = wallFrac * W;
+      final distL = xx.clamp(0.0, margin);
+      final distR = (W - xx).clamp(0.0, margin);
+      final nearL = 1.0 - (distL / margin);
+      final nearR = 1.0 - (distR / margin);
+      double inward = 0.0;
+      if (nearL > 0.0 && nearL >= nearR) inward =  1.0;
+      if (nearR > 0.0 && nearR >  nearL) inward = -1.0;
+      return inward * 35.0 * math.max(nearL, nearR);
+    }
+
+    void _steerToward(double tvx, double tvy) {
+      final dvx = tvx - vx, dvy = tvy - vy;
+      final dv = math.sqrt(dvx*dvx + dvy*dvy);
+      final dvCap = aMax * dt;
+      if (dv > dvCap && dv > 1e-9) {
+        final s = dvCap / dv;
+        vx += dvx * s; vy += dvy * s;
+      } else {
+        vx = tvx; vy = tvy;
+      }
+    }
+
+    final pts = <Offset>[Offset(x, y)];
+
+    for (int i = 0; i < maxSteps; i++) {
+      // ground/height
+      final gY = terrain.heightAt(x);
+      final h  = (gY - y).clamp(0.0, 1e9);
+      final dxAbs = (x - padCx).abs();
+
+      // 1) PF flow (direction + magnitude proxy)
+      // Prefer sampleFlow; if unavailable, fall back to suggestVelocity
+      double fx = 0.0, fy = 0.0, fmag = 0.0;
+      try {
+        final f = field.sampleFlow(x, y);  // has nx, ny, mag
+        fx = f.nx; fy = f.ny; fmag = f.mag;
+      } catch (_) {
+        final s = field.suggestVelocity(
+          x, y,
+          vMinClose: 8.0,
+          vMaxFar: vMaxPF,
+          alpha: 1.2,
+          clampSpeed: 9999.0,
+        );
+        final n = math.sqrt(s.vx*s.vx + s.vy*s.vy);
+        if (n > 1e-6) { fx = s.vx / n; fy = s.vy / n; fmag = n; }
+      }
+      if (fmag < 1e-9) { fx = 0.0; fy = -1.0; }
+
+      // 2) PF-ish speed schedule + flare
+      final vFar = 10.0 + 85.0 * (1.0 - math.exp(-h / 240.0));
+      final flare = _flare(dxAbs, h);
+      final sv = (vFar * flare).clamp(vMinTD, vMaxPF);
+
+      // desired velocity along PF
+      double tvx = fx * sv;
+      double tvy = fy * sv;
+
+      // 3) wall nudge
+      tvx = (1.0 - wallK) * tvx + wallK * _inwardVX(x);
+
+      // 4) mild gravity compensation to keep graceful arcs
+      final vyLook = vy + g * dt;
+      tvy = (tvy - 0.35 * vyLook);
+
+      // 5) steer with accel limit
+      _steerToward(tvx, tvy);
+
+      // physics preview with gravity
+      vy += g * dt;
+      x  += vx * dt;
+      y  += vy * dt;
+
+      // keep inside horizontal bounds
+      x = x.clamp(0.0, worldW.toDouble());
+
+      // skim above ground for visibility
+      final gNow = terrain.heightAt(x);
+      if (y >= gNow) {
+        y = gNow - 0.001;
+        if (vy > 0) vy = 0; // kill downward overshoot visually
+      }
+
+      pts.add(Offset(x, y));
+
+      // stop condition: we’ve essentially reached the pad & slowed
+      final nearX = (x - padCx).abs() <= 6.0;
+      final nearY = (y - padCy).abs() <= 6.0;
+      final slow  = math.sqrt(vx*vx + vy*vy) <= 6.0;
+      if (nearX && nearY && slow) break;
+    }
+
+    // ensure a little length
+    if (pts.length < 8) {
+      final last = pts.last;
+      while (pts.length < 8) pts.add(last);
+    }
+    return pts;
   }
 }

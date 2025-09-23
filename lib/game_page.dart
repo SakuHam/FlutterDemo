@@ -2,6 +2,7 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
+import 'dart:async';
 
 // Engine
 import 'engine/types.dart' as et;
@@ -15,6 +16,9 @@ import 'ai/runtime_policy.dart';
 
 // Potential field
 import 'ai/potential_field.dart';
+
+// NEW: Plan bus (planner → UI)
+import 'ai/plan_bus.dart';
 
 /// Simple UI particle for exhaust/smoke
 class Particle {
@@ -79,11 +83,26 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   // ===== NEW: ray alignment toggle (FWD vs WORLD) =====
   bool _forwardAligned = true;
 
+  // ===== NEW: Plan overlay state (from PlanBus) =====
+  List<Offset> _planPts = const [];
+  int _planVersion = 0;
+  bool _showPlan = true;
+  StreamSubscription<PlanEvent>? _planSub;
+
   @override
   void initState() {
     super.initState();
     _ticker = createTicker(_onTick)..start();
     _loadPolicy(); // fire-and-forget asset load
+
+    // Listen to planner path updates
+    _planSub = PlanBus.instance.stream.listen((e) {
+      if (!_showPlan) return; // avoid churn when hidden
+      setState(() {
+        _planPts = e.points;
+        _planVersion = e.version;
+      });
+    });
   }
 
   Future<void> _loadPolicy() async {
@@ -136,6 +155,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
   @override
   void dispose() {
+    _planSub?.cancel();
     _ticker.dispose();
     super.dispose();
   }
@@ -163,6 +183,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       if (p != null) _applyPolicyPhysicsToEngine(p);
 
       _rebuildPF(); // build once on init/resize
+      _policy?.setPotentialField(_pf);
       setState(() {});
     }
   }
@@ -195,7 +216,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     _lastIntentIdx = null;
     _lastIntentProbs = const [];
     _vecPF = _vecPolicy = null;
+    _planPts = const [];
+    _planVersion = 0;
     _rebuildPF();
+    _policy?.setPotentialField(_pf);
     setState(() {});
   }
 
@@ -213,6 +237,14 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       }
     });
     _toast(_aiPlay ? 'AI: ON' : 'AI: OFF');
+  }
+
+  void _togglePlan() {
+    setState(() => _showPlan = !_showPlan);
+    if (!_showPlan) {
+      setState(() { _planPts = const []; });
+    }
+    _toast(_showPlan ? 'Plan: ON' : 'Plan: OFF');
   }
 
   void _cycleVis() {
@@ -536,15 +568,15 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                   behavior: HitTestBehavior.opaque,
                   onTapDown: (d) => _carveAt(d.localPosition),
                   onTapUp: (_) {
-                    if (_terrainDirty) { _rebuildPF(); _terrainDirty = false; }
+                    if (_terrainDirty) { _rebuildPF(); _policy?.setPotentialField(_pf); _terrainDirty = false; }
                   },
                   onPanStart: (d) => _carveAt(d.localPosition),
                   onPanUpdate: (d) => _carveAt(d.localPosition),
                   onPanEnd: (_) {
-                    if (_terrainDirty) { _rebuildPF(); _terrainDirty = false; }
+                    if (_terrainDirty) { _rebuildPF(); _policy?.setPotentialField(_pf); _terrainDirty = false; }
                   },
                   onPanCancel: () {
-                    if (_terrainDirty) { _rebuildPF(); _terrainDirty = false; }
+                    if (_terrainDirty) { _rebuildPF(); _policy?.setPotentialField(_pf); _terrainDirty = false; }
                   },
                   child: CustomPaint(
                     painter: GamePainter(
@@ -561,6 +593,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       // NEW: pass vectors to draw
                       vecPF: _vecPF,
                       vecPolicy: _vecPolicy,
+                      // NEW: plan path to draw
+                      planPoints: _showPlan ? _planPts : const [],
+                      planVersion: _planVersion,
                       // NEW: pass a hint for painter (to draw forward axis only when useful)
                       showForwardAxis: _visMode == DebugVisMode.rays,
                     ),
@@ -593,6 +628,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                           const SizedBox(width: 8),
                           _aiToggleIcon(),
                           const SizedBox(width: 8),
+                          _planToggleIcon(), // NEW: plan overlay toggle
+                          const SizedBox(width: 8),
 
                           Tooltip(
                             message: 'Tap to cycle view • Long-press to rebuild field',
@@ -604,8 +641,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                           ),
                           const SizedBox(width: 8),
 
-                          // NEW: forward/world ray alignment toggle
                           /*
+                          // Optional: forward/world ray alignment toggle
                           Tooltip(
                             message: 'Ray alignment: ${_forwardAligned ? "Forward (ship frame)" : "World"}',
                             child: FilterChip(
@@ -620,8 +657,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             ),
                           ),
                           const SizedBox(width: 8),
-
-                           */
+                          */
 
                           ElevatedButton.icon(
                             onPressed: _reset,
@@ -745,6 +781,30 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     );
   }
 
+  Widget _planToggleIcon() {
+    final active = _showPlan;
+    return Tooltip(
+      message: active ? 'Flight plan: ON' : 'Flight plan: OFF',
+      child: InkResponse(
+        onTap: _togglePlan,
+        radius: 24,
+        child: Container(
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            color: active ? Colors.cyanAccent.withOpacity(0.18) : Colors.white10,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: active ? Colors.cyanAccent : Colors.white30),
+          ),
+          child: Icon(
+            active ? Icons.timeline : Icons.timeline_outlined,
+            color: active ? Colors.cyanAccent : Colors.white70,
+            size: 22,
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildControls() {
     final disabled = _engine?.status != GameStatus.playing || _aiPlay;
     return IgnorePointer(
@@ -814,7 +874,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 }
 
 /// Painter that draws polygon terrain (light gray), pad-highlighted edges,
-/// rays/potential/velocity overlays, particles, and the lander triangle.
+/// rays/potential/velocity overlays, particles, the lander triangle, and the planned path.
 class GamePainter extends CustomPainter {
   final et.LanderState lander;
   final et.Terrain terrain;
@@ -831,6 +891,10 @@ class GamePainter extends CustomPainter {
   final Offset? vecPF;
   final Offset? vecPolicy;
 
+  // NEW: planned path (world-space) and version
+  final List<Offset> planPoints;
+  final int planVersion;
+
   // NEW: painter hint to draw forward axis when looking at rays
   final bool showForwardAxis;
 
@@ -845,6 +909,8 @@ class GamePainter extends CustomPainter {
     required this.visMode,
     required this.vecPF,
     required this.vecPolicy,
+    required this.planPoints,
+    required this.planVersion,
     required this.showForwardAxis,
   });
 
@@ -861,6 +927,11 @@ class GamePainter extends CustomPainter {
       _paintPotentialVectors(canvas, pf!, stride: 8);
     } else if (visMode == DebugVisMode.rays) {
       _paintRays(canvas);
+    }
+
+    // Planned path (always on when toggled)
+    if (planPoints.length >= 2) {
+      _paintPlanPath(canvas, planPoints);
     }
 
     _paintParticles(canvas);
@@ -971,6 +1042,59 @@ class GamePainter extends CustomPainter {
             : (h.kind == RayHitKind.wall ? Colors.blueAccent : Colors.red);
       canvas.drawCircle(end, 1.7, dotPaint);
     }
+  }
+
+  void _paintPlanPath(Canvas canvas, List<Offset> pts) {
+    // Chaikin smoothing (2 iterations) for a clean curve
+    List<Offset> smooth = _chaikin(pts, 2);
+    if (smooth.length < 2) return;
+
+    final path = Path()..moveTo(smooth.first.dx, smooth.first.dy);
+    for (int i = 1; i < smooth.length; i++) {
+      path.lineTo(smooth[i].dx, smooth[i].dy);
+    }
+
+    final glow = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 6.0
+      ..color = const Color(0xFF6BE7FF).withOpacity(0.18)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
+    final stroke = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.0
+      ..color = const Color(0xFF6BE7FF).withOpacity(0.85)
+      ..strokeJoin = StrokeJoin.round
+      ..strokeCap = StrokeCap.round
+      ..isAntiAlias = true;
+
+    canvas.drawPath(path, glow);
+    canvas.drawPath(path, stroke);
+
+    // dotted cadence markers (every ~0.2 s if ~60 points over 2 s)
+    final dot = Paint()..style = PaintingStyle.fill..color = const Color(0xFF6BE7FF).withOpacity(0.7);
+    for (int i = 0; i < smooth.length; i += 6) {
+      canvas.drawCircle(smooth[i], 1.7, dot);
+    }
+  }
+
+  List<Offset> _chaikin(List<Offset> pts, int iters) {
+    if (pts.length < 3 || iters <= 0) return pts;
+    var out = pts;
+    for (int k = 0; k < iters; k++) {
+      if (out.length < 3) break;
+      final next = <Offset>[];
+      next.add(out.first);
+      for (int i = 0; i < out.length - 1; i++) {
+        final p = out[i];
+        final q = out[i + 1];
+        final a = Offset(0.75 * p.dx + 0.25 * q.dx, 0.75 * p.dy + 0.25 * q.dy);
+        final b = Offset(0.25 * p.dx + 0.75 * q.dx, 0.25 * p.dy + 0.75 * q.dy);
+        next..add(a)..add(b);
+      }
+      next.add(out.last);
+      out = next;
+    }
+    return out;
   }
 
   void _paintPotentialHeat(Canvas canvas, PotentialField pf, {int heatDownsample = 3, int alpha = 160}) {
@@ -1231,6 +1355,8 @@ class GamePainter extends CustomPainter {
         old.visMode != visMode ||
         old.vecPF != vecPF ||
         old.vecPolicy != vecPolicy ||
+        old.planVersion != planVersion ||
+        old.planPoints != planPoints ||
         old.showForwardAxis != showForwardAxis;
   }
 }
