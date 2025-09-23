@@ -278,10 +278,23 @@ class FeatureExtractorRays {
     double vnx = (speed > 1e-6) ? cosH : 0.0;
     double vny = (speed > 1e-6) ? sinH : 0.0;
 
+    double _angWrap(double a) {
+      // wrap to [-pi, pi]
+      const twoPi = math.pi * 2.0;
+      a = a % twoPi;
+      if (a > math.pi) a -= twoPi;
+      if (a < -math.pi) a += twoPi;
+      return a;
+    }
+
     // alignment features
     final cosDelta = vnx * pnx + vny * pny;            // ∈ [-1,1]
     final sinDelta = vnx * pny - vny * pnx;            // >0: pad is to the left of v̂
+    final angDelta = _angWrap(math.atan2(pny, pnx) - math.atan2(vny, vnx)); // [-pi, pi]
+    final angDeltaPi = (angDelta / math.pi).clamp(-1.0, 1.0);
     final padVis = padVecValid ? 1.0 : 0.0;            // visibility flag
+
+    // --- Assemble base features (6 → now 7) ---
 
     // --- Assemble base features (6 → now 7) ---
     final out = <double>[
@@ -294,8 +307,9 @@ class FeatureExtractorRays {
       ang,                     // -2..2
 //      fuel,                    // 0..1
       // alignment block:
-      cosDelta,                // -1..1
-      sinDelta,                // -1..1
+      angDeltaPi,
+//      cosDelta,                // -1..1
+//      sinDelta,                // -1..1
       padVis,                  // 0/1
     ];
 
