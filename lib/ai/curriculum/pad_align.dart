@@ -1,43 +1,53 @@
 // lib/ai/curriculum/pad_align.dart
 //
-// Micro-stage: “pad-align”
-// - Very short episodes (few steps), random spawn near pad center
-// - Teacher FORCES lateral intent (goLeft/goRight) based on pad side
-// - NN is trained with supervised intent alignment (no PG needed here)
-// - We still log what the *policy would have picked* to compute fitness
-// - Prints fitness summary with a rolling sparkline and |dx| trend
+// Micro-stage: “pad-align (balanced)”
+// Goal: learn to choose goLeft/goRight intents with very high accuracy.
+// Key tactics:
+//  - Perfectly BALANCED spawns left/right of pad (no class bias).
+//  - Enforce MIN offset from pad center (no ambiguous/hover states).
+//  - Supervise ONLY on L/R frames (dense, clean signal).
+//  - Many tiny episodes per iteration.
+//  - Fitness print shows overall & per-class accuracy + bias + Δ|dx|/step.
+//
+// CLI knobs (examples):
+//   --curricula=padalign
+//   --padalign_batch=8 --padalign_steps_min=6 --padalign_steps_max=12
+//   --padalign_band_frac=0.15 --padalign_min_offset_px=20
+//   --padalign_print_every=25
+//
+// This curriculum updates ONLY the intent head (intentMode=true).
 
 import 'dart:math' as math;
 
 import '../../engine/types.dart' as et;
 import '../../engine/game_engine.dart' as eng;
 import '../agent.dart';
-import 'core.dart'; // Curriculum, CliView
+import 'core.dart';
 
 class PadAlignCfg {
-  final int batch;            // episodes per iteration
-  final int stepsMin;         // min episode steps (tiny)
-  final int stepsMax;         // max episode steps
-  final double bandFrac;      // horizontal spawn band around pad center (fraction of world width)
-  final double tempIntent;    // temperature for policy *evaluation* (fitness probe)
+  final int batch;            // episodes per iteration (↑ for more labels)
+  final int stepsMin;         // min steps per episode
+  final int stepsMax;         // max steps per episode
+  final double bandFrac;      // horizontal band as fraction of world width
+  final double minOffsetPx;   // enforce >= this |dx| at spawn (no-center)
+  final bool balancedSides;   // alternate L/R spawns exactly
+  final bool randomVY;        // add small downward vy
+  final double vyMin, vyMax;  // vy range if randomVY
+  final int printEvery;       // fitness print cadence
   final bool verbose;
-  final int printEvery;       // print fitness every N iters
-  final bool randomVY;        // small downward vy to make it non-trivial
-  final double vyMin, vyMax;  // start vy range if randomVY
-  final bool allowHoverWhenCentered; // treat near-zero dx as hover (else ignore)
 
   const PadAlignCfg({
-    this.batch = 1,
-    this.stepsMin = 8,
-    this.stepsMax = 24,
-    this.bandFrac = 0.18,
-    this.tempIntent = 1.0,
-    this.verbose = true,
-    this.printEvery = 25,
+    this.batch = 8,
+    this.stepsMin = 6,
+    this.stepsMax = 12,
+    this.bandFrac = 0.15,
+    this.minOffsetPx = 20.0,
+    this.balancedSides = true,
     this.randomVY = true,
     this.vyMin = 8.0,
     this.vyMax = 18.0,
-    this.allowHoverWhenCentered = true,
+    this.printEvery = 25,
+    this.verbose = true,
   });
 
   PadAlignCfg copyWith({
@@ -45,26 +55,26 @@ class PadAlignCfg {
     int? stepsMin,
     int? stepsMax,
     double? bandFrac,
-    double? tempIntent,
-    bool? verbose,
-    int? printEvery,
+    double? minOffsetPx,
+    bool? balancedSides,
     bool? randomVY,
     double? vyMin,
     double? vyMax,
-    bool? allowHoverWhenCentered,
+    int? printEvery,
+    bool? verbose,
   }) {
     return PadAlignCfg(
       batch: batch ?? this.batch,
       stepsMin: stepsMin ?? this.stepsMin,
       stepsMax: stepsMax ?? this.stepsMax,
       bandFrac: bandFrac ?? this.bandFrac,
-      tempIntent: tempIntent ?? this.tempIntent,
-      verbose: verbose ?? this.verbose,
-      printEvery: printEvery ?? this.printEvery,
+      minOffsetPx: minOffsetPx ?? this.minOffsetPx,
+      balancedSides: balancedSides ?? this.balancedSides,
       randomVY: randomVY ?? this.randomVY,
       vyMin: vyMin ?? this.vyMin,
       vyMax: vyMax ?? this.vyMax,
-      allowHoverWhenCentered: allowHoverWhenCentered ?? this.allowHoverWhenCentered,
+      printEvery: printEvery ?? this.printEvery,
+      verbose: verbose ?? this.verbose,
     );
   }
 }
@@ -75,35 +85,30 @@ class PadAlignCurriculum extends Curriculum {
 
   PadAlignCfg cfg = const PadAlignCfg();
 
-  // ---------- Fitness tracking state (rolling) ----------
-  final List<double> _accWindow = <double>[]; // episode accuracies 0..1
+  // Rolling fitness
+  final List<double> _accWindow = <double>[];
   final int _accWinMax = 40;
 
-  int _lrTotal = 0;     // total LR decisions considered
-  int _lrCorrect = 0;   // total correct LR decisions
-  int _lSeen = 0, _lCorrect = 0;
-  int _rSeen = 0, _rCorrect = 0;
+  int _lrTotal = 0, _lrCorrect = 0;
+  int _lSeen = 0, _lCorrect = 0, _rSeen = 0, _rCorrect = 0;
   int _goLeftPicks = 0, _goRightPicks = 0;
-
-  // Horizontal distance trend (per-episode mean of per-step Δ|dx|)
-  double _sumDxDelta = 0.0;
-  int _dxDeltaN = 0;
+  double _sumDxDelta = 0.0; int _dxDeltaN = 0;
 
   @override
   Curriculum configure(Map<String, String?> kv, Set<String> flags) {
     final cli = CliView(kv, flags);
     cfg = cfg.copyWith(
-      batch:    cli.getInt('padalign_batch', def: 1),
-      stepsMin: cli.getInt('padalign_steps_min', def: 8),
-      stepsMax: cli.getInt('padalign_steps_max', def: 24),
-      bandFrac: cli.getDouble('padalign_band_frac', def: 0.18),
-      tempIntent: cli.getDouble('padalign_temp', def: 1.0),
-      verbose:  cli.getFlag('padalign_verbose', def: true),
-      printEvery: cli.getInt('padalign_print_every', def: 25),
+      batch: cli.getInt('padalign_batch', def: 8),
+      stepsMin: cli.getInt('padalign_steps_min', def: 6),
+      stepsMax: cli.getInt('padalign_steps_max', def: 12),
+      bandFrac: cli.getDouble('padalign_band_frac', def: 0.15),
+      minOffsetPx: cli.getDouble('padalign_min_offset_px', def: 20.0),
+      balancedSides: cli.getFlag('padalign_balanced', def: true),
       randomVY: cli.getFlag('padalign_random_vy', def: true),
-      vyMin:    cli.getDouble('padalign_vy_min', def: 8.0),
-      vyMax:    cli.getDouble('padalign_vy_max', def: 18.0),
-      allowHoverWhenCentered: cli.getFlag('padalign_allow_hover', def: true),
+      vyMin: cli.getDouble('padalign_vy_min', def: 8.0),
+      vyMax: cli.getDouble('padalign_vy_max', def: 18.0),
+      printEvery: cli.getInt('padalign_print_every', def: 25),
+      verbose: cli.getFlag('padalign_verbose', def: true),
     );
     _resetFitness();
     return this;
@@ -117,18 +122,11 @@ class PadAlignCurriculum extends Curriculum {
     _sumDxDelta = 0.0; _dxDeltaN = 0;
   }
 
-  // ------------- Helpers -------------
-  bool _isLateralIntent(int idx) {
-    final i = Intent.values[idx];
-    return i == Intent.goLeft || i == Intent.goRight;
-  }
-
-  int _lrLabelForEnv(eng.GameEngine env, {double deadbandPx = 2.0}) {
+  // Label: which lateral intent is correct? (no deadband here)
+  int _lrLabel(eng.GameEngine env) {
     final padCx = env.terrain.padCenter.toDouble();
     final dx = padCx - env.lander.pos.x.toDouble();
-    if (dx > deadbandPx) return Intent.goRight.index;
-    if (dx < -deadbandPx) return Intent.goLeft.index;
-    return -1; // inside deadband; either hover or ignore
+    return dx >= 0 ? Intent.goRight.index : Intent.goLeft.index;
   }
 
   String _sparkline(List<double> vals, {int width = 12}) {
@@ -158,16 +156,16 @@ class PadAlignCurriculum extends Curriculum {
   }
 
   void _recordEpisodeFitness({
-    required double correctFrac, // 0..1
+    required double correctFrac,
     required int lSeen, required int lOk,
     required int rSeen, required int rOk,
     required int leftPicks, required int rightPicks,
-    required double meanDxDeltaPerStep, // negative is good
+    required double meanDxDeltaPerStep,
   }) {
     _accWindow.add(correctFrac);
     if (_accWindow.length > _accWinMax) _accWindow.removeAt(0);
 
-    final seen = (lSeen + rSeen);
+    final seen = lSeen + rSeen;
     _lrCorrect += (correctFrac * seen).round();
     _lrTotal   += seen;
     _lSeen     += lSeen; _lCorrect += lOk;
@@ -180,44 +178,44 @@ class PadAlignCurriculum extends Curriculum {
   }
 
   void _printFitnessLine(int iter) {
-    double acc  = _lrTotal > 0 ? (_lrCorrect / _lrTotal) : 0.0;
-    double lAcc = _lSeen   > 0 ? (_lCorrect / _lSeen)    : 0.0;
-    double rAcc = _rSeen   > 0 ? (_rCorrect / _rSeen)    : 0.0;
+    final acc  = _lrTotal > 0 ? (_lrCorrect / _lrTotal) : 0.0;
+    final lAcc = _lSeen   > 0 ? (_lCorrect / _lSeen)    : 0.0;
+    final rAcc = _rSeen   > 0 ? (_rCorrect / _rSeen)    : 0.0;
     final picks = _goLeftPicks + _goRightPicks;
     final biasL = picks > 0 ? (_goLeftPicks / picks) : 0.5;
-    final bar   = _sparkline(_accWindow, width: 12);
     final dxStep = _dxDeltaN > 0 ? (_sumDxDelta / _dxDeltaN) : 0.0;
 
     print('[PADALIGN/FIT] it=$iter'
         '  acc=${(100*acc).toStringAsFixed(1)}%'
         '  L_ok=${(100*lAcc).toStringAsFixed(0)}%'
         '  R_ok=${(100*rAcc).toStringAsFixed(0)}%'
-        '  bias(L)=${(100*biasL).toStringAsFixed(0)}%  $bar'
-        '  Δ|dx|/step=${dxStep.toStringAsFixed(dxStep.abs()<10?1:0)}');
+        '  bias(L)=${(100*biasL).toStringAsFixed(0)}%  ${_sparkline(_accWindow)}'
+        '  Δ|dx|/step=${dxStep.toStringAsFixed(1)}');
   }
 
-  // ------------- Episode runner -------------
-  EpisodeResult _runEpisode({
+  // Spawn exactly left or right of pad with min offset
+  void _spawnBalanced({
     required eng.GameEngine env,
-    required FeatureExtractorRays fe,
-    required PolicyNetwork policy,
-    required RunningNorm? norm,
     required math.Random rnd,
-    required int stepsTarget,
+    required bool spawnLeft,
     required double bandFrac,
-    required double tempForProbe,
+    required double minOffsetPx,
+    required bool randomVY,
+    required double vyMin,
+    required double vyMax,
   }) {
-    // Spawn near pad center
     final padCx = env.terrain.padCenter.toDouble();
     final W = env.cfg.worldW.toDouble();
-    final x = (padCx + (rnd.nextDouble() * 2 - 1) * (bandFrac * W)).clamp(10.0, W - 10.0);
-    final gy = env.terrain.heightAt(x);
-    final h = 80.0 + rnd.nextDouble() * 60.0; // modest height
-    final vx0 = (rnd.nextDouble() * 16.0) - 8.0;
-    final vy0 = cfg.randomVY ? (cfg.vyMin + rnd.nextDouble() * (cfg.vyMax - cfg.vyMin))
-        : 0.0;
 
-    env.reset(seed: rnd.nextInt(1 << 30));
+    final maxSpan = (bandFrac * W).clamp(1.0, W * 0.45);
+    final offset = minOffsetPx + rnd.nextDouble() * math.max(1.0, maxSpan - minOffsetPx);
+    final x = (spawnLeft ? (padCx - offset) : (padCx + offset)).clamp(10.0, W - 10.0);
+
+    final gy = env.terrain.heightAt(x);
+    final h = 80.0 + rnd.nextDouble() * 60.0;
+    final vx0 = (rnd.nextDouble() * 16.0) - 8.0;
+    final vy0 = randomVY ? (vyMin + rnd.nextDouble() * (vyMax - vyMin)) : 0.0;
+
     env.lander
       ..pos.x = x
       ..pos.y = (gy - h).clamp(0.0, env.cfg.worldH - 10.0)
@@ -225,14 +223,34 @@ class PadAlignCurriculum extends Curriculum {
       ..vel.y = vy0
       ..angle = 0.0
       ..fuel = env.cfg.t.maxFuel;
+  }
 
-    // Supervision containers (intent head only)
+  EpisodeResult _runEpisode({
+    required eng.GameEngine env,
+    required FeatureExtractorRays fe,
+    required PolicyNetwork policy,
+    required RunningNorm? norm,
+    required math.Random rnd,
+    required int stepsTarget,
+    required bool spawnLeft,     // enforce balance outside
+    required double bandFrac,
+    required double minOffsetPx,
+    bool dry = true,
+  }) {
+    env.reset(seed: rnd.nextInt(1 << 30));
+    _spawnBalanced(
+      env: env, rnd: rnd, spawnLeft: spawnLeft,
+      bandFrac: bandFrac, minOffsetPx: minOffsetPx,
+      randomVY: cfg.randomVY, vyMin: cfg.vyMin, vyMax: cfg.vyMax,
+    );
+
+    // Supervision containers (intent only)
     final decisionCaches  = <ForwardCache>[];
-    final intentChoices   = <int>[];      // we use teacher label as the chosen intent
-    final decisionReturns = <double>[];   // keep 0; we do pure supervised align here
-    final alignLabels     = <int>[];      // teacher labels
+    final intentChoices   = <int>[];
+    final decisionReturns = <double>[];
+    final alignLabels     = <int>[];
 
-    // Fitness tallies (per episode)
+    // Fitness tallies
     int epLSeen = 0, epRSeen = 0, epLCorrect = 0, epRCorrect = 0;
     int epLeftPicks = 0, epRightPicks = 0;
     double epDxDeltaSum = 0.0; int epDxDeltaN = 0;
@@ -255,81 +273,61 @@ class PadAlignCurriculum extends Curriculum {
         xfeat = norm.normalize(xfeat, update: false);
       }
 
-      // Policy forward (for cache + fitness probe)
-      final (greedyIdx, probs, cache) = policy.actIntentGreedy(xfeat);
-      // probe with temperature (optional; still take greedyIdx for correctness test)
-      // If you prefer, compute argmax(softmax(logits/T)) here.
+      // Policy forward for cache & fitness
+      final (greedyIdx, _probs, cache) = policy.actIntentGreedy(xfeat);
 
-      // Teacher label: which side is the pad?
-      final label = _lrLabelForEnv(env, deadbandPx: 2.0);
-      int chosenIdx;
-      if (label < 0) {
-        // centered horizontally: either ignore or hover
-        if (cfg.allowHoverWhenCentered) {
-          chosenIdx = Intent.hover.index;
-        } else {
-          // ignore this step for training — but still step the env with a safe control
-          chosenIdx = Intent.descendSlow.index;
-        }
-      } else {
-        // FORCE lateral teacher
-        chosenIdx = label;
-      }
+      // L/R label (always defined because we enforce minOffsetPx)
+      final label = _lrLabel(env); // goLeft or goRight
+      final chosenIdx = label;     // teacher forces lateral intent
 
-      // Fitness: how often would the policy pick the correct lateral intent?
-      if (label >= 0 && _isLateralIntent(greedyIdx)) {
+      // Fitness tallies
+      if (Intent.values[greedyIdx] == Intent.goLeft ||
+          Intent.values[greedyIdx] == Intent.goRight) {
         final correct = (greedyIdx == label);
         if (label == Intent.goLeft.index) { epLSeen++; if (correct) epLCorrect++; }
-        if (label == Intent.goRight.index){ epRSeen++; if (correct) epRCorrect++; }
+        else                               { epRSeen++; if (correct) epRCorrect++; }
         if (greedyIdx == Intent.goLeft.index)  epLeftPicks++;
         if (greedyIdx == Intent.goRight.index) epRightPicks++;
       }
 
-      // Record supervision ONLY when we have a lateral label (or we allow hover)
-      if (label >= 0 || cfg.allowHoverWhenCentered) {
-        decisionCaches.add(cache);
-        intentChoices.add(chosenIdx); // teacher chosen intent
-        alignLabels.add(label >= 0 ? label : Intent.hover.index);
-        decisionReturns.add(0.0); // pure supervised alignment; no advantage
-      }
+      // Supervision (intent only)
+      decisionCaches.add(cache);
+      intentChoices.add(chosenIdx);
+      alignLabels.add(label);
+      decisionReturns.add(0.0); // pure supervised
 
-      // Horizontal distance trend
+      // Δ|dx|/step metric
       final padCx0 = env.terrain.padCenter.toDouble();
       final dx0 = (env.lander.pos.x.toDouble() - padCx0).abs();
 
-      // Map chosen intent to low-level teacher controller
-      final intent = Intent.values[chosenIdx];
-      final u = controllerForIntent(intent, env);
-
-      // Step env
+      // Teacher controller for chosen intent
+      final u = controllerForIntent(Intent.values[chosenIdx], env);
       final info = env.step(1 / 60.0, u);
       totalCost += info.costDelta;
 
       final padCx1 = env.terrain.padCenter.toDouble();
       final dx1 = (env.lander.pos.x.toDouble() - padCx1).abs();
-      epDxDeltaSum += (dx1 - dx0); // negative is good (|dx| decreased)
+      epDxDeltaSum += (dx1 - dx0);
       epDxDeltaN   += 1;
 
       steps++;
       if (info.terminal) { landed = (env.status == et.GameStatus.landed); break; }
     }
 
-    // Do a small supervised update from this micro-episode
-    if (decisionCaches.isNotEmpty) {
-      // Intents only; set action head weights to zero from the caller (train loop)
+    // Supervised update (intent head only)
+    if (!dry && decisionCaches.isNotEmpty) {
       policy.updateFromEpisode(
         decisionCaches: decisionCaches,
         intentChoices: intentChoices,
         decisionReturns: decisionReturns,
         alignLabels: alignLabels,
-        alignWeight: 1.0,         // strong supervised signal
-        intentPgWeight: 0.0,      // no policy gradient needed here
-        lr: 1e-3,                 // actual lr is passed by Trainer; this is ignored by Policy impl
+        alignWeight: 1.0,
+        intentPgWeight: 0.0,
+        lr: 1e-3,
         entropyBeta: 0.0,
         valueBeta: 0.0,
         huberDelta: 1.0,
         intentMode: true,
-        // no action head supervision in this micro-stage
         actionCaches: const [],
         actionTurnTargets: const [],
         actionThrustTargets: const [],
@@ -337,7 +335,7 @@ class PadAlignCurriculum extends Curriculum {
       );
     }
 
-    // Episode fitness summary
+    // Episode fitness record
     final epSeen = epLSeen + epRSeen;
     final epAcc = epSeen > 0 ? (epLCorrect + epRCorrect) / epSeen : 0.0;
     final meanDxDeltaPerStep = epDxDeltaN > 0 ? (epDxDeltaSum / epDxDeltaN) : 0.0;
@@ -358,7 +356,6 @@ class PadAlignCurriculum extends Curriculum {
     );
   }
 
-  // ------------- Main run loop -------------
   @override
   Future<void> run({
     required int iters,
@@ -366,11 +363,11 @@ class PadAlignCurriculum extends Curriculum {
     required FeatureExtractorRays fe,
     required PolicyNetwork policy,
     required RunningNorm? norm,
-    required int planHold,              // unused here
-    required double tempIntent,         // we use cfg.tempIntent for probe; trainer passes something
-    required double gamma,              // unused (no returns)
-    required double lr,                 // Trainer's LR; used inside policy.updateFromEpisode
-    required double intentAlignWeight,  // we still accept these, but the episode sets intentMode
+    required int planHold,
+    required double tempIntent,
+    required double gamma,
+    required double lr,
+    required double intentAlignWeight,
     required double intentPgWeight,
     required double actionAlignWeight,
     required bool gateVerbose,
@@ -379,14 +376,36 @@ class PadAlignCurriculum extends Curriculum {
     final rnd = math.Random(seed ^ 0x51A1);
     if (gateVerbose) {
       print('[CUR/padalign] start iters=$iters batch=${cfg.batch} '
-          'steps=${cfg.stepsMin}..${cfg.stepsMax} bandFrac=${cfg.bandFrac}');
+          'steps=${cfg.stepsMin}..${cfg.stepsMax} bandFrac=${cfg.bandFrac} '
+          'minOff=${cfg.minOffsetPx} balanced=${cfg.balancedSides ? "Y" : "N"}');
     }
+
+    // === Baseline: no updates ===
+    _resetFitness();
+    for (int b = 0; b < cfg.batch; b++) {
+      final stepsTarget = (cfg.stepsMin == cfg.stepsMax)
+          ? cfg.stepsMin
+          : (cfg.stepsMin + rnd.nextInt(math.max(1, cfg.stepsMax - cfg.stepsMin + 1)));
+      final spawnLeft = cfg.balancedSides ? (b % 2 == 0) : rnd.nextBool();
+      _runEpisode(
+        env: env, fe: fe, policy: policy, norm: norm, rnd: rnd,
+        stepsTarget: stepsTarget, spawnLeft: spawnLeft,
+        bandFrac: cfg.bandFrac, minOffsetPx: cfg.minOffsetPx,
+        dry: true, // <-- probe
+      );
+    }
+    _printFitnessLine(0); // prints as it=0 before any updates
 
     for (int it = 0; it < iters; it++) {
       for (int b = 0; b < cfg.batch; b++) {
         final stepsTarget = (cfg.stepsMin == cfg.stepsMax)
             ? cfg.stepsMin
             : (cfg.stepsMin + rnd.nextInt(math.max(1, cfg.stepsMax - cfg.stepsMin + 1)));
+
+        // enforce perfect balance if enabled
+        final spawnLeft = cfg.balancedSides
+            ? (((it * cfg.batch) + b) % 2 == 0)
+            : (rnd.nextBool());
 
         _runEpisode(
           env: env,
@@ -395,8 +414,9 @@ class PadAlignCurriculum extends Curriculum {
           norm: norm,
           rnd: rnd,
           stepsTarget: stepsTarget,
+          spawnLeft: spawnLeft,
           bandFrac: cfg.bandFrac,
-          tempForProbe: cfg.tempIntent,
+          minOffsetPx: cfg.minOffsetPx,
         );
       }
 
