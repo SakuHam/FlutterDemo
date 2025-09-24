@@ -757,6 +757,76 @@ class PolicyNetwork {
   List<List<double>>? _snapWThr;
   List<double>? _snapBThr;
 
+  /// Reward-modulated Hebbian tick.
+  /// dW_ij = eta * mod * ( post_i * pre_j  - (useOja ? post_i^2 * W_ij : decay * W_ij) )
+  void hebbianTick({
+    required HebbianConfig cfg,
+    required List<List<double>> preActs,
+    required List<List<double>> postActs,
+    required double mod,
+  }) {
+    if (!cfg.enabled) return;
+    if (!mod.isFinite) return;
+
+    int li = 0;
+
+    // Trunk
+    for (final layer in trunk.layers) {
+      if (cfg.trunk) {
+        final pre = preActs[li];
+        final post = postActs[li];
+        _hebbLayerUpdate(layer.W, cfg, pre, post, mod);
+      }
+      li++;
+    }
+
+    // Heads (order matches forwardWithActs appends)
+    if (cfg.headIntent) {
+      _hebbLayerUpdate(heads.intent.W, cfg, preActs[li], postActs[li], mod);
+    }
+    li++;
+
+    if (cfg.headTurn) {
+      _hebbLayerUpdate(heads.turn.W, cfg, preActs[li], postActs[li], mod);
+    }
+    li++;
+
+    if (cfg.headThr) {
+      _hebbLayerUpdate(heads.thr.W, cfg, preActs[li], postActs[li], mod);
+    }
+    li++;
+
+    if (cfg.headVal) {
+      _hebbLayerUpdate(heads.val.W, cfg, preActs[li], postActs[li], mod);
+    }
+  }
+
+  void _hebbLayerUpdate(
+      List<List<double>> W,
+      HebbianConfig cfg,
+      List<double> pre,
+      List<double> post,
+      double mod,
+      ) {
+    final m = mod;
+    final eta = cfg.eta;
+    final clip = cfg.clip;
+    final decay = cfg.decay;
+
+    for (int i = 0; i < W.length; i++) {
+      final Wi = W[i];
+      final pi = post[i];
+      final stabFactor = cfg.useOja ? (pi * pi) : decay; // Oja vs decay
+      for (int j = 0; j < Wi.length; j++) {
+        final hebb = pi * pre[j];
+        final stab = stabFactor * Wi[j];
+        final dw = eta * m * (hebb - stab);
+        Wi[j] += _clipD(dw, clip);
+      }
+      if (cfg.rowL2Cap > 0) _capRowL2(Wi, cfg.rowL2Cap);
+    }
+  }
+
   PolicyNetwork({
     required this.inputSize,
     List<int> hidden = const [64, 64],
@@ -884,76 +954,18 @@ class PolicyNetwork {
     return (intentLogits, turnLogits, thrLogit, valScalar, preActs, postActs);
   }
 
-  /// Reward-modulated Hebbian tick.
-  /// dW_ij = eta * mod * ( post_i * pre_j  - (useOja ? post_i^2 * W_ij : decay * W_ij) )
-  void hebbianTick({
-    required HebbianConfig cfg,
-    required List<List<double>> preActs,
-    required List<List<double>> postActs,
-    required double mod,
-  }) {
-    if (!cfg.enabled) return;
-    if (!mod.isFinite) return;
-
-    int li = 0;
-
-    // Trunk
-    for (final layer in trunk.layers) {
-      if (cfg.trunk) {
-        final pre = preActs[li];
-        final post = postActs[li];
-        _hebbLayerUpdate(layer.W, cfg, pre, post, mod);
-      }
-      li++;
+  /// New: return intent probs *and* logits for temperature/bias sampling.
+  (int, List<double>, List<double>, ForwardCache) actIntent(List<double> x) {
+    final c = _forwardFull(x);
+    int arg = 0;
+    double best = c.intentProbs[0];
+    for (int i = 1; i < c.intentProbs.length; i++) {
+      if (c.intentProbs[i] > best) { best = c.intentProbs[i]; arg = i; }
     }
-
-    // Heads (order matches forwardWithActs appends)
-    if (cfg.headIntent) {
-      _hebbLayerUpdate(heads.intent.W, cfg, preActs[li], postActs[li], mod);
-    }
-    li++;
-
-    if (cfg.headTurn) {
-      _hebbLayerUpdate(heads.turn.W, cfg, preActs[li], postActs[li], mod);
-    }
-    li++;
-
-    if (cfg.headThr) {
-      _hebbLayerUpdate(heads.thr.W, cfg, preActs[li], postActs[li], mod);
-    }
-    li++;
-
-    if (cfg.headVal) {
-      _hebbLayerUpdate(heads.val.W, cfg, preActs[li], postActs[li], mod);
-    }
+    return (arg, c.intentProbs, c.intentLogits, c);
   }
 
-  void _hebbLayerUpdate(
-      List<List<double>> W,
-      HebbianConfig cfg,
-      List<double> pre,
-      List<double> post,
-      double mod,
-      ) {
-    final m = mod;
-    final eta = cfg.eta;
-    final clip = cfg.clip;
-    final decay = cfg.decay;
-
-    for (int i = 0; i < W.length; i++) {
-      final Wi = W[i];
-      final pi = post[i];
-      final stabFactor = cfg.useOja ? (pi * pi) : decay; // Oja vs decay
-      for (int j = 0; j < Wi.length; j++) {
-        final hebb = pi * pre[j];
-        final stab = stabFactor * Wi[j];
-        final dw = eta * m * (hebb - stab);
-        Wi[j] += _clipD(dw, clip);
-      }
-      if (cfg.rowL2Cap > 0) _capRowL2(Wi, cfg.rowL2Cap);
-    }
-  }
-
+  /// Back-compat: greedy intent + probs (cache still has logits if needed).
   (int, List<double>, ForwardCache) actIntentGreedy(List<double> x) {
     final c = _forwardFull(x);
     int arg = 0;
@@ -1045,12 +1057,10 @@ class PolicyNetwork {
         final h = c.acts.last;
         final y = alignLabels[n].clamp(0, PolicyNetwork.kIntents - 1);
         final dLog = nn.Ops.crossEntropyGrad(c.intentProbs, y); // (p - y)
-        // Entropy grad wrt logits: dH = -β * ( (1 + log p) - ⟨1 + log p⟩ ), but we can use a simpler:
-        // ∂( -Σ p log p )/∂logit = β * (p * (log p + 1) - const).
-        // A simple practical version is to add β * p to the gradient (pushes toward uniform).
+        // Entropy grad wrt logits: add small β * p to push toward uniform.
         if (entropyBeta > 0) {
           for (int i = 0; i < dLog.length; i++) {
-            dLog[i] += entropyBeta * c.intentProbs[i]; // small push to spread mass
+            dLog[i] += entropyBeta * c.intentProbs[i];
           }
         }
         final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
@@ -1377,6 +1387,29 @@ class Trainer {
   }) : hebbian = hebbian ?? const HebbianConfig(),
         norm = RunningNorm(fe.inputSize, momentum: 0.995);
 
+  // New: sample from raw logits with temperature (numerically stable).
+  int _sampleFromLogits(List<double> logits, math.Random r, double temp) {
+    final T = temp.clamp(1e-6, 10.0);
+    // scale logits by 1/T
+    final z = List<double>.from(logits);
+    for (int i = 0; i < z.length; i++) z[i] /= T;
+
+    // stable softmax sampling via cumulative exp
+    final maxZ = z.reduce((a, b) => a > b ? a : b);
+    double sum = 0.0;
+    final exps = List<double>.filled(z.length, 0.0);
+    for (int i = 0; i < z.length; i++) { final e = math.exp(z[i] - maxZ); exps[i] = e; sum += e; }
+
+    final u = r.nextDouble() * sum;
+    double acc = 0.0;
+    for (int i = 0; i < exps.length; i++) {
+      acc += exps[i];
+      if (u <= acc) return i;
+    }
+    return exps.length - 1;
+  }
+
+  // (kept for back-compat in case you want to use it elsewhere)
   int _sampleCategorical(List<double> probs, math.Random r, double temp) {
     if (temp <= 1e-6) {
       int arg = 0; double best = probs[0];
@@ -1426,6 +1459,8 @@ class Trainer {
     int segCount = 0;
 
     _pwmA = 0.0; _pwmCount = 0; _pwmOn = 0;
+    int _thrustLatch = 0;           // frames remaining to force thrust=ON
+    int _thrustLatchBoost = 8;      // ~0.13s @60Hz; tune 6..14 if you like
 
     int framesLeft = 0;
     int currentIntentIdx = 0;
@@ -1465,12 +1500,13 @@ class Trainer {
           x = norm?.normalize(x, update: false) ?? x;
         }
 
-        final (idxGreedy, p, cache) = policy.actIntentGreedy(x);
-        // Optional tiny exploration (disabled by default):
-        // final eps = 0.03;
-        // final smoothed = List<double>.generate(p.length, (i) => (1 - eps) * p[i] + eps / p.length);
-        // final idx = greedy ? idxGreedy : _sampleCategorical(smoothed, r, tempIntent);
-        final idx = greedy ? idxGreedy : _sampleCategorical(p, r, tempIntent);
+        // <<< CHANGED: use logits-aware forward for sampling >>>
+        final (idxGreedy, probs, logits, cache) = policy.actIntent(x);
+
+        final idx = greedy
+            ? idxGreedy
+            : _sampleFromLogits(logits, r, tempIntent);
+
         currentIntentIdx = idx;
 
         // repetition tracking for lock guard
@@ -1549,18 +1585,41 @@ class Trainer {
 
       final pThrModel   = probs[0].clamp(0.0, 1.0);
       final pThrTeacher = uTeacher.thrust ? 1.0 : 0.0;
-      final pThrExec = blendPolicy * pThrModel + (1.0 - blendPolicy) * pThrTeacher;
+      double pThrExec   = blendPolicy * pThrModel + (1.0 - blendPolicy) * pThrTeacher;
 
-      _pwmA = (_pwmA + pThrExec).clamp(0.0, 10.0);
+// --- When "go up" is requested, latch thrust ON for a few frames ---
+// (also trigger near ground if falling too fast)
+      final vCapUp  = _vCapBrakeUp(height);
+      final needEmergencyUp = (height < 220.0) && (env.lander.vel.y > 0.9 * vCapUp);
 
+// If teacher wants thrust or we're near-ground & hot, (re)arm the latch.
+      if (pThrTeacher >= 0.5 || needEmergencyUp) {
+        _thrustLatch = math.max(_thrustLatch, _thrustLatchBoost);
+      }
+
+// Slight bias upward when low & teacher is pushing up, so the duty builds quicker.
+      if (height < 180.0 && pThrTeacher >= 0.5) {
+        pThrExec = math.max(pThrExec, 0.75);
+      }
+
+// --- Proper accumulator PWM: at most one ON per frame, no while-loop losses ---
+      _pwmA += pThrExec;
       bool thrustPWM = false;
-      while (_pwmA >= 1.0) {
+
+// Latch has priority: keep thrust hard-ON for its duration
+      if (_thrustLatch > 0) {
+        thrustPWM = true;
+        _thrustLatch--;
+      } else if (_pwmA >= 1.0) {
         thrustPWM = true;
         _pwmA -= 1.0;
       }
-      if (height < 90.0 && !thrustPWM && pThrExec > 0.65) {
+
+// Final safety: if we're very low, give a nudge even if accumulator hasn't filled yet.
+      if (!thrustPWM && height < 90.0 && pThrExec > 0.55) {
         thrustPWM = true;
-        _pwmA = (_pwmA - 0.65).clamp(0.0, 0.999);
+        // do a gentle partial drain so we don't drift upward forever
+        _pwmA = math.max(0.0, _pwmA - 0.5);
       }
 
       final execThrust = thrustPWM;
@@ -1671,31 +1730,84 @@ class Trainer {
     // Probabilistic gate (with hard-landed constraint if requested)
     bool accept;
     double sampledP = 1.0; // for logging
+// ===== STRICT, ADAPTIVE STOCHASTIC GATE (z-score; uses *previous* EMA) =====
+
+    double _gMu = 0.0, _gVar = 1.0;
+    bool _gInit = false;
+    const double _gateEma = 0.98;
+
+    void _gateUpdateStats(double x) {
+      if (!_gInit) { _gInit = true; _gMu = x; _gVar = 1.0; return; }
+      final muPrev = _gMu;
+      _gMu = _gateEma * _gMu + (1 - _gateEma) * x;
+      final dx  = x - muPrev;
+      final dx2 = x - _gMu;
+      _gVar = _gateEma * _gVar + (1 - _gateEma) * (dx * dx2);
+    }
+
+// 1) Freeze stats BEFORE decision
+    final double mu0  = _gMu;
+    final double var0 = _gVar;
+    final bool inited = _gInit;
+
+    final double sig0 = math.sqrt((inited && var0 > 1e-8) ? var0 : 1.0);
+// dynamic bar: baseline vs EMA+margin
+    final double dynThr = math.max(gateScoreMin, (inited ? (mu0 + 0.10) : gateScoreMin));
+// z-score against frozen stats
+    final double zBase = (segMean - dynThr) / (sig0 + 1e-6);
+
+// stricter profile knobs
+// --- knobs for the z-score gate ---
+    const bool strictProfile = true;
+
+// let p breathe: wider range
+    final double pMin     = strictProfile ? 0.02 : gateProbMin.clamp(0.0, 1.0);
+    final double pMax     = strictProfile ? 0.80 : gateProbMax.clamp(0.0, 1.0); // was 0.40 → 0.80
+
+// softer slope so p doesn’t slam into the cap immediately
+    final double kSigmoid = strictProfile ? 2.0  : math.max(1.0, gateProbK);   // was 4.0 → 2.0
+
+// still keep a dead-zone below bar
+    final double deadZoneZ = strictProfile ? -0.35 : -0.15;
+
+// tiny boosts
+    final double boostL    = strictProfile ? 0.03 : gateProbLandedBoost.clamp(0.0, 1.0);
+    final double boostN    = strictProfile ? 0.02 : gateProbNearPadBoost.clamp(0.0, 1.0);
+
+// (unchanged) compute s, p from zBase with logistic:
+    final double s = 1.0 / (1.0 + math.exp(-kSigmoid * zBase));
+    double p = pMin + (pMax - pMin) * s;
+    if (landed)         p += boostL;
+    if (nearPadCrashOK) p += boostN;
+    p = p.clamp(pMin, pMax);
+
+// 2) Decide with frozen stats
     if (gateOnlyLanded && !landed && !nearPadCrashOK) {
-      accept = false;
-      sampledP = 0.0;
+      accept = false; sampledP = 0.0;
     } else if (!gateProbEnabled) {
-      // Legacy hard gate
-      accept = segMean >= gateScoreMin;
-      sampledP = accept ? 1.0 : 0.0;
+      accept = segMean >= dynThr; sampledP = accept ? 1.0 : 0.0;
+    } else if (zBase < deadZoneZ) {
+      accept = false; sampledP = 0.0;
     } else {
-      // p = min + (max-min) * sigmoid(k*(segMean - gateScoreMin))
-      final z = gateProbK * (segMean - gateScoreMin);
-      final s = 1.0 / (1.0 + math.exp(-z));
-      double p = gateProbMin + (gateProbMax - gateProbMin) * s;
-      if (landed)         p = (p + gateProbLandedBoost ).clamp(gateProbMin, gateProbMax);
-      if (nearPadCrashOK) p = (p + gateProbNearPadBoost).clamp(gateProbMin, gateProbMax);
+      final s = 1.0 / (1.0 + math.exp(-kSigmoid * zBase));
+      double p = pMin + (pMax - pMin) * s;
+      if (landed)         p += boostL;
+      if (nearPadCrashOK) p += boostN;
+      p = p.clamp(pMin, pMax);
       sampledP = p;
       accept = (math.Random(seed ^ (_epCounter << 7) ^ steps).nextDouble() < p);
     }
 
+// 3) NOW update stats AFTER the decision
+    _gateUpdateStats(segMean);
+
+// (optional) clearer logging
     if (gateVerbose) {
-      final tag = landed ? 'L' : (nearPadCrashOK ? 'NP' : 'NL');
-      final decisionMsg = accept ? 'ACCEPT' : 'DROP';
       print('[GATE] segMean=${segMean.toStringAsFixed(3)} '
-          'thr=${gateScoreMin.toStringAsFixed(3)} '
-          'p=${sampledP.toStringAsFixed(3)} '
-          'result=$decisionMsg [$tag] steps=$steps');
+          'dynThr=${dynThr.toStringAsFixed(3)} mu0=${mu0.toStringAsFixed(3)} '
+          'sig0=${sig0.toStringAsFixed(3)} z=${zBase.toStringAsFixed(2)} '
+          'p=${sampledP.toStringAsFixed(3)} result=${accept ? "ACCEPT" : "DROP"} '
+          '[${landed ? "L" : (nearPadCrashOK ? "NP" : "NL")}] steps=$steps');
     }
 
     if (train) {

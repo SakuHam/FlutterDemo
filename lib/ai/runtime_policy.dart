@@ -597,7 +597,7 @@ class RuntimeTwoStagePolicy {
 
   // FE & planner config
   final _RuntimeFE fe;
-  final int planHold; // frames to hold an intent
+  final int planHold; // base frames to hold an intent
 
   // Saved feature normalization (optional)
   final _RuntimeNorm? norm;
@@ -617,6 +617,13 @@ class RuntimeTwoStagePolicy {
   int _framesLeft = 0;
   int _currentIntentIdx = -1;
   List<double>? _lastReplanProbs;
+
+  // Thrust latch (keeps engine ON for a few frames when climbing is required)
+  int _thrustLatch = 0;
+  int _thrustLatchBoost = 10; // tune 8..14 (≈0.13–0.23s @60Hz)
+
+  // Diagnostics: last seen pad fraction
+  double _padSeenFrac = 0.0;
 
   final bool fixPolarityWithPadRays; // swap goLeft/goRight if pad-avg disagrees
   final bool mirrorX; // hard flip left/right mapping (debug/safety)
@@ -854,6 +861,8 @@ class RuntimeTwoStagePolicy {
   void resetPlanner() {
     _framesLeft = 0;
     _currentIntentIdx = -1;
+    _thrustLatch = 0;
+    _padSeenFrac = 0.0;
   }
 
   // ===== NEW: runtime setters you can call from UI/loop =====
@@ -864,6 +873,30 @@ class RuntimeTwoStagePolicy {
   void setStochasticPlanner(bool on) {
     stochasticPlanner = on;
   }
+
+  // --- Dynamic plan-hold multiplier (1..4) based on calmness/centering
+  int _dynamicPlanHoldMul({
+    required LanderState lander,
+    required Terrain terrain,
+    required double worldW,
+  }) {
+    final padCx = (terrain.padX1 + terrain.padX2) * 0.5;
+    final dxAbs = (lander.pos.x - padCx).abs();
+    final vxAbs = lander.vel.x.abs();
+    final gy = terrain.heightAt(lander.pos.x);
+    final h  = (gy - lander.pos.y).toDouble().clamp(0.0, 1e9);
+    final W  = worldW.toDouble();
+
+    int hold = 1; // fast by default
+    if (dxAbs > 0.12 * W || vxAbs > 60.0) hold = 1;
+    if (h > 280.0 && dxAbs < 0.08 * W && vxAbs < 40.0) hold = 2;
+    if (h > 340.0 && dxAbs < 0.06 * W && vxAbs < 30.0) hold = 3;
+    if (h > 380.0 && dxAbs < 0.04 * W && vxAbs < 20.0) hold = 4;
+    if (h < 160.0) hold = math.max(hold, 2); // near pad: modest dwell
+    return hold.clamp(1, 8);
+  }
+
+  double _vCapBrakeUp(double h) => (0.07 * h + 6.0).clamp(6.0, 16.0);
 
   /// Back-compat: original API (no side/down thrusters).
   /// If your engine supports extra channels, call [actWithIntentExt] instead.
@@ -891,13 +924,12 @@ class RuntimeTwoStagePolicy {
       final h = trunk.forward(x);
       final rawLogits = headIntent.forward(h);
 
-      // ===== NEW: temperature + (optional) sampling =====
+      // ===== Temperature + (optional) sampling =====
       final z = List<double>.generate(rawLogits.length, (i) => rawLogits[i] / intentTemp);
       final probs = _softmax(z);
 
       int idx;
       if (stochasticPlanner) {
-        // Multinomial sample from probs
         final u = _rnd.nextDouble();
         double acc = 0.0;
         idx = probs.length - 1;
@@ -906,12 +938,15 @@ class RuntimeTwoStagePolicy {
           if (u <= acc) { idx = i; break; }
         }
       } else {
-        // Greedy
         idx = _argmax(probs);
       }
 
       _currentIntentIdx = idx;
-      _framesLeft = planHold;
+
+      // Dynamic plan-hold multiplier
+      final holdMul = _dynamicPlanHoldMul(lander: lander, terrain: terrain, worldW: worldW);
+      _framesLeft = (planHold * holdMul).clamp(1, 120);
+
       _lastReplanProbs = probs;
 
       // Optional polarity fix using average pad vector
@@ -923,31 +958,20 @@ class RuntimeTwoStagePolicy {
           final isRight = _currentIntentIdx == Intent.goRight.index;
           if ((isLeft && !padIsLeft) || (isRight && padIsLeft)) {
             _currentIntentIdx = isLeft ? Intent.goRight.index : Intent.goLeft.index;
-            IntentBus.instance.publishIntent(IntentEvent(
-              intent: kIntentNames[_currentIntentIdx],
-              probs: _lastReplanProbs ?? const [],
-              step: step,
-              meta: {'polarity_fix': true, 'T': intentTemp, 'stochastic': stochasticPlanner},
-            ));
           }
         }
       }
 
-      // === NEW: publish a plan preview for the overlay ===
-      final intentForPreview = Intent.values[_currentIntentIdx];
+      // Pad visibility diagnostics (for overlays/logs)
+      if (rays != null && rays.isNotEmpty) {
+        int padHits = 0;
+        for (final r in rays) { if (r.kind == RayHitKind.pad) padHits++; }
+        _padSeenFrac = padHits / rays.length;
+      } else {
+        _padSeenFrac = 0.0;
+      }
 
-      // Use extended controller to include side/down thrusters according to physics
-      final uExt = _controllerForIntentExt(
-        intentForPreview,
-        lander: lander,
-        terrain: terrain,
-        worldW: worldW,
-        worldH: worldH,
-        phys: physics,
-      );
-
-      final intentNow = Intent.values[_currentIntentIdx];
-      // --- Publish a PF-guided plan if we have a field; fallback to old plan otherwise.
+      // === Publish a plan preview for the overlay (if PF available) ===
       try {
         final field = _pf;
         if (field != null) {
@@ -967,7 +991,7 @@ class RuntimeTwoStagePolicy {
           PlanBus.instance.push(points: planPts, widths: widths, source: 'pf');
         }
       } catch (_) {
-        // ignore planning errors (don’t crash gameplay)
+        // ignore planning errors
       }
 
       IntentBus.instance.publishIntent(
@@ -975,7 +999,13 @@ class RuntimeTwoStagePolicy {
           intent: kIntentNames[_currentIntentIdx],
           probs: probs,
           step: step,
-          meta: {'plan_hold': planHold, 'T': intentTemp, 'stochastic': stochasticPlanner},
+          meta: {
+            'plan_hold': planHold,
+            'hold_mul': holdMul,
+            'T': intentTemp,
+            'stochastic': stochasticPlanner,
+            'padSeenFrac': _padSeenFrac,
+          },
         ),
       );
     }
@@ -991,15 +1021,37 @@ class RuntimeTwoStagePolicy {
       worldH: worldH,
     );
 
+    // ====== Thrust LATCH & emergency-up ======
+    final groundY = terrain.heightAt(lander.pos.x.toDouble());
+    final height  = (groundY - lander.pos.y).toDouble().clamp(0.0, 1e9);
+    final vCapUp  = _vCapBrakeUp(height);
+    final needEmergencyUp = (height < 220.0) && (lander.vel.y > 0.9 * vCapUp);
+
+    if (intent == Intent.brakeUp || needEmergencyUp) {
+      _thrustLatch = math.max(_thrustLatch, _thrustLatchBoost);
+    }
+
+    bool thrustOut = ctrl.thrust;
+    if (_thrustLatch > 0) {
+      thrustOut = true;
+      _thrustLatch--;
+    }
+
     // Optional global turn inversion (debug/safety)
     if (mirrorX) {
-      final swapped = (thrust: ctrl.thrust, left: ctrl.right, right: ctrl.left);
+      final swapped = (thrust: thrustOut, left: ctrl.right, right: ctrl.left);
       IntentBus.instance.publishControl(ControlEvent(
         thrust: swapped.thrust,
         left: swapped.left,
         right: swapped.right,
         step: step,
-        meta: {'intent': kIntentNames[idxNow], 'mirrorX': true},
+        meta: {
+          'intent': kIntentNames[idxNow],
+          'mirrorX': true,
+          'hold_left': _framesLeft,
+          'thrust_latch': _thrustLatch,
+          'padSeenFrac': _padSeenFrac,
+        },
       ));
       _framesLeft -= 1;
       return (swapped.thrust, swapped.left, swapped.right, idxNow, _lastReplanProbs ?? const []);
@@ -1007,16 +1059,21 @@ class RuntimeTwoStagePolicy {
 
     IntentBus.instance.publishControl(
       ControlEvent(
-        thrust: ctrl.thrust,
+        thrust: thrustOut,
         left: ctrl.left,
         right: ctrl.right,
         step: step,
-        meta: {'intent': kIntentNames[idxNow]},
+        meta: {
+          'intent': kIntentNames[idxNow],
+          'hold_left': _framesLeft,
+          'thrust_latch': _thrustLatch,
+          'padSeenFrac': _padSeenFrac,
+        },
       ),
     );
 
     _framesLeft -= 1;
-    return (ctrl.thrust, ctrl.left, ctrl.right, idxNow, _lastReplanProbs ?? const []);
+    return (thrustOut, ctrl.left, ctrl.right, idxNow, _lastReplanProbs ?? const []);
   }
 
   /// NEW: Extended API that also returns side/down thrusters based on physics.
@@ -1072,11 +1129,14 @@ class RuntimeTwoStagePolicy {
         'sideLeft': sideLeft,
         'sideRight': sideRight,
         'downThrust': ext.downThrust,
+        'hold_left': _framesLeft,
+        'thrust_latch': _thrustLatch,
+        'padSeenFrac': _padSeenFrac,
       },
     ));
 
     return (
-    legacy.$1, // thrust (main)
+    legacy.$1, // thrust (main, with latch)
     left,
     right,
     sideLeft,
@@ -1087,7 +1147,7 @@ class RuntimeTwoStagePolicy {
     );
   }
 
-// Acceleration-limited plan that follows the PF vector field toward the pad.
+  // Acceleration-limited plan that follows the PF vector field toward the pad.
   List<Offset> _buildPFPlanPolyline({
     required LanderState lander,
     required Terrain terrain,
@@ -1211,7 +1271,7 @@ class RuntimeTwoStagePolicy {
 
       pts.add(Offset(x, y));
 
-      // stop condition: we’ve essentially reached the pad & slowed
+      // stop condition: reached pad & slowed
       final nearX = (x - padCx).abs() <= 6.0;
       final nearY = (y - padCy).abs() <= 6.0;
       final slow  = math.sqrt(vx*vx + vy*vy) <= 6.0;
