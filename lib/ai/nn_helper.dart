@@ -51,6 +51,31 @@ enum InitKind { xavier, kaiming }
 /* ------------------------------------ Ops ------------------------------------ */
 
 class Ops {
+  /// log1p(y) ≈ log(1+y), but stable for small |y|.
+  static double log1p(double y) {
+    // handle edge cases
+    if (y <= -1.0) return double.nan; // log(≤0) undefined
+    final ay = y.abs();
+    if (ay > 1e-4) {
+      return math.log(1.0 + y);
+    }
+    // series for small y: y - y^2/2 + y^3/3 - y^4/4 ...
+    final y2 = y * y;
+    final y3 = y2 * y;
+    final y4 = y3 * y;
+    return y - 0.5 * y2 + (1.0 / 3.0) * y3 - 0.25 * y4;
+  }
+
+  static double softplus(double x) {
+    // stable: softplus(x) = log(1 + exp(x)) = max(0,x) + log1p(exp(-|x|))
+    final ax = x.abs();
+    return log1p(math.exp(-ax)) + (x > 0 ? x : 0.0);
+  }
+
+  // (optional) vector helper if you ever want it
+  static List<double> softplusVec(List<double> xs) =>
+      xs.map((v) => softplus(v)).toList();
+
   static List<double> softmax(List<double> z) {
     double m = z[0];
     for (int i = 1; i < z.length; i++) if (z[i] > m) m = z[i];

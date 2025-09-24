@@ -358,6 +358,13 @@ int _argmax(List<double> a) {
   return idx;
 }
 
+// Stable softplus for seconds decoding (>= 0)
+double _softplus(double x) {
+  if (x > 30.0) return x;           // exp overflow safe
+  if (x < -30.0) return math.exp(x);
+  return math.log(1.0 + math.exp(x));
+}
+
 /* =============================================================================
    MLP & Norm
    ========================================================================== */
@@ -588,16 +595,18 @@ _controllerForIntentExt(
 class RuntimeTwoStagePolicy {
   // Architecture (inferred)
   final int inputSize;
-  final _MLP trunk; // arbitrary hidden layers (tanh)
+  final _MLP trunk;       // arbitrary hidden layers (tanh)
   final _Linear headIntent; // (K, Hlast)
   // Optional loaded heads (not used by planner, kept for parity)
   final _Linear? headTurn; // (3, Hlast)
-  final _Linear? headThr; // (1, Hlast)
-  final _Linear? headVal; // (1, Hlast)
+  final _Linear? headThr;  // (1, Hlast)
+  final _Linear? headVal;  // (1, Hlast)
+  // NEW: optional learned duration/hold head (seconds)
+  final _Linear? headDur;  // (1, Hlast)
 
   // FE & planner config
   final _RuntimeFE fe;
-  final int planHold; // base frames to hold an intent
+  final int planHold; // base frames to hold an intent (heuristic baseline)
 
   // Saved feature normalization (optional)
   final _RuntimeNorm? norm;
@@ -625,6 +634,9 @@ class RuntimeTwoStagePolicy {
   // Diagnostics: last seen pad fraction
   double _padSeenFrac = 0.0;
 
+  // Smoother for learned hold (in frames)
+  double _holdEma = 0.0;
+
   final bool fixPolarityWithPadRays; // swap goLeft/goRight if pad-avg disagrees
   final bool mirrorX; // hard flip left/right mapping (debug/safety)
 
@@ -640,6 +652,7 @@ class RuntimeTwoStagePolicy {
     this.headTurn,
     this.headThr,
     this.headVal,
+    this.headDur,                 // NEW
     required this.fe,
     required this.planHold,
     required this.norm,
@@ -729,10 +742,17 @@ class RuntimeTwoStagePolicy {
       }
 
       final headIntent = _readHead('intent');
-      _Linear? headTurn, headThr, headVal;
+      _Linear? headTurn, headThr, headVal, headDur;
       if (headsJ.containsKey('turn')) headTurn = _readHead('turn');
-      if (headsJ.containsKey('thr')) headThr = _readHead('thr');
-      if (headsJ.containsKey('val')) headVal = _readHead('val');
+      if (headsJ.containsKey('thr'))  headThr  = _readHead('thr');
+      if (headsJ.containsKey('val'))  headVal  = _readHead('val');
+
+      // NEW: optional duration/hold head (seconds)
+      if (headsJ.containsKey('dur')) {
+        headDur = _readHead('dur');
+      } else if (headsJ.containsKey('hold')) {
+        headDur = _readHead('hold'); // alt key
+      }
 
       // FE choice
       _RuntimeFE fe0;
@@ -766,6 +786,7 @@ class RuntimeTwoStagePolicy {
         headTurn: headTurn,
         headThr: headThr,
         headVal: headVal,
+        headDur: headDur,                 // NEW
         fe: fe0,
         planHold: planHold,
         norm: norm,
@@ -826,6 +847,7 @@ class RuntimeTwoStagePolicy {
       headTurn: headTurn,
       headThr: headThr,
       headVal: headVal,
+      headDur: null,                 // no duration head in v1
       fe: fe0,
       planHold: planHold,
       norm: norm,
@@ -863,6 +885,7 @@ class RuntimeTwoStagePolicy {
     _currentIntentIdx = -1;
     _thrustLatch = 0;
     _padSeenFrac = 0.0;
+    _holdEma = 0.0;
   }
 
   // ===== NEW: runtime setters you can call from UI/loop =====
@@ -943,12 +966,6 @@ class RuntimeTwoStagePolicy {
 
       _currentIntentIdx = idx;
 
-      // Dynamic plan-hold multiplier
-      final holdMul = _dynamicPlanHoldMul(lander: lander, terrain: terrain, worldW: worldW);
-      _framesLeft = (planHold * holdMul).clamp(1, 120);
-
-      _lastReplanProbs = probs;
-
       // Optional polarity fix using average pad vector
       if (fixPolarityWithPadRays && rays != null && rays.isNotEmpty) {
         final av = _avgPadVector(rays: rays, px: lander.pos.x, py: lander.pos.y);
@@ -970,6 +987,32 @@ class RuntimeTwoStagePolicy {
       } else {
         _padSeenFrac = 0.0;
       }
+
+      // === Compute plan hold (heuristic + learned duration) ===
+      final holdMul = _dynamicPlanHoldMul(
+          lander: lander, terrain: terrain, worldW: worldW);
+      final int baseHoldFrames = (planHold * holdMul).clamp(1, 120);
+
+      // Optional learned seconds → frames
+      int learnedHoldFrames = 0;
+      double learnedHoldSec = 0.0;
+      if (headDur != null) {
+        final zDur = headDur!.forward(h)[0]; // raw logit
+        learnedHoldSec = _softplus(zDur);    // >= 0 s
+        const double maxLearnedSec = 2.0;    // cap (tune as needed)
+        final secClamped = learnedHoldSec.clamp(0.0, maxLearnedSec);
+        learnedHoldFrames = (secClamped * 60.0).round();
+      }
+
+      final int combinedHold = (baseHoldFrames + learnedHoldFrames).clamp(1, 120);
+
+      // Smooth to avoid jitter (EMA)
+      const double a = 0.65; // higher → smoother/laggier
+      if (_holdEma <= 0.0) _holdEma = combinedHold.toDouble();
+      _holdEma = a * _holdEma + (1.0 - a) * combinedHold.toDouble();
+      _framesLeft = _holdEma.round();
+
+      _lastReplanProbs = probs;
 
       // === Publish a plan preview for the overlay (if PF available) ===
       try {
@@ -1000,8 +1043,11 @@ class RuntimeTwoStagePolicy {
           probs: probs,
           step: step,
           meta: {
-            'plan_hold': planHold,
-            'hold_mul': holdMul,
+            'plan_hold': planHold,                 // base config
+            'hold_mul': holdMul,                   // dynamic multiplier
+            'hold_frames_base': baseHoldFrames,    // heuristic frames
+            'hold_learned_sec': learnedHoldSec,    // NN predicted seconds (softplus)
+            'hold_frames_combined': _framesLeft,   // final frames after smoothing
             'T': intentTemp,
             'stochastic': stochasticPlanner,
             'padSeenFrac': _padSeenFrac,

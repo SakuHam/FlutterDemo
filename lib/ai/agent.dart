@@ -197,7 +197,7 @@ class FeatureExtractor {
   }
 }
 
-/// Ray-based features: lander scalars + per-ray channels.
+/// Ray-based features (kept from your current file)
 class FeatureExtractorRays {
   final int rayCount;
   final bool kindsOneHot;
@@ -205,9 +205,6 @@ class FeatureExtractorRays {
 
   int get inputSize => 5 + rayCount * (kindsOneHot ? 4 : 1);
 
-// In runtime_policy.dart, inside _RuntimeFE_Rays.extract(...)
-
-  @override
   List<double> extract({
     required et.LanderState lander,
     required et.Terrain terrain,
@@ -220,38 +217,27 @@ class FeatureExtractorRays {
       throw StateError('Runtime FE (rays) requires a rays list. Pass engine.rays.');
     }
 
-    // --- Position / angle / fuel (same as before) ---
-    final px = (lander.pos.x / worldW);
-    final py = (lander.pos.y / worldH);
     final ang = (lander.angle / math.pi).clamp(-2.0, 2.0);
-    final fuel = (lander.fuel / (uiMaxFuel > 0 ? uiMaxFuel : 1.0)).clamp(0.0, 1.0);
 
-    // --- height-normalized vertical speed ---
+    // height-normalized vertical speed
     final gy = terrain.heightAt(lander.pos.x);
     final h  = (gy - lander.pos.y).toDouble().clamp(0.0, 1e9);
-    // smooth cap that grows with height (same family used in controllers)
-    double vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);         // px/s
+    double vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);
     final hnVy  = (lander.vel.y.toDouble() / (vCap > 1e-6 ? vCap : 1.0)).clamp(-3.0, 3.0);
 
-    // --- Polar velocity representation ---
+    // speed
     final vx = lander.vel.x.toDouble();
     final vy = lander.vel.y.toDouble();
     double speed = math.sqrt(vx * vx + vy * vy);
-    // soft clip speed and normalize to ~[0,1]
-    final sClip = 140.0;
+    const sClip = 140.0;
     speed = (speed / sClip).clamp(0.0, 1.5);
 
-    final heading = math.atan2(vy, vx); // [-pi, pi]
-    final sinH = math.sin(heading);
-    final cosH = math.cos(heading);
-
-    // --- Pad vector + alignment (robust to visibility) ---
+    // pad vector (prefer ray-avg)
     final padCx = (terrain.padX1 + terrain.padX2) * 0.5;
     final padCy = terrain.heightAt(padCx);
     double pxToPad = padCx - lander.pos.x;
     double pyToPad = padCy - lander.pos.y;
 
-    // Try rays-averaged pad vector if available (weighted by 1/d)
     double sx = 0.0, sy = 0.0, wsum = 0.0;
     for (final r in rays) {
       if (r.kind != RayHitKind.pad) continue;
@@ -269,51 +255,28 @@ class FeatureExtractorRays {
       padVecValid = true;
     }
 
-    // normalize pad dir
-    double padLen = math.sqrt(pxToPad*pxToPad + pyToPad*pyToPad);
-    double pnx = 0.0, pny = 0.0;
-    if (padLen > 1e-6) { pnx = pxToPad / padLen; pny = pyToPad / padLen; }
+    // unit vectors
+    final vLen = math.max(1e-9, math.sqrt(vx*vx + vy*vy));
+    final vnx = vx / vLen, vny = vy / vLen;
 
-    // velocity dir (if speed very small, keep 0 to avoid NaNs)
-    double vnx = (speed > 1e-6) ? cosH : 0.0;
-    double vny = (speed > 1e-6) ? sinH : 0.0;
+    final pLen = math.max(1e-9, math.sqrt(pxToPad*pxToPad + pyToPad*pyToPad));
+    final pnx = pxToPad / pLen, pny = pyToPad / pLen;
 
     double _angWrap(double a) {
-      // wrap to [-pi, pi]
       const twoPi = math.pi * 2.0;
       a = a % twoPi;
       if (a > math.pi) a -= twoPi;
       if (a < -math.pi) a += twoPi;
       return a;
     }
-
-    // alignment features
-    final cosDelta = vnx * pnx + vny * pny;            // ∈ [-1,1]
-    final sinDelta = vnx * pny - vny * pnx;            // >0: pad is to the left of v̂
-    final angDelta = _angWrap(math.atan2(pny, pnx) - math.atan2(vny, vnx)); // [-pi, pi]
+    final angDelta = _angWrap(math.atan2(pny, pnx) - math.atan2(vny, vnx));
     final angDeltaPi = (angDelta / math.pi).clamp(-1.0, 1.0);
-    final padVis = padVecValid ? 1.0 : 0.0;            // visibility flag
+    final padVis = padVecValid ? 1.0 : 0.0;
 
-    // --- Assemble base features (6 → now 7) ---
-
-    // --- Assemble base features (6 → now 7) ---
     final out = <double>[
-//      px,                      // 0..1
-//      py,                      // 0..1
-      speed,                   // ~0..1.5 clipped
-      hnVy,
-//      sinH,                    // -1..1
-//      cosH,                    // -1..1
-      ang,                     // -2..2
-//      fuel,                    // 0..1
-      // alignment block:
-      angDeltaPi,
-//      cosDelta,                // -1..1
-//      sinDelta,                // -1..1
-      padVis,                  // 0/1
+      speed, hnVy, ang, angDeltaPi, padVis,
     ];
 
-    // --- Rays channels, same as before ---
     final maxD = math.sqrt(worldW * worldW + worldH * worldH);
     final int n = rayCount;
     for (int i = 0; i < n; i++) {
@@ -387,7 +350,7 @@ int predictiveIntentLabelAdaptive(
   final T = env.terrain;
   final cfg = env.cfg;
 
-  // ---- State (world space) ----
+  // ---- State ----
   final px = L.pos.x.toDouble();
   final py = L.pos.y.toDouble();
   final vx = L.vel.x.toDouble();
@@ -398,17 +361,16 @@ int predictiveIntentLabelAdaptive(
   final h  = (gy - py).toDouble().clamp(0.0, 1e9);
   final W  = cfg.worldW.toDouble();
 
-  // ---- Height-adaptive look-ahead (reaction horizon) ----
+  // ---- Height-adaptive horizon ----
   final hNorm = (h / 320.0).clamp(0.0, 1.6);
   final tau   = (baseTauSec * (0.7 + 0.5 * hNorm)).clamp(minTauSec, maxTauSec);
 
-  // ---- Predict short-term future (ignore lateral accel) ----
+  // ---- Predict short-term future ----
   final g   = cfg.t.gravity;
   final xF  = px + vx * tau;
   final vyF = vy + g * tau;
 
-  // ---- Build a to-pad vector (prefer rays, fall back to center) ----
-  // Try rays-averaged pad vector (weighted by 1/d) for robustness.
+  // ---- Pad vector (rays preferred) ----
   double pdx = 0.0, pdy = 0.0; bool padVecValid = false;
   double sx = 0.0, sy = 0.0, wsum = 0.0;
   for (final r in env.rays) {
@@ -425,27 +387,22 @@ int predictiveIntentLabelAdaptive(
     pdx = sx * inv; pdy = sy * inv;
     padVecValid = true;
   } else {
-    // Fallback: use horizontal to the pad center; keep vertical neutral to avoid bias.
     pdx = (padCx - px);
     pdy = 0.0;
-    padVecValid = false;
   }
 
-  // ---- Helper math ----
-  double crossZ(double ax, double ay, double bx, double by) => ax*by - ay*bx; // sign = “B is to the left of A”
+  double crossZ(double ax, double ay, double bx, double by) => ax*by - ay*bx;
   double dot   (double ax, double ay, double bx, double by) => ax*bx + ay*by;
 
-  // Normalize reference only for angle tests (keep raw for dot/cross thresholds):
   final padLen = math.sqrt(pdx*pdx + pdy*pdy);
   final pnx = padLen > 1e-6 ? (pdx / padLen) : 0.0;
   final pny = padLen > 1e-6 ? (pdy / padLen) : 0.0;
 
-  // Future-velocity vector & speed
   final vFx = vx;
   final vFy = vyF;
   final vFmag = math.sqrt(vFx*vFx + vFy*vFy) + 1e-9;
 
-  // ---- Quick vertical safety (emergency brake) ----
+  // Emergency brake-up near pad center
   double _vCapBrakeUp(double hh) => (0.07 * hh + 6.0).clamp(6.0, 16.0);
   final vCapStrong   = _vCapBrakeUp(h);
   final tooLow       = h < 140.0;
@@ -455,7 +412,7 @@ int predictiveIntentLabelAdaptive(
     return intentToIndex(Intent.brakeUp);
   }
 
-  // ---- If centered laterally, manage vertical and lateral braking locally ----
+  // centered laterally → manage locally
   final padEnter = 0.08 * W;
   final dxNow    = px - padCx;
   if (dxNow.abs() <= padEnter) {
@@ -464,50 +421,41 @@ int predictiveIntentLabelAdaptive(
     return intentToIndex(Intent.descendSlow);
   }
 
-  // ---- Will we cross pad center soon? (x sign flip within τ) ----
+  // will cross center within τ?
   final dxF = xF - padCx;
   final crossesCenter = (dxNow * dxF) < 0.0;
-
   if (crossesCenter) {
-    // Prioritize killing lateral speed so we don’t overshoot the pad.
     if (vx >  12.0) return intentToIndex(Intent.brakeRight);
     if (vx < -12.0) return intentToIndex(Intent.brakeLeft);
     return intentToIndex(Intent.descendSlow);
   }
 
-  // ---- Drifting away from pad? (|dx| growing) -> steer toward pad ----
-  final driftingAway = dxF.abs() > dxNow.abs() + 2.0; // small hysteresis
+  // drifting away?
+  final driftingAway = dxF.abs() > dxNow.abs() + 2.0;
   if (driftingAway) {
     return (dxNow > 0.0) ? intentToIndex(Intent.goLeft)
         : intentToIndex(Intent.goRight);
   }
 
-  // ---- If we have a usable pad vector, compare it with future velocity ----
-  // Use signed cross to decide left/right; require meaningful misalignment.
   if (padVecValid) {
-    final cp = crossZ(vFx, vFy, pdx, pdy);   // >0: pad is to the LEFT of vF
+    final cp = crossZ(vFx, vFy, pdx, pdy);   // >0: pad left of vF
     final dp = dot   (vFx, vFy, pdx, pdy);
 
-    // Scale thresholds with speed so decisions are stable across regimes.
-    // “cpThresh” ~ how far off-axis we tolerate; “dpBad” ~ going mostly away.
-    final cpThresh = 0.015 * vFmag * (padLen > 1.0 ? padLen : 1.0); // proportional to |vF| and distance
+    final cpThresh = 0.015 * vFmag * (padLen > 1.0 ? padLen : 1.0);
     final dpBad    = -0.030 * vFmag * (padLen > 1.0 ? padLen : 1.0);
 
     final misaligned = (cp.abs() > cpThresh) || (dp < dpBad);
     if (misaligned) {
-      // If pad lies to the left of our future velocity, yaw/translate LEFT.
       return (cp > 0.0) ? intentToIndex(Intent.goLeft)
           : intentToIndex(Intent.goRight);
     }
   } else {
-    // No reliable pad vector — bias to safety: slow descent if getting fast.
     double _vCapHover(double hh) => (0.06 * hh + 6.0).clamp(6.0, 18.0);
     final vCapHover = _vCapHover(h);
     final needUp    = (vy > vCapHover) || (vyF > 0.85 * vCapHover);
     if (needUp) return intentToIndex(Intent.brakeUp);
   }
 
-  // ---- Boundary guard: if moving outward near lateral boundary, nudge inward ----
   final padExit     = 0.14 * W;
   final willExitSoon = (dxF.abs() > padEnter) && (dxNow.abs() <= padEnter);
   final vxIsOutward  = (dxNow.sign == vx.sign) && vx.abs() > 18.0;
@@ -516,7 +464,6 @@ int predictiveIntentLabelAdaptive(
         : intentToIndex(Intent.goRight);
   }
 
-  // ---- Default: keep a controlled descent ----
   return intentToIndex(Intent.descendSlow);
 }
 
@@ -533,29 +480,25 @@ bool _canStrafe(eng.GameEngine env, {double minH = 110.0, double maxVy = 35.0}) 
   if (h <= minH) return false;
   if (L.vel.y.abs() >= maxVy) return false;
 
-  // NOTE: no angle/tilt constraint here — strafing is allowed at any tilt.
   return true;
 }
 
-// --- helpers: smooth vertical caps + short-term lookahead --------------------
 double _vCapHover(double h)  => (0.06 * h + 6.0).clamp(6.0, 18.0);
 double _vCapDesc(double h)   => (0.10 * h + 8.0).clamp(8.0, 26.0);
 double _vCapBrakeUp(double h)=> (0.07 * h + 6.0).clamp(6.0, 16.0);
 
-/// Predict near-future vertical speed (px/s) after tauReact without thrust.
 double _vyPredictNoThrust(eng.GameEngine env, {double tauReact = 0.35}) {
   final vy = env.lander.vel.y.toDouble();
   final g  = env.cfg.t.gravity;
   return vy + g * tauReact;
 }
 
-/// Should we pre-boost now to avoid exceeding cap soon?
 bool _needPreBoost({
   required double vCap,
   required eng.GameEngine env,
-  double warnFrac = 0.85,      // trigger before cap at 80% of vCap
-  double tauReact = 1.0,       // seconds of look-ahead
-  double extraPad = 2.5,       // px/s extra safety margin
+  double warnFrac = 0.85,
+  double tauReact = 1.0,
+  double extraPad = 2.5,
 }) {
   final vyNow   = env.lander.vel.y.toDouble();
   final vyNext  = _vyPredictNoThrust(env, tauReact: tauReact);
@@ -572,23 +515,18 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
   final vx = L.vel.x.toDouble();
   final vy = L.vel.y.toDouble();
 
-  // Distance to pad center
   final padCx = T.padCenter.toDouble();
   final dx    = (px - padCx);
 
-  // Height-adaptive vertical caps
   double vCapDesc   = (0.11 * h +  9.0).clamp( 9.0, 24.0);
   double vCapHover  = (0.07 * h +  7.0).clamp( 7.0, 18.0);
   double vCapBrake  = (0.07 * h +  6.0).clamp( 6.0, 16.0);
 
-  // Lateral target profile: far → faster, near → slower
-  // |vxt| in [vMin..vMax] scaled by |dx|/W
   final W = env.cfg.worldW.toDouble();
-  final far = (dx.abs() / (0.45 * W)).clamp(0.0, 1.0); // 0 at center, 1 at ~0.45W
+  final far = (dx.abs() / (0.45 * W)).clamp(0.0, 1.0);
   final vMin = 12.0, vMax = 45.0;
-  final vxt = (vMin + (vMax - vMin) * far) * (dx > 0 ? -1.0 : 1.0); // sign points TOWARD pad
+  final vxt = (vMin + (vMax - vMin) * far) * (dx > 0 ? -1.0 : 1.0);
 
-  // Helper: vertical pre-boost check (predict a bit ahead)
   bool needUp(double cap, {double tau = 1.0, double warn = 0.80, double pad = 2.0}) {
     final g = env.cfg.t.gravity;
     final vyNext = vy + g * tau;
@@ -596,27 +534,24 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
     return (vy > warnCap - pad) || (vyNext > warnCap);
   }
 
-  // Prefer world-frame RCS if available; if not, tilt+main
   final tcfg = env.cfg.t as dynamic;
   final rcsEnabled   = (tcfg.rcsEnabled ?? false) == true;
   final rcsBodyFrame = (tcfg.rcsBodyFrame ?? true) == true;
 
-  // Common altitude hold for all intents (slightly relaxed while translating)
   bool altHold({double relax = 1.0}) {
     final cap = math.min(vCapDesc * relax, (0.085 * h + 9.0) * relax);
     return needUp(cap, tau: 1.2, warn: 0.80, pad: 2.0);
   }
 
-  // Build outputs
   bool thr=false, left=false, right=false, sL=false, sR=false, dT=false;
 
   switch (intent) {
     case Intent.brakeUp: {
-      final vCap = _vCapBrakeUp(h); // (0.07*h + 6)..16
-      final needUp = vy > (0.9 * vCap) || _needPreBoost(
+      final vCap = _vCapBrakeUp(h);
+      final needUpNow = vy > (0.9 * vCap) || _needPreBoost(
           vCap: vCap, env: env, warnFrac: 0.75, tauReact: 1.6, extraPad: 4.0);
       return et.ControlInput(
-        thrust: needUp,
+        thrust: needUpNow,
         left: false, right: false,
         sideLeft: false, sideRight: false,
         downThrust: false,
@@ -625,24 +560,19 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
     case Intent.descendSlow: {
       final need = vy > vCapDesc || needUp(vCapDesc, tau: 1.3, warn: 0.80, pad: 2.0);
-      // Optionally push down if too slow and down-thruster exists
       final downEn = ((tcfg.downThrEnabled ?? false) == true);
       dT = downEn && (vy < 0.55 * vCapDesc);
       thr = need;
       break;
     }
 
-    case Intent.brakeLeft: { // want vxt <= 0 (moving right → brake rightward)
-      // Brake rule: if vx > -2, just align; otherwise push right to reduce |vx|
+    case Intent.brakeLeft: {
       final allowTranslate = (h > 90.0 && h < 360.0) && (vy < 42.0);
       if (rcsEnabled && !rcsBodyFrame && allowTranslate) {
-        // world-frame strafing right to reduce leftward drift
-        sL = true; // RCS pushing to the right (your engine: sideLeft => +X if rcsBodyFrame=false)
+        sL = true;
         thr = altHold(relax: 1.08);
       } else {
-        // tilt left or right as needed; while braking, tilt opposite vx
         final wantTiltRight = (vx < -3.0);
-        left  = false;
         right = wantTiltRight;
         thr = altHold(relax: wantTiltRight ? 1.10 : 1.0);
       }
@@ -652,12 +582,11 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
     case Intent.brakeRight: {
       final allowTranslate = (h > 90.0 && h < 360.0) && (vy < 42.0);
       if (rcsEnabled && !rcsBodyFrame && allowTranslate) {
-        sR = true; // push left
+        sR = true;
         thr = altHold(relax: 1.08);
       } else {
         final wantTiltLeft = (vx > 3.0);
         left  = wantTiltLeft;
-        right = false;
         thr = altHold(relax: wantTiltLeft ? 1.10 : 1.0);
       }
       break;
@@ -665,14 +594,11 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
     case Intent.goLeft: {
       final allowTranslate = (h > 90.0 && h < 360.0) && (vy < 42.0);
-      // Track the target vxt (negative) — aggressively if far
-      final err = vx - vxt;
       final strong = far > 0.4 || dx.abs() > 0.18 * W;
       if (rcsEnabled && !rcsBodyFrame && allowTranslate) {
-        sR = true; // push left
+        sR = true;
         thr = altHold(relax: strong ? 1.12 : 1.06);
       } else {
-        // no RCS: lean left and keep thrust on to keep altitude while sliding
         left = true;
         thr  = altHold(relax: strong ? 1.12 : 1.06);
       }
@@ -681,10 +607,9 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
 
     case Intent.goRight: {
       final allowTranslate = (h > 90.0 && h < 360.0) && (vy < 42.0);
-      final err = vx - vxt;
       final strong = far > 0.4 || dx.abs() > 0.18 * W;
       if (rcsEnabled && !rcsBodyFrame && allowTranslate) {
-        sL = true; // push right
+        sL = true;
         thr = altHold(relax: strong ? 1.12 : 1.06);
       } else {
         right = true;
@@ -706,9 +631,60 @@ et.ControlInput controllerForIntent(Intent intent, eng.GameEngine env) {
     downThrust: dT,
   );
 }
+
 /* -------------------------------------------------------------------------- */
 /*                               POLICY NETWORK                                */
 /* -------------------------------------------------------------------------- */
+
+// === DURATION HEAD: tiny local linear so we don't touch nn_helper.dart ===
+class _Lin {
+  List<List<double>> W;
+  List<double> b;
+  _Lin(int outDim, int inDim, int seed)
+      : W = List.generate(outDim, (_) {
+    final r = math.Random(seed ^= 0x9E3779B9);
+    // Kaiming-ish small init
+    final s = 1.0 / math.sqrt(inDim.toDouble());
+    return List<double>.generate(inDim, (_) => (r.nextDouble()*2-1) * 0.05 * s);
+  }),
+        b = List<double>.filled(outDim, 0.0);
+
+  List<double> forward(List<double> x) {
+    final z = List<double>.filled(b.length, 0.0);
+    for (int i = 0; i < W.length; i++) {
+      double s = b[i];
+      final Wi = W[i];
+      for (int j = 0; j < Wi.length; j++) s += Wi[j] * x[j];
+      z[i] = s;
+    }
+    return z;
+  }
+
+  // dOut: gradient wrt output logits (same shape as b)
+  List<double> backward({
+    required List<double> x,
+    required List<double> dOut,
+    required List<List<double>> gW,
+    required List<double> gb,
+  }) {
+    assert(dOut.length == b.length && gW.length == W.length);
+    // accumulate grads
+    for (int i = 0; i < W.length; i++) {
+      gb[i] += dOut[i];
+      for (int j = 0; j < W[0].length; j++) {
+        gW[i][j] += dOut[i] * x[j];
+      }
+    }
+    // return grad wrt input
+    final dIn = List<double>.filled(W[0].length, 0.0);
+    for (int j = 0; j < W[0].length; j++) {
+      double s = 0.0;
+      for (int i = 0; i < W.length; i++) s += dOut[i] * W[i][j];
+      s; dIn[j] = s;
+    }
+    return dIn;
+  }
+}
 
 class ForwardCache {
   final List<double> x;
@@ -719,6 +695,10 @@ class ForwardCache {
   final double thrLogit;
   final double thrProb;
   final double v; // value head
+  // === DURATION HEAD (cache) ===
+  final double durLogit;
+  final double durFrames;
+
   ForwardCache({
     required this.x,
     required this.acts,
@@ -728,6 +708,8 @@ class ForwardCache {
     required this.thrLogit,
     required this.thrProb,
     required this.v,
+    required this.durLogit,
+    required this.durFrames,
   });
 }
 
@@ -739,12 +721,15 @@ class PolicyNetwork {
   final nn.MLPTrunk trunk;
   final nn.PolicyHeads heads;
 
+  // === DURATION HEAD ===
+  late final _Lin durHead;
+
   // ---- Consolidation (L2-SP) anti-forgetting ----
   bool consolidateEnabled = false;
-  double consolidateTrunk = 0.0;   // e.g. 1e-3
-  double consolidateHeads = 0.0;   // e.g. 5e-4
+  double consolidateTrunk = 0.0;
+  double consolidateHeads = 0.0;
 
-  // Snapshots (previous-stage weights)
+  // Snapshots
   List<List<List<double>>>? _snapWTrunk;
   List<List<double>>? _snapBTrunk;
 
@@ -757,8 +742,6 @@ class PolicyNetwork {
   List<List<double>>? _snapWThr;
   List<double>? _snapBThr;
 
-  /// Reward-modulated Hebbian tick.
-  /// dW_ij = eta * mod * ( post_i * pre_j  - (useOja ? post_i^2 * W_ij : decay * W_ij) )
   void hebbianTick({
     required HebbianConfig cfg,
     required List<List<double>> preActs,
@@ -770,7 +753,6 @@ class PolicyNetwork {
 
     int li = 0;
 
-    // Trunk
     for (final layer in trunk.layers) {
       if (cfg.trunk) {
         final pre = preActs[li];
@@ -780,7 +762,6 @@ class PolicyNetwork {
       li++;
     }
 
-    // Heads (order matches forwardWithActs appends)
     if (cfg.headIntent) {
       _hebbLayerUpdate(heads.intent.W, cfg, preActs[li], postActs[li], mod);
     }
@@ -816,7 +797,7 @@ class PolicyNetwork {
     for (int i = 0; i < W.length; i++) {
       final Wi = W[i];
       final pi = post[i];
-      final stabFactor = cfg.useOja ? (pi * pi) : decay; // Oja vs decay
+      final stabFactor = cfg.useOja ? (pi * pi) : decay;
       for (int j = 0; j < Wi.length; j++) {
         final hebb = pi * pre[j];
         final stab = stabFactor * Wi[j];
@@ -836,22 +817,24 @@ class PolicyNetwork {
           inputSize: inputSize,
           hiddenSizes: hidden,
           seed: seed ^ 0x7777,
-          activation: nn.Activation.silu, // robust under noise
-          trainNoiseStd: 0.02,            // small Gaussian noise on z (train only)
-          dropoutProb: 0.10,              // 10% dropout on a (train only)
-          trainMode: false,               // will be toggled per episode
+          activation: nn.Activation.silu,
+          trainNoiseStd: 0.02,
+          dropoutProb: 0.10,
+          trainMode: false,
         ),
         heads  = nn.PolicyHeads(
           hidden.isEmpty ? inputSize : hidden.last,
           intents: kIntents,
           seed: seed ^ 0x8888,
         ) {
-    assert(heads.intent.b.length == kIntents, 'intent head outDim mismatch');
-    assert(heads.intent.W.length == kIntents, 'intent head rows mismatch');
+    assert(heads.intent.b.length == kIntents);
+    assert(heads.intent.W.length == kIntents);
+    // === DURATION HEAD init (1 x H) ===
+    final H = hidden.isEmpty ? inputSize : hidden.last;
+    durHead = _Lin(1, H, seed ^ 0xDAA7);
   }
 
   void captureConsolidationAnchor() {
-    // trunk
     _snapWTrunk = [
       for (final L in trunk.layers)
         [ for (final row in L.W) List<double>.from(row) ]
@@ -859,7 +842,7 @@ class PolicyNetwork {
     _snapBTrunk = [
       for (final L in trunk.layers) List<double>.from(L.b)
     ];
-    // heads
+
     _snapWIntent = [ for (final row in heads.intent.W) List<double>.from(row) ];
     _snapBIntent = List<double>.from(heads.intent.b);
 
@@ -882,6 +865,12 @@ class PolicyNetwork {
     final thrProb      = nn.Ops.sigmoid(thrLogit);
     final v            = heads.val.forward(h)[0];
 
+    // === DURATION HEAD forward ===
+    final dLog         = durHead.forward(h)[0];
+    // softplus → positive frames, then clamp to a safe band
+    double dFrames     = nn.Ops.softplus(dLog);
+    dFrames            = dFrames.clamp(1.0, 24.0);
+
     return ForwardCache(
       x: List<double>.from(x),
       acts: acts,
@@ -891,20 +880,17 @@ class PolicyNetwork {
       thrLogit: thrLogit,
       thrProb: thrProb,
       v: v,
+      durLogit: dLog,
+      durFrames: dFrames,
     );
   }
 
-  /// Forward that also returns layer-wise inputs/outputs for Hebbian.
-  /// Layer indexing:
-  ///   0..trunk.layers.length-1  -> trunk layers (pre=input of layer, post=activation)
-  ///   then heads in order: intent, turn, thr, val (post = raw logits/value)
   (List<double> intentLogits, List<double> turnLogits, double thrLogit, double valScalar,
   List<List<double>> preActs, List<List<double>> postActs)
   forwardWithActs(List<double> x) {
     final preActs = <List<double>>[];
     final postActs = <List<double>>[];
 
-    // Trunk
     List<double> h = x;
     for (final layer in trunk.layers) {
       final pre = List<double>.from(h);
@@ -921,7 +907,6 @@ class PolicyNetwork {
       h = a;
     }
 
-    // Heads: linear logits/value
     List<double> _head(List<List<double>> W, List<double> b, List<double> inp) {
       final z = List<double>.filled(b.length, 0.0);
       for (int i = 0; i < W.length; i++) {
@@ -951,10 +936,14 @@ class PolicyNetwork {
     final valScalar = _head(heads.val.W, heads.val.b, h)[0];
     postActs.add([valScalar]);
 
+    // (optional) could also add duration to postActs if you want Hebbian on it:
+    // preActs.add(headPre);
+    // final dLog = durHead.forward(h)[0];
+    // postActs.add([dLog]);
+
     return (intentLogits, turnLogits, thrLogit, valScalar, preActs, postActs);
   }
 
-  /// New: return intent probs *and* logits for temperature/bias sampling.
   (int, List<double>, List<double>, ForwardCache) actIntent(List<double> x) {
     final c = _forwardFull(x);
     int arg = 0;
@@ -965,7 +954,6 @@ class PolicyNetwork {
     return (arg, c.intentProbs, c.intentLogits, c);
   }
 
-  /// Back-compat: greedy intent + probs (cache still has logits if needed).
   (int, List<double>, ForwardCache) actIntentGreedy(List<double> x) {
     final c = _forwardFull(x);
     int arg = 0;
@@ -991,34 +979,29 @@ class PolicyNetwork {
   }
 
   void updateFromEpisode({
-    required List<ForwardCache> decisionCaches,     // for intent head
-    required List<int> intentChoices,              // chosen intents
-    required List<double> decisionReturns,         // advantages (signed)
-    required List<int> alignLabels,                // teacher labels for intent
-    required double alignWeight,                   // CE supervision
-    required double intentPgWeight,                // PG on intent
+    required List<ForwardCache> decisionCaches,     // intent head
+    required List<int> intentChoices,
+    required List<double> decisionReturns,
+    required List<int> alignLabels,
+    required double alignWeight,
+    required double intentPgWeight,
     required double lr,
     required double entropyBeta,
     required double valueBeta,
     required double huberDelta,
     required bool intentMode,
 
-    List<ForwardCache>? actionCaches,              // action supervision (turn/thr)
+    List<ForwardCache>? actionCaches,
     List<int>? actionTurnTargets,
     List<bool>? actionThrustTargets,
     double actionAlignWeight = 0.0,
+
+    // === DURATION HEAD (training) ===
+    List<ForwardCache>? durationCaches,
+    List<double>? durationTargets,
+    double durationAlignWeight = 0.0,
   }) {
     final int H = trunk.layers.isEmpty ? inputSize : trunk.layers.last.b.length;
-    assert(heads.intent.b.length > 0 && heads.intent.W.isNotEmpty,
-    'intent head not initialized');
-    assert(heads.turn.b.length == 3 && heads.turn.W.length == 3,
-    'turn head must have 3 logits');
-    assert(heads.thr.b.length == 1 && heads.thr.W.length == 1,
-    'thrust head must have 1 logit');
-    assert(heads.intent.W[0].length == H &&
-        heads.turn.W[0].length   == H &&
-        heads.thr.W[0].length    == H,
-    'head input dims must match trunk output');
 
     double _clipGrad(double g, [double c = 1.0]) {
       if (!g.isFinite) return 0.0;
@@ -1049,6 +1032,10 @@ class PolicyNetwork {
             (_) => List<double>.filled(heads.thr.W[0].length, 0.0));
     final gb_thr = List<double>.filled(heads.thr.b.length, 0.0);
 
+    // === DURATION HEAD grads ===
+    final gW_dur = [ List<double>.filled(H, 0.0) ];
+    final gb_dur = [ 0.0 ];
+
     // ----- Intent CE (optional) -----
     if (intentMode && alignWeight > 0 && decisionCaches.isNotEmpty) {
       final N = decisionCaches.length;
@@ -1056,17 +1043,14 @@ class PolicyNetwork {
         final c = decisionCaches[n];
         final h = c.acts.last;
         final y = alignLabels[n].clamp(0, PolicyNetwork.kIntents - 1);
-        final dLog = nn.Ops.crossEntropyGrad(c.intentProbs, y); // (p - y)
-        // Entropy grad wrt logits: add small β * p to push toward uniform.
+        final dLog = nn.Ops.crossEntropyGrad(c.intentProbs, y);
         if (entropyBeta > 0) {
           for (int i = 0; i < dLog.length; i++) {
             dLog[i] += entropyBeta * c.intentProbs[i];
           }
         }
         final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
-        trunk.backwardFromTopGrad(
-          dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x,
-        );
+        trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x);
       }
       final scale = lr * alignWeight / N;
       for (int i = 0; i < heads.intent.b.length; i++) {
@@ -1075,7 +1059,7 @@ class PolicyNetwork {
           heads.intent.W[i][j] -= _clipGrad(scale * gW_int[i][j]);
         }
       }
-      // zero CE accumulators so PG doesn't double-apply trunk grads
+      // zero accumulators to avoid double-applying trunk grads
       for (int i = 0; i < gb_int.length; i++) gb_int[i] = 0.0;
       for (int i = 0; i < gW_int.length; i++) {
         for (int j = 0; j < gW_int[0].length; j++) gW_int[i][j] = 0.0;
@@ -1088,24 +1072,21 @@ class PolicyNetwork {
       }
     }
 
-    // ----- Intent PG (REINFORCE with advantage) -----
+    // ----- Intent PG -----
     if (intentPgWeight > 0 && decisionCaches.isNotEmpty) {
       final N = decisionCaches.length;
       for (int n = 0; n < N; n++) {
         final c = decisionCaches[n];
         final h = c.acts.last;
         final chosen = intentChoices[n].clamp(0, PolicyNetwork.kIntents - 1);
-        final adv = decisionReturns[n]; // signed advantage
+        final adv = decisionReturns[n];
         final dLog = List<double>.generate(
           c.intentProbs.length,
               (i) => (c.intentProbs[i] - (i == chosen ? 1.0 : 0.0)) * (-adv),
         );
         final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
-        trunk.backwardFromTopGrad(
-          dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x,
-        );
+        trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x);
       }
-
       final scale = lr * intentPgWeight / decisionCaches.length;
       for (int i = 0; i < heads.intent.b.length; i++) {
         heads.intent.b[i] -= _clipGrad(scale * gb_int[i]);
@@ -1140,14 +1121,12 @@ class PolicyNetwork {
         teacherThrRate += yb;
 
         final dH_turn = heads.turn.backward(x: h, dOut: dTurn, gW: gW_turn, gb: gb_turn);
-        final dH_thr  = heads.thr.backward (x: h, dOut: [dThr], gW: gW_thr , gb: gb_thr );
+        final dH_thr  = heads.thr .backward(x: h, dOut: [dThr], gW: gW_thr , gb: gb_thr );
 
         final dH = List<double>.filled(h.length, 0.0);
         for (int i = 0; i < h.length; i++) dH[i] = dH_turn[i] + dH_thr[i];
 
-        trunk.backwardFromTopGrad(
-          dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x,
-        );
+        trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x);
 
         meanThrLogit += c.thrLogit;
       }
@@ -1164,7 +1143,6 @@ class PolicyNetwork {
         heads.thr.W[0][j] -= _clipGrad(scale * gW_thr[0][j]);
       }
 
-      // quick thrust bias calibration
       meanThrLogit /= actionCaches.length;
       teacherThrRate /= actionCaches.length;
       final logitTarget = nn.Ops.logit(teacherThrRate);
@@ -1172,9 +1150,49 @@ class PolicyNetwork {
       heads.thr.b[0] += (logitTarget - meanThrLogit) * calibStep;
     }
 
+    // ----- Duration head supervision (optional) -----
+    final hasDur = durationAlignWeight > 0.0 &&
+        durationCaches != null &&
+        durationTargets != null &&
+        durationCaches.isNotEmpty;
+
+    if (hasDur) {
+      final N = durationCaches!.length;
+      for (int n = 0; n < N; n++) {
+        final c = durationCaches[n];
+        final h = c.acts.last;
+        final y = durationTargets[n].clamp(1.0, 24.0);
+
+        final z = c.durLogit;
+        final yhat = nn.Ops.softplus(z);
+        // log-MSE loss: 0.5 (log yhat - log y)^2
+        final eps = 1e-6;
+        final logDiff = (math.log(yhat + eps) - math.log(y + eps));
+        final sig = nn.Ops.sigmoid(z); // d softplus = sigmoid
+        final dZ = logDiff * (sig / (yhat + eps)); // dL/dz (scalar)
+
+        final dH = durHead.backward(
+          x: h,
+          dOut: [dZ],
+          gW: gW_dur,
+          gb: gb_dur,
+        );
+
+        trunk.backwardFromTopGrad(
+          dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x,
+        );
+      }
+
+      final scale = lr * durationAlignWeight / durationCaches.length;
+      // apply dur head grads
+      durHead.b[0] -= _clipGrad(scale * gb_dur[0]);
+      for (int j = 0; j < durHead.W[0].length; j++) {
+        durHead.W[0][j] -= _clipGrad(scale * gW_dur[0][j]);
+      }
+    }
+
     // ===================== L2-SP consolidation (optional) =====================
     if (consolidateEnabled) {
-      // Trunk penalty: add dL/dW += λ (W - W0), dL/db += λ (b - b0)
       if (consolidateTrunk > 0.0 && _snapWTrunk != null && _snapBTrunk != null) {
         for (int li = 0; li < trunk.layers.length; li++) {
           final L = trunk.layers[li];
@@ -1188,7 +1206,6 @@ class PolicyNetwork {
           }
         }
       }
-      // Heads penalty (usually smaller λ)
       if (consolidateHeads > 0.0) {
         if (_snapWIntent != null && _snapBIntent != null) {
           for (int i = 0; i < heads.intent.W.length; i++) {
@@ -1214,9 +1231,9 @@ class PolicyNetwork {
         }
       }
     }
-    // =================== end consolidation (optional) ========================
+    // =================== end consolidation ========================
 
-    // ----- Apply trunk update (shared grads) -----
+    // ----- Apply trunk update -----
     final trunkScale = lr;
     for (int li = 0; li < trunk.layers.length; li++) {
       final L = trunk.layers[li];
@@ -1240,7 +1257,7 @@ class EpisodeResult {
   final int steps;
   final double totalCost;
   final bool landed;
-  final double segMean; // here: mean PF reward (for logging/gating)
+  final double segMean; // mean PF reward (for logging/gating)
   EpisodeResult({
     required this.steps,
     required this.totalCost,
@@ -1249,7 +1266,6 @@ class EpisodeResult {
   });
 }
 
-// external dense reward hook (potential-field reward; velocity-only)
 typedef ExternalRewardHook = double Function({
 required eng.GameEngine env,
 required double dt,
@@ -1263,7 +1279,6 @@ class _Ema {
 }
 
 double _entropyFromLogits(List<double> logits) {
-  // softmax -> probs in a numerically stable way
   final maxZ = logits.reduce((a,b) => a > b ? a : b);
   var sum = 0.0;
   final exps = List<double>.filled(logits.length, 0.0);
@@ -1284,7 +1299,7 @@ class Trainer {
   final double gamma;
   final int seed;
   final bool twoStage;
-  final int planHold;
+  final int planHold;               // kept for back-compat; not used directly now
   final double tempIntent;
   final double intentEntropyBeta;
   final bool useLearnedController;
@@ -1299,7 +1314,7 @@ class Trainer {
   final bool gateOnlyLanded;
   final bool gateVerbose;
 
-  // probabilistic gate knobs (NEW)
+  // probabilistic gate knobs
   final bool gateProbEnabled;
   final double gateProbK;
   final double gateProbMin;
@@ -1307,13 +1322,13 @@ class Trainer {
   final double gateProbLandedBoost;
   final double gateProbNearPadBoost;
 
-  // accept near-pad crashes (configurable)
+  // accept near-pad crashes
   final bool gateAcceptNearPadCrashes;
   final double gatePadFrac;
   final double gatePadHeight;
   final double gateMaxImpactSpeed;
 
-  // align teacher label polarity with pad rays
+  // training-time polarity alignment
   final bool alignPolarityWithPadRays;
 
   final RunningNorm? norm;
@@ -1324,18 +1339,23 @@ class Trainer {
   int _pwmCount = 0;
   int _pwmOn = 0;
 
-  // external per-step reward hook (PF)
   final ExternalRewardHook? externalRewardHook;
 
-  // Hebbian plasticity config + guards
+  // Hebbian + guards
   final HebbianConfig hebbian;
-  final double hebbModGain;        // scales centered reward
-  final double hebbModAbsClip;     // absolute clip for modulation
-  final double minIntentEntropy;   // skip head Hebbian below this
-  final int maxSameIntentRun;      // skip head Hebbian if repeating too long
+  final double hebbModGain;
+  final double hebbModAbsClip;
+  final double minIntentEntropy;
+  final int maxSameIntentRun;
   final _Ema _modEma = _Ema(a: 0.98);
   int _sameIntentRun = 0;
   int _lastIntent = -1;
+
+  // === DURATION blending knobs ===
+  final double durationMinHold;     // frames clamp min
+  final double durationMaxHold;     // frames clamp max
+  final double durationBlend;       // 1.0 model only; 0.0 teacher only
+  final double durationTeacherBias; // additive bias for teacher (frames)
 
   Trainer({
     required this.env,
@@ -1359,7 +1379,6 @@ class Trainer {
     this.gateOnlyLanded = false,
     this.gateVerbose = true,
 
-    // probabilistic gate defaults (enabled by default -> set false to get hard gate)
     this.gateProbEnabled = true,
     this.gateProbK = 8.0,
     this.gateProbMin = 0.05,
@@ -1367,34 +1386,34 @@ class Trainer {
     this.gateProbLandedBoost = 0.15,
     this.gateProbNearPadBoost = 0.10,
 
-    // near-pad crash acceptance
     this.gateAcceptNearPadCrashes = false,
     this.gatePadFrac = 0.12,
     this.gatePadHeight = 160.0,
     this.gateMaxImpactSpeed = 60.0,
 
-    // training-time polarity alignment
     this.alignPolarityWithPadRays = true,
 
     this.externalRewardHook,
 
-    // Hebbian + guards
     HebbianConfig? hebbian,
     this.hebbModGain = 0.6,
     this.hebbModAbsClip = 1.5,
-    this.minIntentEntropy = 0.5, // nats
-    this.maxSameIntentRun = 48,  // ~0.8s @60Hz
+    this.minIntentEntropy = 0.5,
+    this.maxSameIntentRun = 48,
+
+    // Duration defaults
+    this.durationMinHold = 1.0,
+    this.durationMaxHold = 24.0,
+    this.durationBlend   = 0.7,   // lean toward model
+    this.durationTeacherBias = 0.0,
   }) : hebbian = hebbian ?? const HebbianConfig(),
         norm = RunningNorm(fe.inputSize, momentum: 0.995);
 
-  // New: sample from raw logits with temperature (numerically stable).
   int _sampleFromLogits(List<double> logits, math.Random r, double temp) {
     final T = temp.clamp(1e-6, 10.0);
-    // scale logits by 1/T
     final z = List<double>.from(logits);
     for (int i = 0; i < z.length; i++) z[i] /= T;
 
-    // stable softmax sampling via cumulative exp
     final maxZ = z.reduce((a, b) => a > b ? a : b);
     double sum = 0.0;
     final exps = List<double>.filled(z.length, 0.0);
@@ -1409,7 +1428,6 @@ class Trainer {
     return exps.length - 1;
   }
 
-  // (kept for back-compat in case you want to use it elsewhere)
   int _sampleCategorical(List<double> probs, math.Random r, double temp) {
     if (temp <= 1e-6) {
       int arg = 0; double best = probs[0];
@@ -1431,16 +1449,15 @@ class Trainer {
   EpisodeResult runEpisode({
     required bool train,
     required bool greedy,
-    required bool scoreIsReward,   // kept for API compat; unused
+    required bool scoreIsReward,
     double lr = 3e-4,
     double valueBeta = 0.5,
     double huberDelta = 1.0,
   }) {
-    // Toggle trunk noise/dropout depending on train/eval
     policy.trunk.trainMode = train;
 
     final r = math.Random(seed ^ (_epCounter++));
-    final decisionRewards = <double>[];  // per-decision reward (PF only)
+    final decisionRewards = <double>[];
 
     final actionCaches = <ForwardCache>[];
     final actionTurnTargets = <int>[];
@@ -1451,16 +1468,19 @@ class Trainer {
     final decisionReturns = <double>[];
     final alignLabels = <int>[];
 
+    // === duration training buffers ===
+    final durationCaches = <ForwardCache>[];
+    final durationTargets = <double>[];
+
     env.reset(seed: r.nextInt(1 << 30));
     double totalCost = 0.0;
 
-    // PF logging
     double segSum = 0.0;
     int segCount = 0;
 
     _pwmA = 0.0; _pwmCount = 0; _pwmOn = 0;
-    int _thrustLatch = 0;           // frames remaining to force thrust=ON
-    int _thrustLatchBoost = 8;      // ~0.13s @60Hz; tune 6..14 if you like
+    int _thrustLatch = 0;
+    int _thrustLatchBoost = 8;
 
     int framesLeft = 0;
     int currentIntentIdx = 0;
@@ -1468,7 +1488,6 @@ class Trainer {
     int steps = 0;
     bool landed = false;
 
-    // accumulate PF reward until next decision boundary
     double pfAcc = 0.0;
 
     while (true) {
@@ -1478,7 +1497,6 @@ class Trainer {
           env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35,
         );
 
-        // flip teacher left/right if pad-ray polarity disagrees
         if (alignPolarityWithPadRays) {
           final L = env.lander;
           final rays = env.rays;
@@ -1500,16 +1518,10 @@ class Trainer {
           x = norm?.normalize(x, update: false) ?? x;
         }
 
-        // <<< CHANGED: use logits-aware forward for sampling >>>
         final (idxGreedy, probs, logits, cache) = policy.actIntent(x);
-
-        final idx = greedy
-            ? idxGreedy
-            : _sampleFromLogits(logits, r, tempIntent);
-
+        final idx = greedy ? idxGreedy : _sampleFromLogits(logits, r, tempIntent);
         currentIntentIdx = idx;
 
-        // repetition tracking for lock guard
         if (_lastIntent == currentIntentIdx) {
           _sameIntentRun++;
         } else {
@@ -1518,7 +1530,6 @@ class Trainer {
         }
 
         if (train) {
-          // PF-only: push the accumulated PF reward for the last window
           decisionCaches.add(cache);
           intentChoices.add(idx);
           alignLabels.add(yTeacher);
@@ -1526,36 +1537,26 @@ class Trainer {
           pfAcc = 0.0;
         }
 
-        // compute discounted returns (advantages)
         if (train && decisionCaches.isNotEmpty) {
           final T = decisionRewards.length;
-          if (T != decisionCaches.length ||
-              T != intentChoices.length ||
-              T != alignLabels.length) {
-            throw StateError('length mismatch in decision arrays');
-          }
-
           final tmp = List<double>.filled(T, 0.0);
           double G = 0.0;
           for (int i = T - 1; i >= 0; i--) {
             G = decisionRewards[i] + gamma * G;
             tmp[i] = G;
           }
-
           double mean = 0.0;
           for (final v in tmp) mean += v;
           mean /= T;
-
           double var0 = 0.0;
           for (final v in tmp) { final d = v - mean; var0 += d * d; }
           var0 = (var0 / T).clamp(1e-9, double.infinity);
           final std = math.sqrt(var0);
-
           decisionReturns.clear();
           for (final v in tmp) decisionReturns.add((v - mean) / std);
         }
 
-        // adaptive plan hold
+        // --- teacher dyn hold (simple heuristic for label) ---
         final padCx = env.terrain.padCenter.toDouble();
         final dxAbs = (env.lander.pos.x.toDouble() - padCx).abs();
         final vxAbs = env.lander.vel.x.toDouble().abs();
@@ -1566,7 +1567,22 @@ class Trainer {
         int dynHold = 1;
         if (dxAbs > 0.12 * W || vxAbs > 60.0) dynHold = 1;
         if (dynHold == 1 && h > 320.0 && dxAbs < 0.04 * W && vxAbs < 25.0) dynHold = 2;
-        framesLeft = dynHold;
+
+        // --- model prediction ---
+        double predHold = cache.durFrames.clamp(durationMinHold, durationMaxHold);
+
+        // optional label bias
+        final teacherHold = (dynHold + durationTeacherBias).clamp(durationMinHold, durationMaxHold);
+
+        // blend model & teacher
+        final useHold = (durationBlend * predHold) + ((1.0 - durationBlend) * teacherHold);
+        framesLeft = useHold.round().clamp(1, 120);
+
+        // stash duration training data
+        if (train) {
+          durationCaches.add(cache);
+          durationTargets.add(teacherHold);
+        }
       }
 
       final intent = indexToIntent(currentIntentIdx);
@@ -1575,9 +1591,7 @@ class Trainer {
       var xAct = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
       xAct = norm?.normalize(xAct, update: false) ?? xAct;
 
-      // Hebbian-aware forward (for activations)
       final fw = policy.forwardWithActs(xAct);
-      // Also keep greedy path for caches/UI:
       final (thBool, lf, rt, probs, cAct) = policy.actGreedy(xAct);
 
       final groundY = env.terrain.heightAt(env.lander.pos.x);
@@ -1587,26 +1601,20 @@ class Trainer {
       final pThrTeacher = uTeacher.thrust ? 1.0 : 0.0;
       double pThrExec   = blendPolicy * pThrModel + (1.0 - blendPolicy) * pThrTeacher;
 
-// --- When "go up" is requested, latch thrust ON for a few frames ---
-// (also trigger near ground if falling too fast)
       final vCapUp  = _vCapBrakeUp(height);
       final needEmergencyUp = (height < 220.0) && (env.lander.vel.y > 0.9 * vCapUp);
 
-// If teacher wants thrust or we're near-ground & hot, (re)arm the latch.
       if (pThrTeacher >= 0.5 || needEmergencyUp) {
         _thrustLatch = math.max(_thrustLatch, _thrustLatchBoost);
       }
 
-// Slight bias upward when low & teacher is pushing up, so the duty builds quicker.
       if (height < 180.0 && pThrTeacher >= 0.5) {
         pThrExec = math.max(pThrExec, 0.75);
       }
 
-// --- Proper accumulator PWM: at most one ON per frame, no while-loop losses ---
       _pwmA += pThrExec;
       bool thrustPWM = false;
 
-// Latch has priority: keep thrust hard-ON for its duration
       if (_thrustLatch > 0) {
         thrustPWM = true;
         _thrustLatch--;
@@ -1615,38 +1623,31 @@ class Trainer {
         _pwmA -= 1.0;
       }
 
-// Final safety: if we're very low, give a nudge even if accumulator hasn't filled yet.
       if (!thrustPWM && height < 90.0 && pThrExec > 0.55) {
         thrustPWM = true;
-        // do a gentle partial drain so we don't drift upward forever
         _pwmA = math.max(0.0, _pwmA - 0.5);
       }
 
       final execThrust = thrustPWM;
       final execLeft   = useLearnedController ? lf : uTeacher.left;
       final execRight  = useLearnedController ? rt : uTeacher.right;
-
-      // pass teacher’s strafing & down-thrust to the environment
       final execSideLeft  = uTeacher.sideLeft;
       final execSideRight = uTeacher.sideRight;
       final execDown      = uTeacher.downThrust;
 
-      // ----- PF-only reward accumulation / modulation -----
       final r_pf = externalRewardHook?.call(env: env, dt: dt, tStep: steps) ?? 0.0;
       pfAcc += r_pf;
-      segSum += r_pf; // for logging/gating
+      segSum += r_pf;
       segCount++;
 
-      // --- Reward-modulated Hebbian tick (centered, clipped, guarded) ---
       if (train && hebbian.enabled) {
-        // Center & scale the reward, then hard-clip
         final centered = r_pf - _modEma.update(r_pf);
         double mod = centered * hebbModGain;
         if (mod >  hebbModAbsClip) mod =  hebbModAbsClip;
         if (mod < -hebbModAbsClip) mod = -hebbModAbsClip;
 
         if (mod != 0.0) {
-          final intentEntropy = _entropyFromLogits(fw.$1); // fw.$1 = intentLogits
+          final intentEntropy = _entropyFromLogits(fw.$1);
           final skipHeadsForLock = (_sameIntentRun >= maxSameIntentRun) || (intentEntropy < minIntentEntropy);
 
           final cfg = skipHeadsForLock
@@ -1667,8 +1668,8 @@ class Trainer {
 
           policy.hebbianTick(
             cfg: cfg,
-            preActs: fw.$5,   // pre
-            postActs: fw.$6,  // post
+            preActs: fw.$5,
+            postActs: fw.$6,
             mod: mod,
           );
         }
@@ -1699,7 +1700,6 @@ class Trainer {
       if (info.terminal) {
         landed = env.status == et.GameStatus.landed;
 
-        // push any remaining PF reward into the final decision window
         if (train && decisionRewards.isNotEmpty && pfAcc.abs() > 0) {
           decisionRewards[decisionRewards.length - 1] += pfAcc;
           pfAcc = 0.0;
@@ -1711,7 +1711,7 @@ class Trainer {
 
     final segMean = (segCount > 0) ? (segSum / segCount) : 0.0;
 
-    // ---- GATED UPDATE + LOGGING ----
+    // ---- Probabilistic gating (same as your current strict version) ----
     bool nearPadCrashOK = false;
     if (!landed && env.status == et.GameStatus.crashed && gateAcceptNearPadCrashes) {
       final L = env.lander;
@@ -1727,10 +1727,8 @@ class Trainer {
               (speed <= gateMaxImpactSpeed);
     }
 
-    // Probabilistic gate (with hard-landed constraint if requested)
     bool accept;
-    double sampledP = 1.0; // for logging
-// ===== STRICT, ADAPTIVE STOCHASTIC GATE (z-score; uses *previous* EMA) =====
+    double sampledP = 1.0;
 
     double _gMu = 0.0, _gVar = 1.0;
     bool _gInit = false;
@@ -1745,43 +1743,22 @@ class Trainer {
       _gVar = _gateEma * _gVar + (1 - _gateEma) * (dx * dx2);
     }
 
-// 1) Freeze stats BEFORE decision
     final double mu0  = _gMu;
     final double var0 = _gVar;
     final bool inited = _gInit;
 
     final double sig0 = math.sqrt((inited && var0 > 1e-8) ? var0 : 1.0);
-// dynamic bar: baseline vs EMA+margin
     final double dynThr = math.max(gateScoreMin, (inited ? (mu0 + 0.10) : gateScoreMin));
-// z-score against frozen stats
     final double zBase = (segMean - dynThr) / (sig0 + 1e-6);
 
-// stricter profile knobs
-// --- knobs for the z-score gate ---
     const bool strictProfile = true;
-
-// let p breathe: wider range
     final double pMin     = strictProfile ? 0.02 : gateProbMin.clamp(0.0, 1.0);
-    final double pMax     = strictProfile ? 0.80 : gateProbMax.clamp(0.0, 1.0); // was 0.40 → 0.80
-
-// softer slope so p doesn’t slam into the cap immediately
-    final double kSigmoid = strictProfile ? 2.0  : math.max(1.0, gateProbK);   // was 4.0 → 2.0
-
-// still keep a dead-zone below bar
+    final double pMax     = strictProfile ? 0.80 : gateProbMax.clamp(0.0, 1.0);
+    final double kSigmoid = strictProfile ? 2.0  : math.max(1.0, gateProbK);
     final double deadZoneZ = strictProfile ? -0.35 : -0.15;
-
-// tiny boosts
     final double boostL    = strictProfile ? 0.03 : gateProbLandedBoost.clamp(0.0, 1.0);
     final double boostN    = strictProfile ? 0.02 : gateProbNearPadBoost.clamp(0.0, 1.0);
 
-// (unchanged) compute s, p from zBase with logistic:
-    final double s = 1.0 / (1.0 + math.exp(-kSigmoid * zBase));
-    double p = pMin + (pMax - pMin) * s;
-    if (landed)         p += boostL;
-    if (nearPadCrashOK) p += boostN;
-    p = p.clamp(pMin, pMax);
-
-// 2) Decide with frozen stats
     if (gateOnlyLanded && !landed && !nearPadCrashOK) {
       accept = false; sampledP = 0.0;
     } else if (!gateProbEnabled) {
@@ -1798,10 +1775,8 @@ class Trainer {
       accept = (math.Random(seed ^ (_epCounter << 7) ^ steps).nextDouble() < p);
     }
 
-// 3) NOW update stats AFTER the decision
     _gateUpdateStats(segMean);
 
-// (optional) clearer logging
     if (gateVerbose) {
       print('[GATE] segMean=${segMean.toStringAsFixed(3)} '
           'dynThr=${dynThr.toStringAsFixed(3)} mu0=${mu0.toStringAsFixed(3)} '
@@ -1815,7 +1790,7 @@ class Trainer {
         policy.updateFromEpisode(
           decisionCaches: decisionCaches,
           intentChoices: intentChoices,
-          decisionReturns: decisionReturns,   // advantages from PF-only rewards
+          decisionReturns: decisionReturns,
           alignLabels: alignLabels,
           alignWeight: intentAlignWeight,
           intentPgWeight: intentPgWeight,
@@ -1828,6 +1803,10 @@ class Trainer {
           actionTurnTargets: actionTurnTargets,
           actionThrustTargets: actionThrustTargets,
           actionAlignWeight: actionAlignWeight,
+          // duration supervision
+          durationCaches: durationCaches,
+          durationTargets: durationTargets,
+          durationAlignWeight: 0.25, // tune 0.1..0.5
         );
       }
     }
