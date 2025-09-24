@@ -199,9 +199,9 @@ class PadAlignCurriculum extends Curriculum {
       intentChoices: choices,          // argmax placeholders; not used for SL alignment
       decisionReturns: returns,
       alignLabels: labels,             // <-- the supervised labels (L/R)
-      alignWeight: weight,             // scale of supervised cross-entropy
+      alignWeight: 2.0,             // scale of supervised cross-entropy
       intentPgWeight: 0.0,             // no PG here
-      lr: lr,
+      lr: 0.0012,
       entropyBeta: 0.0,
       valueBeta: 0.0,
       huberDelta: 1.0,
@@ -277,6 +277,9 @@ class PadAlignCurriculum extends Curriculum {
     required int seed,
   }) async {
     final rnd = math.Random(seed ^ 0xBEE5);
+
+    final wasTrain = policy.trunk.trainMode;
+    policy.trunk.trainMode = false; // freeze trunk for PadAlign
 
     if (gateVerbose) {
       final minS = cfg.minSteps;
@@ -376,5 +379,6 @@ class PadAlignCurriculum extends Curriculum {
         print(_fitnessLine(iter: it));
       }
     }
+    policy.trunk.trainMode = wasTrain;
   }
 }
