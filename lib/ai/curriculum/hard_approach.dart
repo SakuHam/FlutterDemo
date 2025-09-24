@@ -4,6 +4,11 @@
 // - Intent selection is NEVER greedy (temperature + entropy floor)
 // - Exploration escalates across retries (temp, ε-action noise, lateral bias flips, assist)
 // - Cohorts (terrain+spawn) count ONCE toward nearFrac adaptation (retries are "(nc)")
+//
+// NEW:
+// - Dense shaping rewards meaningful progress toward pad (gated/denoised).
+// - Progress gating: episodes that made enough progress (even if not landed) can be accepted
+//   for training with a smooth probabilistic gate.
 
 import 'dart:math' as math;
 
@@ -67,6 +72,14 @@ class HardApproachCfg {
   final bool   stuckNeutralizeBias;  // zero lateral bias during climb
   final bool   autoClimbWhenPadHidden;// proactive short climb if pad rays unseen & low
 
+  // === NEW: Progress gating (besides "landed") ===
+  final bool   gateProgress;      // enable gating by progress (probabilistic)
+  final double gateProgThresh;    // threshold in "progScore" space
+  final double gateProgK;         // logistic sharpness (bigger = steeper)
+  final double gateProgMinP;      // acceptance probability floor
+  final double gateProgMaxP;      // acceptance probability cap
+  final double gateProgLandBoost; // added to progress score if landed (makes landing near-certain)
+
   const HardApproachCfg({
     this.batch = 1,
     this.minSteps = 32,
@@ -99,6 +112,14 @@ class HardApproachCfg {
     this.stuckClimbMinH = 180.0,     // clear common ridges
     this.stuckNeutralizeBias = true, // cancel lateral bias while climbing
     this.autoClimbWhenPadHidden = true,
+
+    // Progress gating defaults
+    this.gateProgress      = true,
+    this.gateProgThresh    = 0.90,   // tune with wProg below
+    this.gateProgK         = 6.0,
+    this.gateProgMinP      = 0.05,
+    this.gateProgMaxP      = 0.98,
+    this.gateProgLandBoost = 1.0,
   });
 
   HardApproachCfg copyWith({
@@ -132,6 +153,14 @@ class HardApproachCfg {
     double? stuckClimbMinH,
     bool? stuckNeutralizeBias,
     bool? autoClimbWhenPadHidden,
+
+    // progress gating
+    bool? gateProgress,
+    double? gateProgThresh,
+    double? gateProgK,
+    double? gateProgMinP,
+    double? gateProgMaxP,
+    double? gateProgLandBoost,
   }) => HardApproachCfg(
     batch:            batch ?? this.batch,
     minSteps:         minSteps ?? this.minSteps,
@@ -163,6 +192,13 @@ class HardApproachCfg {
     stuckClimbMinH:     stuckClimbMinH ?? this.stuckClimbMinH,
     stuckNeutralizeBias: stuckNeutralizeBias ?? this.stuckNeutralizeBias,
     autoClimbWhenPadHidden: autoClimbWhenPadHidden ?? this.autoClimbWhenPadHidden,
+
+    gateProgress:      gateProgress ?? this.gateProgress,
+    gateProgThresh:    gateProgThresh ?? this.gateProgThresh,
+    gateProgK:         gateProgK ?? this.gateProgK,
+    gateProgMinP:      gateProgMinP ?? this.gateProgMinP,
+    gateProgMaxP:      gateProgMaxP ?? this.gateProgMaxP,
+    gateProgLandBoost: gateProgLandBoost ?? this.gateProgLandBoost,
   );
 }
 
@@ -214,6 +250,14 @@ class HardApproach extends Curriculum {
       stuckClimbMinH:      cli.getDouble('hardapp_stuck_climb_h',   def: 180.0),
       stuckNeutralizeBias: cli.getFlag('hardapp_stuck_neutral_bias', def: true),
       autoClimbWhenPadHidden: cli.getFlag('hardapp_auto_climb_when_pad_hidden', def: true),
+
+      // NEW: progress gating CLI
+      gateProgress:      cli.getFlag  ('hardapp_gate_prog',       def: true),
+      gateProgThresh:    cli.getDouble('hardapp_gate_prog_thr',   def: 0.90),
+      gateProgK:         cli.getDouble('hardapp_gate_prog_k',     def: 6.0),
+      gateProgMinP:      cli.getDouble('hardapp_gate_prog_pmin',  def: 0.05),
+      gateProgMaxP:      cli.getDouble('hardapp_gate_prog_pmax',  def: 0.98),
+      gateProgLandBoost: cli.getDouble('hardapp_gate_prog_lboost',def: 1.0),
     );
     _curNearFrac = cfg.nearPadFrac.clamp(0.0, cfg.nearFracMax);
     _winCount = 0; _winLanded = 0;
@@ -375,6 +419,26 @@ class HardApproach extends Curriculum {
     return hold;
   }
 
+  // ---------- Helpers for progress shaping/gating ----------
+  double _dxToPadAbs(eng.GameEngine env) {
+    final padCx = env.terrain.padCenter.toDouble();
+    return (env.lander.pos.x.toDouble() - padCx).abs();
+    // lateral-only distance; robust and aligned with lateral intents
+  }
+
+  double _heightPx(eng.GameEngine env) {
+    final gy = env.terrain.heightAt(env.lander.pos.x.toDouble());
+    return (gy - env.lander.pos.y.toDouble()).clamp(0.0, 1e9);
+  }
+
+  bool _padLikelyVisible(eng.GameEngine env, {int minHits = 1}) {
+    int hits = 0;
+    for (final r in env.rays) {
+      if (r.kind == rc.RayHitKind.pad) { hits++; if (hits >= minHits) return true; }
+    }
+    return false;
+  }
+
   EpisodeWithSpawn _runEpisode({
     required eng.GameEngine env,
     required FeatureExtractorRays fe,
@@ -441,6 +505,12 @@ class HardApproach extends Curriculum {
     int climbFrames = preClimbFrames;
     double climbMinH = preClimbMinH;
     bool neutralizeBiasNow = neutralizeLatBias;
+
+    // === Progress bookkeeping for gating ===
+    final double startDx = _dxToPadAbs(env);
+    double minDx = startDx;
+    double progCreditSum = 0.0;
+    double lastDxEma = startDx;
 
     double _vCapLoose(double h) {
       final base = 0.12, add = (assistLevel == 0) ? 0.0 : (assistLevel == 1 ? 0.03 : 0.06);
@@ -543,11 +613,8 @@ class HardApproach extends Curriculum {
 
       // --- Proactive short climb if pad is hidden and low (optional) ----------
       if (cfg.autoClimbWhenPadHidden && climbFrames <= 0) {
-        bool padVisible = false;
-        for (final r in env.rays) { if (r.kind == rc.RayHitKind.pad) { padVisible = true; break; } }
-        final Lp  = env.lander;
-        final gyp = env.terrain.heightAt(Lp.pos.x);
-        final hp  = (gyp - Lp.pos.y).toDouble().clamp(0.0, 1e9);
+        final padVisible = _padLikelyVisible(env);
+        final hp         = _heightPx(env);
         if (!padVisible && hp < cfg.stuckClimbMinH) {
           climbFrames = (0.5 * cfg.stuckClimbFrames).round();
           climbMinH   = cfg.stuckClimbMinH;
@@ -557,14 +624,11 @@ class HardApproach extends Curriculum {
 
       // --- Climb-first override (bailout) ------------------------------------
       if (climbFrames > 0) {
-        final L  = env.lander;
-        final gy = env.terrain.heightAt(L.pos.x);
-        final h  = (gy - L.pos.y).toDouble().clamp(0.0, 1e9);
-
+        final h  = _heightPx(env);
         final needClimb = (h < climbMinH) || (climbMinH <= 0.0);
         if (needClimb && !useWarm) {
           // Cancel lateral motion during the climb; just flare up.
-          uTry = et.ControlInput(
+          uTry = const et.ControlInput(
             thrust: true,
             left: false, right: false,
             sideLeft: false, sideRight: false,
@@ -581,13 +645,11 @@ class HardApproach extends Curriculum {
       // Step the env (with stronger flare assist if configured)
       et.StepInfo info;
       if (!useWarm && intent == Intent.descendSlow) {
-        final L = env.lander;
-        final gy = env.terrain.heightAt(L.pos.x);
-        final h  = (gy - L.pos.y).toDouble().clamp(0.0, 1e9);
+        final h  = _heightPx(env);
         final vCap = _vCapLoose(h);
         final tau = (assistLevel >= 2) ? 0.75 : 0.6;
         final vyNext = _vyPredictNoThrust(env, tauReact: tau);
-        final needUp = (L.vel.y > vCap) || (vyNext > 0.9 * vCap);
+        final needUp = (env.lander.vel.y > vCap) || (vyNext > 0.9 * vCap);
         final u2 = et.ControlInput(
           thrust: uTry.thrust || needUp,
           left: uTry.left, right: uTry.right,
@@ -614,11 +676,44 @@ class HardApproach extends Curriculum {
       actionTurnTargets.add(uTeacher.left ? 0 : (uTeacher.right ? 2 : 1));
       actionThrustTargets.add(uTeacher.thrust);
 
-      // dense reward: simple speed-min
+      // ===== Dense shaping =====
+      // (A) speed-min keeps things calm
       final vx = env.lander.vel.x.toDouble();
       final vy = env.lander.vel.y.toDouble();
-      final v = math.sqrt(vx * vx + vy * vy);
+      final v  = math.sqrt(vx * vx + vy * vy);
       accReward += -0.01 * v;
+
+      // (B) gated progress toward pad (lateral), scale-aware & denoised
+      final dxNow = _dxToPadAbs(env);
+      // gates to avoid “farming”
+      final pastWarm     = steps >= cfg.warmFrames;
+      final visOK        = _padLikelyVisible(env) || _heightPx(env) > 160.0;
+      final speedOK      = env.lander.vel.y.toDouble() < 42.0;
+      final notTooClose  = dxNow > 6.0;
+
+      if (pastWarm && visOK && speedOK && notTooClose) {
+        // EMA baseliner to measure meaningful per-step improvement
+        const double emaA = 0.30;
+        lastDxEma = (steps == 0) ? dxNow : ((1 - emaA) * lastDxEma + emaA * dxNow);
+
+        // Only count progress beyond a small deadzone to beat noise
+        const double deadzone = 2.5; // px; scale if you change worldW a lot
+        final dProg = (lastDxEma - dxNow) - deadzone; // >0 = real progress
+
+        if (dProg > 0) {
+          // Farther from ground ⇒ allow larger credit (encourage early approach)
+          final h = _heightPx(env);
+          final farGain = (h / (h + 240.0)).clamp(0.15, 1.0);
+          const double wProg = 0.004; // main scale; tune 0.002–0.008
+          final credit = wProg * farGain * dProg.clamp(0.0, 10.0);
+
+          accReward     += credit;   // use as dense shaping too
+          progCreditSum += credit;   // and accumulate for gating
+        }
+      }
+
+      // Track best lateral closeness for a clean, scale-robust feature
+      if (dxNow < minDx) minDx = dxNow;
 
       // progression + decision window countdown
       steps++;
@@ -643,7 +738,29 @@ class HardApproach extends Curriculum {
       }
     }
 
-    final bool accept = landed;
+    // ===== Accept / Gate =====
+    bool accept = landed;
+
+    // Progress score combines integrated gated credits and the net best improvement
+    final double dxGain = (startDx - minDx).clamp(0.0, double.infinity);
+    // Small scale on dxGain keeps it comparable to progCreditSum
+    final double progScore =
+        progCreditSum + 0.003 * dxGain + (landed ? cfg.gateProgLandBoost : 0.0);
+
+    if (!accept && cfg.gateProgress) {
+      final double z = cfg.gateProgK * (progScore - cfg.gateProgThresh);
+      final double p = (1.0 / (1.0 + math.exp(-z)))
+          .clamp(cfg.gateProgMinP, cfg.gateProgMaxP);
+      if (rnd.nextDouble() < p) accept = true;
+
+      if (cfg.verbose) {
+        print('${logPrefix}[HARDAPP/GATE] landed=$landed '
+            'progScore=${progScore.toStringAsFixed(3)} '
+            'dxGain=${dxGain.toStringAsFixed(1)} progSum=${progCreditSum.toStringAsFixed(3)} '
+            'p=${p.toStringAsFixed(2)} accept=${accept ? "Y" : "N"}');
+      }
+    }
+
     if (accept) {
       // Single update from this episode
       policy.updateFromEpisode(
@@ -744,6 +861,14 @@ class HardApproach extends Curriculum {
       _winCount = 0;
       _winLanded = 0;
     }
+  }
+
+  double _distToPad(eng.GameEngine env) {
+    final padCx = env.terrain.padCenter.toDouble();
+    final padCy = env.terrain.heightAt(padCx);
+    final dx = env.lander.pos.x.toDouble() - padCx;
+    final dy = env.lander.pos.y.toDouble() - padCy;
+    return math.sqrt(dx * dx + dy * dy);
   }
 
   // =============================== Run loop ==================================

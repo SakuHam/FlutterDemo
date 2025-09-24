@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter_application_1/ai/curriculum/pad_align.dart';
 import 'package:flutter_application_1/ai/pf_reward.dart';
 
 import '../engine/types.dart' as et;
@@ -387,6 +388,7 @@ void main(List<String> argv) async {
   // ---- Curriculum registry ----
   final registry = CurriculumRegistry()
     ..register('speedmin', () => SpeedMinCurriculum())
+    ..register('padalign', () => PadAlignCurriculum())
     ..register('hardapp', () => HardApproach())
     ..register('final', () => FinalApproach());
 
@@ -652,6 +654,8 @@ void main(List<String> argv) async {
       final itersThis =
       cur.key == 'hardapp'   && hardappIters > 0 ? hardappIters :
       cur.key == 'speedmin'  && lowaltIters  > 0 ? lowaltIters  :
+      cur.key == 'padalign'  && lowaltIters  > 0 ? lowaltIters  :
+      cur.key == 'final'  && lowaltIters  > 0 ? lowaltIters  :
       curIters;
 
       if (itersThis <= 0) continue;
