@@ -855,7 +855,7 @@ class PolicyNetwork {
     consolidateEnabled = true;
   }
 
-  ForwardCache _forwardFull(List<double> x) {
+  ForwardCache forwardFull(List<double> x) {
     final acts = trunk.forwardAll(x);
     final h = acts.last;
     final intentLogits = heads.intent.forward(h);
@@ -945,7 +945,7 @@ class PolicyNetwork {
   }
 
   (int, List<double>, List<double>, ForwardCache) actIntent(List<double> x) {
-    final c = _forwardFull(x);
+    final c = forwardFull(x);
     int arg = 0;
     double best = c.intentProbs[0];
     for (int i = 1; i < c.intentProbs.length; i++) {
@@ -955,7 +955,7 @@ class PolicyNetwork {
   }
 
   (int, List<double>, ForwardCache) actIntentGreedy(List<double> x) {
-    final c = _forwardFull(x);
+    final c = forwardFull(x);
     int arg = 0;
     double best = c.intentProbs[0];
     for (int i = 1; i < c.intentProbs.length; i++) {
@@ -965,7 +965,7 @@ class PolicyNetwork {
   }
 
   (bool, bool, bool, List<double>, ForwardCache) actGreedy(List<double> x) {
-    final c = _forwardFull(x);
+    final c = forwardFull(x);
     final thrust = c.thrProb >= 0.5;
     int tArg = 0;
     double best = c.turnLogits[0];
@@ -977,6 +977,99 @@ class PolicyNetwork {
     final probs = <double>[ c.thrProb, ...nn.Ops.softmax(c.turnLogits) ];
     return (thrust, left, right, probs, c);
   }
+
+  /* ------------------ NEW: copy action heads from another policy ----------- */
+
+  /// Copies **action heads only** (turn & thrust) from `src` into this policy,
+  /// without hard-coupling to a concrete class name.
+  ///
+  /// Accepts:
+  /// - another `PolicyNetwork` (direct)
+  /// - any object exposing `heads.turn/heads.thr` with `.W` and `.b`
+  /// - any object exposing `turnHead/thrHead` with `.W` and `.b`
+  /// - any object exposing `action.turn/action.thr` with `.W` and `.b`
+  ///
+  /// If dimensions differ, copies the overlapping submatrix/vector.
+  void copyActionHeadsFrom(Object src) {
+    T? _try<T>(T Function() f) { try { return f(); } catch (_) { return null; } }
+
+    void _assignVec(List<double> dst, dynamic maybeVec) {
+      if (maybeVec is List) {
+        final m = math.min(dst.length, maybeVec.length);
+        for (int i = 0; i < m; i++) {
+          final v = maybeVec[i];
+          if (v is num) dst[i] = v.toDouble();
+        }
+      }
+    }
+
+    void _assignMat(List<List<double>> dst, dynamic maybeMat) {
+      if (maybeMat is List) {
+        final rows = math.min(dst.length, maybeMat.length);
+        for (int i = 0; i < rows; i++) {
+          final srcRow = maybeMat[i];
+          if (srcRow is List) {
+            final cols = math.min(dst[i].length, srcRow.length);
+            for (int j = 0; j < cols; j++) {
+              final v = srcRow[j];
+              if (v is num) dst[i][j] = v.toDouble();
+            }
+          }
+        }
+      }
+    }
+
+    // Case 1: direct PolicyNetwork
+    if (src is PolicyNetwork) {
+      _assignMat(heads.turn.W, src.heads.turn.W);
+      _assignVec(heads.turn.b, src.heads.turn.b);
+      _assignMat(heads.thr.W,  src.heads.thr.W);
+      _assignVec(heads.thr.b,  src.heads.thr.b);
+      return;
+    }
+
+    final dyn = src as dynamic;
+
+    // Case 2: src.heads.turn / src.heads.thr
+    final h  = _try(() => dyn.heads);
+    final t1 = _try(() => h?.turn);
+    final r1 = _try(() => h?.thr);
+    if (t1 != null && r1 != null) {
+      _assignMat(heads.turn.W, _try(() => t1.W) ?? _try(() => t1.weights));
+      _assignVec(heads.turn.b, _try(() => t1.b) ?? _try(() => t1.bias));
+      _assignMat(heads.thr.W,  _try(() => r1.W) ?? _try(() => r1.weights));
+      _assignVec(heads.thr.b,  _try(() => r1.b) ?? _try(() => r1.bias));
+      return;
+    }
+
+    // Case 3: src.turnHead / src.thrHead
+    final t2 = _try(() => dyn.turnHead);
+    final r2 = _try(() => dyn.thrHead);
+    if (t2 != null && r2 != null) {
+      _assignMat(heads.turn.W, _try(() => t2.W) ?? _try(() => t2.weights));
+      _assignVec(heads.turn.b, _try(() => t2.b) ?? _try(() => t2.bias));
+      _assignMat(heads.thr.W,  _try(() => r2.W) ?? _try(() => r2.weights));
+      _assignVec(heads.thr.b,  _try(() => r2.b) ?? _try(() => r2.bias));
+      return;
+    }
+
+    // Case 4: src.action.turn / src.action.thr
+    final a  = _try(() => dyn.action);
+    final t3 = _try(() => a?.turn);
+    final r3 = _try(() => a?.thr);
+    if (t3 != null && r3 != null) {
+      _assignMat(heads.turn.W, _try(() => t3.W) ?? _try(() => t3.weights));
+      _assignVec(heads.turn.b, _try(() => t3.b) ?? _try(() => t3.bias));
+      _assignMat(heads.thr.W,  _try(() => r3.W) ?? _try(() => r3.weights));
+      _assignVec(heads.thr.b,  _try(() => r3.b) ?? _try(() => r3.bias));
+      return;
+    }
+
+    // Optional: print a hint if nothing matched.
+    // print('[Policy] copyActionHeadsFrom: no compatible fields on ${src.runtimeType}');
+  }
+
+  /* ------------------------------------------------------------------------ */
 
   void updateFromEpisode({
     required List<ForwardCache> decisionCaches,     // intent head
@@ -1282,7 +1375,7 @@ double _entropyFromLogits(List<double> logits) {
   final maxZ = logits.reduce((a,b) => a > b ? a : b);
   var sum = 0.0;
   final exps = List<double>.filled(logits.length, 0.0);
-  for (int i = 0; i < logits.length; i++) { exps[i] = math.exp(logits[i] - maxZ); sum += exps[i]; }
+  for (int i = 0; i < logits.length; i++) { final e = math.exp(logits[i] - maxZ); exps[i] = e; sum += e; }
   double H = 0.0;
   for (final e in exps) {
     final p = e / sum;
