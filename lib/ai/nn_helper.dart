@@ -51,6 +51,34 @@ enum InitKind { xavier, kaiming }
 /* ------------------------------------ Ops ------------------------------------ */
 
 class Ops {
+  static int argmax(List<double> v) {
+    if (v.isEmpty) return -1;
+    int bestIdx = 0;
+    double best = v[0];
+    for (int i = 1; i < v.length; i++) {
+      final x = v[i];
+      if (x > best) {
+        best = x;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  static int argmin(List<double> v) {
+    if (v.isEmpty) return -1;
+    int bestIdx = 0;
+    double best = v[0];
+    for (int i = 1; i < v.length; i++) {
+      final x = v[i];
+      if (x < best) {
+        best = x;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
   /// log1p(y) ≈ log(1+y), but stable for small |y|.
   static double log1p(double y) {
     // handle edge cases
