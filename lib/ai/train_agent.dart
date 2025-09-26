@@ -502,12 +502,16 @@ void main(List<String> argv) async {
   final gateVerbose = args.getFlag('gate_verbose', def: true);
 
   // ---------------------- NEW: probabilistic gating CLI ----------------------
-  final gateProbEnabled      = args.getFlag('gate_prob', def: true);          // --gate_prob (set false = hard gate)
+  final gateProbEnabled      = args.getFlag('gate_prob', def: true);
   final gateProbK            = args.getDouble('gate_prob_k', def: 8.0);
   final gateProbMin          = args.getDouble('gate_prob_min', def: 0.05);
   final gateProbMax          = args.getDouble('gate_prob_max', def: 0.95);
   final gateProbLandedBoost  = args.getDouble('gate_prob_landed_boost', def: 0.15);
   final gateProbNearPadBoost = args.getDouble('gate_prob_nearpad_boost', def: 0.10);
+
+  // NEW: gentle floor (avoid p=0 lockout) + optional deadzone
+  final gateProbDeadzoneZ    = args.getDouble('gate_prob_deadzone_z', def: -1e9); // disabled
+  final gateProbFloor        = args.getDouble('gate_prob_floor', def: 0.02);      // small min acceptance
 
   // ---------------------- Hebbian CLI knobs (new) ----------------------
   final hebbOn       = args.getFlag('hebbian', def: false);
@@ -565,6 +569,11 @@ void main(List<String> argv) async {
   final policy = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
   print('Init policy. hidden=${policy.hidden} | FE(kind=rays, in=$inDim, rays=${env.rayCfg.rayCount}, oneHot=$kindsOneHot)');
 
+  // Enable training for curricula stage (typical: trunk+intent+action)
+  policy.setTrunkTrainable(true);
+  policy.setHeadsTrainable(intent: true, action: true, value: false);
+  print('[STAGE] Curricula: trainable { trunk=ON, intent=ON, action=ON, value=OFF }');
+
   // ===== Optional: LOAD existing policy weights =====
   if (loadPath != null && loadPath.trim().isNotEmpty) {
     _loadPolicyIntoNetwork(
@@ -581,10 +590,14 @@ void main(List<String> argv) async {
       print('Consolidation anchor captured from loaded policy. '
           'λ_trunk=${policy.consolidateTrunk} λ_heads=${policy.consolidateHeads}');
     }
+    // If loading a curriculum-complete model and going straight to PF, you may prefer:
+    // policy.setTrunkTrainable(false);
+    // policy.setHeadsTrainable(intent: false, action: true, value: false);
+    // print('[STAGE] PF (from loaded): trainable { trunk=OFF, intent=OFF, action=ON, value=OFF }');
   }
 
-  // ===== Trainer (Stage 2 runtime container) =====
-  ai.ExternalRewardHook? pfHook; // captured by trainer closure
+  // ===== Trainer =====
+  ai.ExternalRewardHook? pfHook;
 
   final trainer = Trainer(
     env: env,
@@ -609,7 +622,7 @@ void main(List<String> argv) async {
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
 
-    // NEW: probabilistic gating wiring
+    // Probabilistic gating wiring (with safe defaults)
     gateProbEnabled: gateProbEnabled,
     gateProbK: gateProbK,
     gateProbMin: gateProbMin,
@@ -617,19 +630,22 @@ void main(List<String> argv) async {
     gateProbLandedBoost: gateProbLandedBoost,
     gateProbNearPadBoost: gateProbNearPadBoost,
 
+    // NEW: deadzone & floor
+    gateProbDeadzoneZ: gateProbDeadzoneZ,
+    gateProbFloor: gateProbFloor,
+
     // external dense reward hook (PF)
     externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
       return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
     }),
 
-    // ---- NEW: Hebbian + guards wiring ----
+    // Hebbian + guards
     hebbian: HebbianConfig(
       enabled: hebbOn,
       useOja: hebbOja,
       eta: hebbEta,
       clip: hebbClip,
       rowL2Cap: hebbRowCap,
-      // where to apply
       trunk: hebbTrunk,
       headIntent: hebbHeadInt,
       headTurn: hebbHeadTurn,
@@ -652,7 +668,7 @@ void main(List<String> argv) async {
     print('Determinism probe: steps ${a.steps} vs ${b.steps} | cost ${a.cost.toStringAsFixed(6)} vs ${b.cost.toStringAsFixed(6)} => ${ok ? "OK" : "MISMATCH"}');
   }
 
-  // ===== MODULAR CURRICULA (Stage 1/micro-stages) =====
+  // ===== MODULAR CURRICULA =====
   if (curricula.isNotEmpty && (curIters > 0 || lowaltIters > 0 || hardappIters > 0)) {
     print('=== Curricula: ${curricula.map((c) => c.key).join(", ")} ===');
     for (final cur in curricula) {
@@ -709,6 +725,14 @@ void main(List<String> argv) async {
     if (warmAfterCurr) {
       // Optionally re-warm feature norm here if you have a helper.
     }
+
+    // Freeze curriculum features/intent; train action in PF
+    policy.setTrunkTrainable(false);
+    policy.setHeadsTrainable(intent: false, action: true, value: false);
+    print('[STAGE] PF: trainable { trunk=OFF, intent=OFF, action=ON, value=OFF }');
+    if (policy.consolidateEnabled) {
+      print('[STAGE] PF: consolidation L2-SP active (λ_trunk=${policy.consolidateTrunk}, λ_heads=${policy.consolidateHeads})');
+    }
   }
 
   // ===== Baseline eval =====
@@ -742,7 +766,7 @@ void main(List<String> argv) async {
     }
   }
 
-  // ===== MAIN TRAIN LOOP (Stage 2: PF reward) =====
+  // ===== MAIN TRAIN LOOP (PF) =====
   final rnd = math.Random(seed ^ 0xDEADBEEF);
   final rayCount = env.rayCfg.rayCount;
 
@@ -817,8 +841,8 @@ void main(List<String> argv) async {
           blendPolicy: blendPolicy,
           tempIntent: tempIntent,
           intentEntropy: intentEntropy,
-          evalDebug: evalDebug,
-          evalDebugFailN: evalDebugFailN,
+          evalDebug: true,
+          evalDebugFailN: 3,
         );
       } else {
         ev = eval.evaluateSequential(
@@ -827,8 +851,6 @@ void main(List<String> argv) async {
           episodes: evalEpisodes,
           seed: seed ^ (0x1111 * (it + 1)),
           attemptsPerTerrain: attemptsPerTerrain,
-          evalDebug: evalDebug,
-          evalDebugFailN: evalDebugFailN,
         );
       }
 

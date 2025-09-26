@@ -1,5 +1,7 @@
 // lib/ai/agent.dart
 import 'dart:math' as math;
+import 'dart:convert' as convert;
+
 import '../engine/raycast.dart';
 import 'nn_helper.dart' as nn;                 // MLPTrunk/PolicyHeads with silu+noise+dropout
 import '../engine/types.dart' as et;
@@ -138,6 +140,36 @@ class RunningNorm {
       out[i] = (x[i] - mean[i]) / math.sqrt(var_[i] + eps);
     }
     return out;
+  }
+
+  // ---- Optional persistence helpers ----
+  Map<String, dynamic> toJson() => {
+    'dim': dim,
+    'mean': mean,
+    'var': var_,
+    'momentum': momentum,
+    'inited': inited,
+    'eps': eps,
+  };
+  void fromJson(Map<String, dynamic> m) {
+    dim = (m['dim'] as num).toInt();
+    mean = (m['mean'] as List).map((e) => (e as num).toDouble()).toList();
+    var_ = (m['var'] as List).map((e) => (e as num).toDouble()).toList();
+    momentum = (m['momentum'] as num).toDouble();
+    inited = m['inited'] == true;
+    // eps is final; ignore or assert close
+  }
+  String toJsonString() => convert.jsonEncode(toJson());
+  void loadFromJson(String s) => fromJson(convert.jsonDecode(s));
+  void copyFrom(RunningNorm other) {
+    final m = math.min(mean.length, other.mean.length);
+    for (int i = 0; i < m; i++) {
+      mean[i] = other.mean[i];
+      var_[i] = other.var_[i];
+    }
+    dim = other.dim;
+    momentum = other.momentum;
+    inited = other.inited;
   }
 }
 
@@ -742,6 +774,12 @@ class PolicyNetwork {
   List<List<double>>? _snapWThr;
   List<double>? _snapBThr;
 
+  // ---- Trainable gates (replace .trainable on layers/heads) ----
+  bool _trainTrunk = true;
+  bool _trainIntent = true;
+  bool _trainAction = true; // turn + thr
+  bool _trainValue  = true;
+
   void hebbianTick({
     required HebbianConfig cfg,
     required List<List<double>> preActs,
@@ -978,18 +1016,50 @@ class PolicyNetwork {
     return (thrust, left, right, probs, c);
   }
 
-  /* ------------------ NEW: copy action heads from another policy ----------- */
+  /* ------------------ Transfer & freezing helpers ------------------------- */
 
-  /// Copies **action heads only** (turn & thrust) from `src` into this policy,
-  /// without hard-coupling to a concrete class name.
-  ///
-  /// Accepts:
-  /// - another `PolicyNetwork` (direct)
-  /// - any object exposing `heads.turn/heads.thr` with `.W` and `.b`
-  /// - any object exposing `turnHead/thrHead` with `.W` and `.b`
-  /// - any object exposing `action.turn/action.thr` with `.W` and `.b`
-  ///
-  /// If dimensions differ, copies the overlapping submatrix/vector.
+  /// Copy TRUNK params (weights & biases). No assumptions about internal norms.
+  void copyTrunkFrom(PolicyNetwork src, {bool strict = false}) {
+    void assignVec(List<double> dst, List<double> srcV) {
+      final m = strict ? (dst.length == srcV.length ? dst.length : 0)
+          : math.min(dst.length, srcV.length);
+      for (int i = 0; i < m; i++) dst[i] = srcV[i];
+    }
+    void assignMat(List<List<double>> dst, List<List<double>> srcM) {
+      final R = strict ? (dst.length == srcM.length ? dst.length : 0)
+          : math.min(dst.length, srcM.length);
+      for (int r = 0; r < R; r++) {
+        final C = strict ? (dst[r].length == srcM[r].length ? dst[r].length : 0)
+            : math.min(dst[r].length, srcM[r].length);
+        for (int c = 0; c < C; c++) dst[r][c] = srcM[r][c];
+      }
+    }
+    for (int k = 0; k < math.min(trunk.layers.length, src.trunk.layers.length); k++) {
+      assignMat(trunk.layers[k].W, src.trunk.layers[k].W);
+      assignVec(trunk.layers[k].b, src.trunk.layers[k].b);
+    }
+  }
+
+  /// Copy intent head only (L/R/etc classifier)
+  void copyIntentHeadFrom(PolicyNetwork src, {bool strict = false}) {
+    void assignVec(List<double> d, List<double> s) {
+      final m = strict ? (d.length == s.length ? d.length : 0) : math.min(d.length, s.length);
+      for (int i = 0; i < m; i++) d[i] = s[i];
+    }
+    void assignMat(List<List<double>> d, List<List<double>> s) {
+      final R = strict ? (d.length == s.length ? d.length : 0) : math.min(d.length, s.length);
+      for (int r = 0; r < R; r++) {
+        final C = strict ? (d[r].length == s[r].length ? d[r].length : 0)
+            : math.min(d[r].length, s[r].length);
+        for (int c = 0; c < C; c++) d[r][c] = s[r][c];
+      }
+    }
+    assignMat(heads.intent.W, src.heads.intent.W);
+    assignVec(heads.intent.b, src.heads.intent.b);
+  }
+
+  /// Copies **action heads only** (turn & thrust) from `src` into this policy.
+  /// Accepts a PolicyNetwork or any dynamic with compatible fields (heads.turn/thr, etc.)
   void copyActionHeadsFrom(Object src) {
     T? _try<T>(T Function() f) { try { return f(); } catch (_) { return null; } }
 
@@ -1019,7 +1089,6 @@ class PolicyNetwork {
       }
     }
 
-    // Case 1: direct PolicyNetwork
     if (src is PolicyNetwork) {
       _assignMat(heads.turn.W, src.heads.turn.W);
       _assignVec(heads.turn.b, src.heads.turn.b);
@@ -1030,7 +1099,6 @@ class PolicyNetwork {
 
     final dyn = src as dynamic;
 
-    // Case 2: src.heads.turn / src.heads.thr
     final h  = _try(() => dyn.heads);
     final t1 = _try(() => h?.turn);
     final r1 = _try(() => h?.thr);
@@ -1042,7 +1110,6 @@ class PolicyNetwork {
       return;
     }
 
-    // Case 3: src.turnHead / src.thrHead
     final t2 = _try(() => dyn.turnHead);
     final r2 = _try(() => dyn.thrHead);
     if (t2 != null && r2 != null) {
@@ -1053,7 +1120,6 @@ class PolicyNetwork {
       return;
     }
 
-    // Case 4: src.action.turn / src.action.thr
     final a  = _try(() => dyn.action);
     final t3 = _try(() => a?.turn);
     final r3 = _try(() => a?.thr);
@@ -1064,9 +1130,35 @@ class PolicyNetwork {
       _assignVec(heads.thr.b,  _try(() => r3.b) ?? _try(() => r3.bias));
       return;
     }
+  }
 
-    // Optional: print a hint if nothing matched.
-    // print('[Policy] copyActionHeadsFrom: no compatible fields on ${src.runtimeType}');
+  /// Blend action heads toward `src` by factor `alpha` in [0,1].
+  void blendActionHeadsFrom(PolicyNetwork src, {double alpha = 0.5}) {
+    double mix(double a, double b) => a * (1 - alpha) + b * alpha;
+    for (int r = 0; r < math.min(heads.turn.W.length, src.heads.turn.W.length); r++) {
+      for (int c = 0; c < math.min(heads.turn.W[r].length, src.heads.turn.W[r].length); c++) {
+        heads.turn.W[r][c] = mix(heads.turn.W[r][c], src.heads.turn.W[r][c]);
+      }
+    }
+    for (int i = 0; i < math.min(heads.turn.b.length, src.heads.turn.b.length); i++) {
+      heads.turn.b[i] = mix(heads.turn.b[i], src.heads.turn.b[i]);
+    }
+    for (int r = 0; r < math.min(heads.thr.W.length, src.heads.thr.W.length); r++) {
+      for (int c = 0; c < math.min(heads.thr.W[r].length, src.heads.thr.W[r].length); c++) {
+        heads.thr.W[r][c] = mix(heads.thr.W[r][c], src.heads.thr.W[r][c]);
+      }
+    }
+    for (int i = 0; i < math.min(heads.thr.b.length, src.heads.thr.b.length); i++) {
+      heads.thr.b[i] = mix(heads.thr.b[i], src.heads.thr.b[i]);
+    }
+  }
+
+  /// Freeze/unfreeze convenience (no reliance on .trainable fields)
+  void setTrunkTrainable(bool on) { _trainTrunk = on; }
+  void setHeadsTrainable({bool intent = true, bool action = true, bool value = true}) {
+    _trainIntent = intent;
+    _trainAction = action;
+    _trainValue  = value;
   }
 
   /* ------------------------------------------------------------------------ */
@@ -1143,16 +1235,21 @@ class PolicyNetwork {
           }
         }
         final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
-        trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x);
-      }
-      final scale = lr * alignWeight / N;
-      for (int i = 0; i < heads.intent.b.length; i++) {
-        heads.intent.b[i] -= _clipGrad(scale * gb_int[i]);
-        for (int j = 0; j < heads.intent.W[0].length; j++) {
-          heads.intent.W[i][j] -= _clipGrad(scale * gW_int[i][j]);
+        // only backprop into trunk grads if trunk is trainable
+        if (_trainTrunk) {
+          trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x);
         }
       }
-      // zero accumulators to avoid double-applying trunk grads
+      final scale = lr * alignWeight / N;
+      if (_trainIntent) {
+        for (int i = 0; i < heads.intent.b.length; i++) {
+          heads.intent.b[i] -= _clipGrad(scale * gb_int[i]);
+          for (int j = 0; j < heads.intent.W[0].length; j++) {
+            heads.intent.W[i][j] -= _clipGrad(scale * gW_int[i][j]);
+          }
+        }
+      }
+      // zero accumulators to avoid double-applying trunk grads from CE stage
       for (int i = 0; i < gb_int.length; i++) gb_int[i] = 0.0;
       for (int i = 0; i < gW_int.length; i++) {
         for (int j = 0; j < gW_int[0].length; j++) gW_int[i][j] = 0.0;
@@ -1178,14 +1275,23 @@ class PolicyNetwork {
               (i) => (c.intentProbs[i] - (i == chosen ? 1.0 : 0.0)) * (-adv),
         );
         final dH = heads.intent.backward(x: h, dOut: dLog, gW: gW_int, gb: gb_int);
-        trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x);
-      }
-      final scale = lr * intentPgWeight / decisionCaches.length;
-      for (int i = 0; i < heads.intent.b.length; i++) {
-        heads.intent.b[i] -= _clipGrad(scale * gb_int[i]);
-        for (int j = 0; j < heads.intent.W[0].length; j++) {
-          heads.intent.W[i][j] -= _clipGrad(scale * gW_int[i][j]);
+        if (_trainTrunk) {
+          trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x);
         }
+      }
+      if (_trainIntent) {
+        final scale = lr * intentPgWeight / decisionCaches.length;
+        for (int i = 0; i < heads.intent.b.length; i++) {
+          heads.intent.b[i] -= _clipGrad(scale * gb_int[i]);
+          for (int j = 0; j < heads.intent.W[0].length; j++) {
+            heads.intent.W[i][j] -= _clipGrad(scale * gW_int[i][j]);
+          }
+        }
+      }
+      // if intent is frozen, discard its grads
+      for (int i = 0; i < gb_int.length; i++) gb_int[i] = 0.0;
+      for (int i = 0; i < gW_int.length; i++) {
+        for (int j = 0; j < gW_int[0].length; j++) gW_int[i][j] = 0.0;
       }
     }
 
@@ -1219,27 +1325,32 @@ class PolicyNetwork {
         final dH = List<double>.filled(h.length, 0.0);
         for (int i = 0; i < h.length; i++) dH[i] = dH_turn[i] + dH_thr[i];
 
-        trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x);
+        if (_trainTrunk) {
+          trunk.backwardFromTopGrad(dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x);
+        }
 
         meanThrLogit += c.thrLogit;
       }
 
       final scale = lr * actionAlignWeight / actionCaches.length;
-      for (int i = 0; i < heads.turn.b.length; i++) {
-        heads.turn.b[i] -= _clipGrad(scale * gb_turn[i]);
-        for (int j = 0; j < heads.turn.W[0].length; j++) {
-          heads.turn.W[i][j] -= _clipGrad(scale * gW_turn[i][j]);
+      if (_trainAction) {
+        for (int i = 0; i < heads.turn.b.length; i++) {
+          heads.turn.b[i] -= _clipGrad(scale * gb_turn[i]);
+          for (int j = 0; j < heads.turn.W[0].length; j++) {
+            heads.turn.W[i][j] -= _clipGrad(scale * gW_turn[i][j]);
+          }
         }
-      }
-      heads.thr.b[0] -= _clipGrad(scale * gb_thr[0]);
-      for (int j = 0; j < heads.thr.W[0].length; j++) {
-        heads.thr.W[0][j] -= _clipGrad(scale * gW_thr[0][j]);
+        heads.thr.b[0] -= _clipGrad(scale * gb_thr[0]);
+        for (int j = 0; j < heads.thr.W[0].length; j++) {
+          heads.thr.W[0][j] -= _clipGrad(scale * gW_thr[0][j]);
+        }
       }
 
       meanThrLogit /= actionCaches.length;
       teacherThrRate /= actionCaches.length;
       final logitTarget = nn.Ops.logit(teacherThrRate);
       final calibStep = 0.25;
+      // always calibrate bias (kept behavior)
       heads.thr.b[0] += (logitTarget - meanThrLogit) * calibStep;
     }
 
@@ -1271,13 +1382,15 @@ class PolicyNetwork {
           gb: gb_dur,
         );
 
-        trunk.backwardFromTopGrad(
-          dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x,
-        );
+        if (_trainTrunk) {
+          trunk.backwardFromTopGrad(
+            dTop: dH, acts: c.acts, gW: gW_trunk, gb: gb_trunk, x0: c.x,
+          );
+        }
       }
 
       final scale = lr * durationAlignWeight / durationCaches.length;
-      // apply dur head grads
+      // apply dur head grads (always train duration head)
       durHead.b[0] -= _clipGrad(scale * gb_dur[0]);
       for (int j = 0; j < durHead.W[0].length; j++) {
         durHead.W[0][j] -= _clipGrad(scale * gW_dur[0][j]);
@@ -1286,7 +1399,7 @@ class PolicyNetwork {
 
     // ===================== L2-SP consolidation (optional) =====================
     if (consolidateEnabled) {
-      if (consolidateTrunk > 0.0 && _snapWTrunk != null && _snapBTrunk != null) {
+      if (consolidateTrunk > 0.0 && _snapWTrunk != null && _snapBTrunk != null && _trainTrunk) {
         for (int li = 0; li < trunk.layers.length; li++) {
           final L = trunk.layers[li];
           final W0 = _snapWTrunk![li];
@@ -1300,7 +1413,7 @@ class PolicyNetwork {
         }
       }
       if (consolidateHeads > 0.0) {
-        if (_snapWIntent != null && _snapBIntent != null) {
+        if (_snapWIntent != null && _snapBIntent != null && _trainIntent) {
           for (int i = 0; i < heads.intent.W.length; i++) {
             for (int j = 0; j < heads.intent.W[0].length; j++) {
               gW_int[i][j] += consolidateHeads * (heads.intent.W[i][j] - _snapWIntent![i][j]);
@@ -1308,7 +1421,7 @@ class PolicyNetwork {
             gb_int[i] += consolidateHeads * (heads.intent.b[i] - _snapBIntent![i]);
           }
         }
-        if (_snapWTurn != null && _snapBTurn != null) {
+        if (_snapWTurn != null && _snapBTurn != null && _trainAction) {
           for (int i = 0; i < heads.turn.W.length; i++) {
             for (int j = 0; j < heads.turn.W[0].length; j++) {
               gW_turn[i][j] += consolidateHeads * (heads.turn.W[i][j] - _snapWTurn![i][j]);
@@ -1316,7 +1429,7 @@ class PolicyNetwork {
             gb_turn[i] += consolidateHeads * (heads.turn.b[i] - _snapBTurn![i]);
           }
         }
-        if (_snapWThr != null && _snapBThr != null) {
+        if (_snapWThr != null && _snapBThr != null && _trainAction) {
           for (int j = 0; j < heads.thr.W[0].length; j++) {
             gW_thr[0][j] += consolidateHeads * (heads.thr.W[0][j] - _snapWThr![0][j]);
           }
@@ -1327,15 +1440,17 @@ class PolicyNetwork {
     // =================== end consolidation ========================
 
     // ----- Apply trunk update -----
-    final trunkScale = lr;
-    for (int li = 0; li < trunk.layers.length; li++) {
-      final L = trunk.layers[li];
-      final gb = gb_trunk[li];
-      final gW = gW_trunk[li];
-      for (int i = 0; i < L.b.length; i++) L.b[i] -= _clipGrad(trunkScale * gb[i]);
-      for (int i = 0; i < L.W.length; i++) {
-        for (int j = 0; j < L.W[0].length; j++) {
-          L.W[i][j] -= _clipGrad(trunkScale * gW[i][j]);
+    if (_trainTrunk) {
+      final trunkScale = lr;
+      for (int li = 0; li < trunk.layers.length; li++) {
+        final L = trunk.layers[li];
+        final gb = gb_trunk[li];
+        final gW = gW_trunk[li];
+        for (int i = 0; i < L.b.length; i++) L.b[i] -= _clipGrad(trunkScale * gb[i]);
+        for (int i = 0; i < L.W.length; i++) {
+          for (int j = 0; j < L.W[0].length; j++) {
+            L.W[i][j] -= _clipGrad(trunkScale * gW[i][j]);
+          }
         }
       }
     }
@@ -1450,6 +1565,9 @@ class Trainer {
   final double durationBlend;       // 1.0 model only; 0.0 teacher only
   final double durationTeacherBias; // additive bias for teacher (frames)
 
+  final double gateProbDeadzoneZ;   // z-score below which we force DROP
+  final double gateProbFloor;       // absolute floor for acceptance prob
+
   Trainer({
     required this.env,
     required this.fe,
@@ -1499,6 +1617,8 @@ class Trainer {
     this.durationMaxHold = 24.0,
     this.durationBlend   = 0.7,   // lean toward model
     this.durationTeacherBias = 0.0,
+    this.gateProbDeadzoneZ = -0.35,
+    this.gateProbFloor = 0.02,
   }) : hebbian = hebbian ?? const HebbianConfig(),
         norm = RunningNorm(fe.inputSize, momentum: 0.995);
 
@@ -1585,7 +1705,13 @@ class Trainer {
 
     while (true) {
       if (framesLeft <= 0) {
-        var x = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
+        var x = fe.extract(
+          lander: env.lander,
+          terrain: env.terrain,
+          worldW: env.cfg.worldW,
+          worldH: env.cfg.worldH,
+          rays: env.rays,
+        );
         int yTeacher = predictiveIntentLabelAdaptive(
           env, baseTauSec: 1.0, minTauSec: 0.45, maxTauSec: 1.35,
         );
@@ -1594,7 +1720,11 @@ class Trainer {
           final L = env.lander;
           final rays = env.rays;
           if (rays.isNotEmpty) {
-            final av = _avgPadVectorFromRays(rays: rays, px: L.pos.x.toDouble(), py: L.pos.y.toDouble());
+            final av = _avgPadVectorFromRays(
+              rays: rays,
+              px: L.pos.x.toDouble(),
+              py: L.pos.y.toDouble(),
+            );
             if (av.valid) {
               final padIsLeft = av.x < 0.0;
               if (yTeacher == intentToIndex(Intent.goLeft) && !padIsLeft) {
@@ -1681,7 +1811,13 @@ class Trainer {
       final intent = indexToIntent(currentIntentIdx);
       final uTeacher = controllerForIntent(intent, env);
 
-      var xAct = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays);
+      var xAct = fe.extract(
+        lander: env.lander,
+        terrain: env.terrain,
+        worldW: env.cfg.worldW,
+        worldH: env.cfg.worldH,
+        rays: env.rays,
+      );
       xAct = norm?.normalize(xAct, update: false) ?? xAct;
 
       final fw = policy.forwardWithActs(xAct);
@@ -1804,7 +1940,7 @@ class Trainer {
 
     final segMean = (segCount > 0) ? (segSum / segCount) : 0.0;
 
-    // ---- Probabilistic gating (same as your current strict version) ----
+    // ---- Probabilistic gating with exposed knobs ----
     bool nearPadCrashOK = false;
     if (!landed && env.status == et.GameStatus.crashed && gateAcceptNearPadCrashes) {
       final L = env.lander;
@@ -1844,13 +1980,14 @@ class Trainer {
     final double dynThr = math.max(gateScoreMin, (inited ? (mu0 + 0.10) : gateScoreMin));
     final double zBase = (segMean - dynThr) / (sig0 + 1e-6);
 
-    const bool strictProfile = true;
-    final double pMin     = strictProfile ? 0.02 : gateProbMin.clamp(0.0, 1.0);
-    final double pMax     = strictProfile ? 0.80 : gateProbMax.clamp(0.0, 1.0);
-    final double kSigmoid = strictProfile ? 2.0  : math.max(1.0, gateProbK);
-    final double deadZoneZ = strictProfile ? -0.35 : -0.15;
-    final double boostL    = strictProfile ? 0.03 : gateProbLandedBoost.clamp(0.0, 1.0);
-    final double boostN    = strictProfile ? 0.02 : gateProbNearPadBoost.clamp(0.0, 1.0);
+    // Map z -> probability using your exposed params
+    final double pMinBase  = gateProbMin.clamp(0.0, 1.0);
+    final double pMin      = math.max(gateProbFloor.clamp(0.0, 1.0), pMinBase);
+    final double pMax      = gateProbMax.clamp(0.0, 1.0);
+    final double kSigmoid  = math.max(1.0, gateProbK);
+    final double deadZoneZ = gateProbDeadzoneZ; // force DROP if below this z
+    final double boostL    = gateProbLandedBoost.clamp(0.0, 1.0);
+    final double boostN    = gateProbNearPadBoost.clamp(0.0, 1.0);
 
     if (gateOnlyLanded && !landed && !nearPadCrashOK) {
       accept = false; sampledP = 0.0;
@@ -1904,6 +2041,11 @@ class Trainer {
       }
     }
 
-    return EpisodeResult(steps: steps, totalCost: totalCost, landed: landed, segMean: segMean);
+    return EpisodeResult(
+      steps: steps,
+      totalCost: totalCost,
+      landed: landed,
+      segMean: segMean,
+    );
   }
 }
