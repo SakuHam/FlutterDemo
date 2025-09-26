@@ -15,7 +15,7 @@ import 'agent.dart';
 import 'curriculum/final_approach.dart';
 import 'curriculum/final_dagger.dart';
 import 'curriculum/final_simple.dart';
-import 'curriculum/pad_align_progressive.dart';
+import 'curriculum/pad_align_progressive.dart' as padprog show PadAlignProgressiveCurriculum;
 import 'nn_helper.dart' as nn;
 import 'potential_field.dart'; // buildPotentialField, PotentialField
 
@@ -392,7 +392,7 @@ void main(List<String> argv) async {
   final registry = CurriculumRegistry()
     ..register('speedmin', () => SpeedMinCurriculum())
     ..register('padalign', () => PadAlignCurriculum())
-    ..register('padalign_progressive', () => PadAlignProgressiveCurriculum())
+    ..register('padalign_progressive', () => padprog.PadAlignProgressiveCurriculum())
     ..register('hardapp', () => HardApproach())
     ..register('final_simple', () => FinalSimple())
     ..register('final_dagger', () => FinalDagger())
