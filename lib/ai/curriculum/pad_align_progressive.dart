@@ -61,8 +61,8 @@ class PadAlignProgressiveCfg {
   final double probeDt;           // per-step dt during probe (usually 1/60)
 
   const PadAlignProgressiveCfg({
-    this.iters = 1600,
-    this.batch = 32,
+    this.iters = 4000,
+    this.batch = 8,
     this.fitEvery = 25,
     this.probeWindow = 500,
     this.sparkWidth = 12,
@@ -146,8 +146,8 @@ class PadAlignProgressiveCurriculum extends Curriculum {
   Curriculum configure(Map<String, String?> kv, Set<String> flags) {
     final cli = CliView(kv, flags);
     cfg = cfg.copyWith(
-      iters: cli.getInt('padprog_iters', def: 1600),
-      batch: cli.getInt('padprog_batch', def: 32),
+      iters: cli.getInt('padprog_iters', def: 10000),
+      batch: cli.getInt('padprog_batch', def: 8),
       fitEvery: cli.getInt('padprog_fit_every', def: 25),
       probeWindow: cli.getInt('padprog_probe_win', def: 500),
       sparkWidth: cli.getInt('padprog_spark_w', def: 12),
