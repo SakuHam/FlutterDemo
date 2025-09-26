@@ -56,7 +56,7 @@ _EvalChunkResult _evalChunk({
   required int evalDebugFailN,
 }) {
   final env = eng.GameEngine(cfg);
-  env.rayCfg = const RayConfig(rayCount: 180, includeFloor: false, forwardAligned: false);
+  env.rayCfg = const RayConfig(rayCount: 180, includeFloor: false, forwardAligned: true);
   final fe = FeatureExtractorRays(rayCount: env.rayCfg.rayCount);
 
   final trainer = Trainer(
@@ -70,8 +70,8 @@ _EvalChunkResult _evalChunk({
     planHold: planHold,
     tempIntent: tempIntent,
     intentEntropyBeta: intentEntropy,
-    useLearnedController: false,
-    blendPolicy: blendPolicy,
+    useLearnedController: true,
+    blendPolicy: 1.0, //blendPolicy,
     intentAlignWeight: 0.0,
     intentPgWeight: 0.0,
     actionAlignWeight: 0.0,
@@ -173,6 +173,10 @@ Future<EvalStats> evaluateParallel({
     cp.heads.turn.W   = _copyW(p.heads.turn.W);   cp.heads.turn.b   = List<double>.from(p.heads.turn.b);
     cp.heads.thr.W    = _copyW(p.heads.thr.W);    cp.heads.thr.b    = List<double>.from(p.heads.thr.b);
     cp.heads.val.W    = _copyW(p.heads.val.W);    cp.heads.val.b    = List<double>.from(p.heads.val.b);
+    for (int j = 0; j < cp.durHead.W[0].length; j++) {
+      cp.durHead.W[0][j] = p.durHead.W[0][j];
+    }
+    cp.durHead.b[0] = p.durHead.b[0];
     return cp;
   }
 

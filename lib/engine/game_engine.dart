@@ -24,7 +24,7 @@ class GameEngine {
   static const double _autoLevelGain  = 3.0;     // 1/sec
   static const double _flareBelow     = 40.0;    // px
   static const double _flareGain      = 8.0;     // 1/sec
-  static const double _rotFriction    = 0.6;     // rad/sec toward 0
+  static const double _rotFriction    = 0.6;     // rad/sec toward 0 (currently unused)
 
   // Substep limits (anti-tunneling)
   static const double _maxVertexStepPx = 3.0;      // max vertex travel per substep
@@ -169,7 +169,7 @@ class GameEngine {
       final len = math.sqrt(dx*dx + dy*dy);
       if (len > 1e-6) return Vector2(dx/len, dy/len);
     }
-    // Default: go up (negative Y in screen coordinates)
+    // Default: go up (negative Y in screen coordinates for y-down)
     return Vector2(0.0, -1.0);
   }
 
@@ -252,10 +252,10 @@ class GameEngine {
 
       // ----- Acceleration & fuel burn -----
       final double thrustA = t.thrustAccel * 0.05; // EQUALIZED THRUST POWER
-      Vector2 accel = Vector2(0, t.gravity * 0.05);
+      Vector2 accel = Vector2(0, t.gravity * 0.05); // +Y is down in y-down coords
       double fuel = lander.fuel;
 
-      // Main engine
+      // Main engine: up thrust at angle==0 (negative Y)
       final bool mainOn = u.thrust && fuel > 0.0;
       final double power = mainOn ? 1.0 : 0.0;
       if (mainOn) {
@@ -265,6 +265,7 @@ class GameEngine {
       }
 
       // Side thrusters (equal power to main, per-thruster fuel)
+      // NOTE: sideLeft fires the LEFT pod, which pushes to +X in body frame (rightward).
       if (t.rcsEnabled && fuel > 0.0) {
         final bool l = u.sideLeft;
         final bool r = u.sideRight;
@@ -375,26 +376,28 @@ class GameEngine {
       stepCost += score.cost;
 
       // --- Directional pad-toward shaping (robust, symmetric) ---
+      // FIXED: use current microstep pos/vel and correct desired-velocity sign.
           {
-        final double x = lander.pos.x.toDouble();
-        final double y = lander.pos.y.toDouble();
-        final double vxNow = lander.vel.x.toDouble();
-        final double W = cfg.worldW.toDouble();
+        final double x  = pos.x.toDouble();
+        final double vxNow = vel.x.toDouble();
 
         // height above local ground
-        final gy = terrain.heightAt(x);
-        final h  = (gy - y).toDouble().clamp(0.0, 1e9);
+        final double gy = terrain.heightAt(x);
+        final double h  = (gy - pos.y).toDouble().clamp(0.0, 1e9);
 
         // pad rays summary: minD, bearing (rad, +right), visible∈[0,1]
         final ps = padSummary();
         final bool padSeen = ps.visible > 0.05; // tune
-        final double s = padSeen
-            ? (ps.bearing >= 0 ? 1.0 : -1.0)   // +right, -left
-            : ((W * 0.5 - x) >= 0 ? 1.0 : -1.0);
 
-        // desirables: gently head toward pad, but fade near touchdown
-        final double vTargetFar = 12.0;   // px/s
-        final double vTargetNear = 4.0;   // px/s
+        // If rays see pad, sign from bearing; otherwise fallback to pad center
+        final double padCx = terrain.padCenter.toDouble();
+        final double sLR = padSeen
+            ? (ps.bearing >= 0 ? 1.0 : -1.0)         // +right, -left
+            : ((padCx - x) >= 0 ? 1.0 : -1.0);       // fallback heuristic
+
+        // desirables: gently head toward pad, fade near touchdown
+        const double vTargetFar  = 12.0;   // px/s
+        const double vTargetNear =  4.0;   // px/s
         final double a = (h / 300.0).clamp(0.0, 1.0);  // far→near blend
         final double vTarget = vTargetNear + a * (vTargetFar - vTargetNear);
 
@@ -402,9 +405,14 @@ class GameEngine {
         final double baseW = padSeen ? 1.0 : 0.35;
         final double w = baseW * math.exp(- (h * h) / (220.0 * 220.0 + 1e-6));
 
-        // penalty if moving away (vx*s positive means moving away from pad center)
-        final double away = (vxNow * s - (-vTarget)).clamp(0.0, 1e9);
-        final double lambdaDir = 0.002; // start tiny; 0.001–0.006 works well
+        // desired lateral velocity toward pad (positive when pad is to the right)
+        final double vDesired = sLR * vTarget;
+
+        // hinge penalty if not moving enough toward the pad (or moving away)
+        final double err = vDesired - vxNow;
+        final double away = err > 0 ? err : 0.0;
+
+        const double lambdaDir = 0.002; // 0.001–0.006 reasonable
         stepCost += lambdaDir * w * away;
       }
 
@@ -422,12 +430,11 @@ class GameEngine {
         );
 
         // Alignment penalties (0 good → 2 bad)
-        final double pNow = _alignPenalty(vNow, dHat);
-        final double pFut = _alignPenalty(vFuture, dHat);
-
-        // Weights (tunable)
         const double kNow   = 0.45;
         const double kFut   = 0.80;
+
+        final double pNow = _alignPenalty(vNow, dHat);
+        final double pFut = _alignPenalty(vFuture, dHat);
 
         // Blend scales with substep duration so it’s time-consistent
         final double w = dtk;

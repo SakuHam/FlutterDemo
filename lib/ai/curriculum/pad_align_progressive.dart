@@ -61,7 +61,7 @@ class PadAlignProgressiveCfg {
   final double probeDt;           // per-step dt during probe (usually 1/60)
 
   const PadAlignProgressiveCfg({
-    this.iters = 4000,
+    this.iters = 5000,
     this.batch = 8,
     this.fitEvery = 25,
     this.probeWindow = 500,
@@ -146,8 +146,8 @@ class PadAlignProgressiveCurriculum extends Curriculum {
   Curriculum configure(Map<String, String?> kv, Set<String> flags) {
     final cli = CliView(kv, flags);
     cfg = cfg.copyWith(
-      iters: cli.getInt('padprog_iters', def: 10000),
-      batch: cli.getInt('padprog_batch', def: 8),
+      iters: cli.getInt('padprog_iters', def: 5000),
+      batch: cli.getInt('padprog_batch', def: 4),
       fitEvery: cli.getInt('padprog_fit_every', def: 25),
       probeWindow: cli.getInt('padprog_probe_win', def: 500),
       sparkWidth: cli.getInt('padprog_spark_w', def: 12),
@@ -331,11 +331,11 @@ class PadAlignProgressiveCurriculum extends Curriculum {
       final agreeFrac = _polAgree / _polVotes;
       if (agreeFrac < 0.20) {
         _invertLR = !_invertLR;
-        print('[PADPROG/POLARITY] Flipping LR mapping. invertLR=${_invertLR ? "ON" : "OFF"} '
-            '(agree=${(100*agreeFrac).toStringAsFixed(1)}% over $_polVotes votes)');
+//        print('[PADPROG/POLARITY] Flipping LR mapping. invertLR=${_invertLR ? "ON" : "OFF"} '
+//            '(agree=${(100*agreeFrac).toStringAsFixed(1)}% over $_polVotes votes)');
       } else {
-        print('[PADPROG/POLARITY] Keeping mapping. invertLR=${_invertLR ? "ON" : "OFF"} '
-            '(agree=${(100*agreeFrac).toStringAsFixed(1)}% over $_polVotes votes)');
+//        print('[PADPROG/POLARITY] Keeping mapping. invertLR=${_invertLR ? "ON" : "OFF"} '
+//            '(agree=${(100*agreeFrac).toStringAsFixed(1)}% over $_polVotes votes)');
       }
       _polVotes = 0; _polAgree = 0;
     }

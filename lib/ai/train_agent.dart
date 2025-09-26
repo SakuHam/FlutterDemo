@@ -127,6 +127,10 @@ Map<String, dynamic> _policyToJson({
       'turn': headJson(p.heads.turn),
       'thr': headJson(p.heads.thr),
       'val': headJson(p.heads.val),
+      'dur': {
+        'W': [ List<double>.from(p.durHead.W[0]) ], // 1 x H
+        'b': [ p.durHead.b[0] ],
+      },
     },
     'feature_extractor': {
       'kind': 'rays',
@@ -159,6 +163,12 @@ Map<String, dynamic> _policyToJson({
 
     'signature': sig,
     'format': 'v2rays',
+
+    'ray_config': {
+      'rayCount': rayCount,
+      'includeFloor': env.rayCfg.includeFloor,
+      'forwardAligned': env.rayCfg.forwardAligned,
+    },
   };
 
   if (norm != null && norm.inited && norm.dim == p.inputSize) {
@@ -274,17 +284,22 @@ void _loadPolicyIntoNetwork({
   _loadHead('val', target.heads.val);
 
   // Norm (optional)
-  final nm = (j['norm'] as Map?)?.cast<String, dynamic>();
-  if (nm != null && norm != null) {
-    final dim = (nm['dim'] as num?)?.toInt() ?? -1;
-    if (dim == norm.dim) {
-      final mean = (nm['mean'] as List).map((e) => (e as num).toDouble()).toList();
-      final var_ = (nm['var'] as List).map((e) => (e as num).toDouble()).toList();
-      if (mean.length == norm.dim && var_.length == norm.dim) {
-        norm.mean = mean;
-        norm.var_ = var_;
-        norm.inited = true;
+  final durJ = headsJ['dur'];
+  if (durJ != null) {
+    List<List<double>> _as2d(dynamic v) => (v as List)
+        .map<List<double>>((r) => (r as List).map<double>((x) => (x as num).toDouble()).toList())
+        .toList();
+    List<double> _as1d(dynamic v) => (v as List).map<double>((x) => (x as num).toDouble()).toList();
+
+    final Wd = _as2d((durJ as Map)['W']);
+    final Bd = _as1d(durJ['b']);
+    if (Wd.length == 1 && Wd[0].length == target.durHead.W[0].length && Bd.length == 1) {
+      for (int j = 0; j < target.durHead.W[0].length; j++) {
+        target.durHead.W[0][j] = Wd[0][j];
       }
+      target.durHead.b[0] = Bd[0];
+    } else {
+      // shape mismatch → ignore quietly or throw, your call
     }
   }
 
@@ -563,7 +578,7 @@ void main(List<String> argv) async {
   env.reset(seed: seed ^ 0xC0FFEE);
   env.step(1 / 60.0, const et.ControlInput(thrust: false, left: false, right: false));
   final inDim = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays).length;
-  final kindsOneHot = (inDim == 6 + env.rayCfg.rayCount * 4);
+  final kindsOneHot = true; //(inDim == 6 + env.rayCfg.rayCount * 4);
 
   // ----- Policy -----
   final policy = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
@@ -574,13 +589,15 @@ void main(List<String> argv) async {
   policy.setHeadsTrainable(intent: true, action: true, value: false);
   print('[STAGE] Curricula: trainable { trunk=ON, intent=ON, action=ON, value=OFF }');
 
+  final loadedNorm = ai.RunningNorm(inDim, momentum: 0.995);
+
   // ===== Optional: LOAD existing policy weights =====
   if (loadPath != null && loadPath.trim().isNotEmpty) {
     _loadPolicyIntoNetwork(
       path: loadPath,
       target: policy,
       env: env,
-      norm: null,
+      norm: loadedNorm,
     );
     if (anchorOnLoad) {
       policy.captureConsolidationAnchor();
@@ -657,6 +674,11 @@ void main(List<String> argv) async {
     minIntentEntropy: minIntEntropy,
     maxSameIntentRun: maxSameRun,
   );
+
+  if (loadedNorm.inited) {
+    trainer.norm?.copyFrom(loadedNorm);
+    print('Restored feature normalization from policy JSON.');
+  }
 
   // Determinism probe
   if (determinism) {

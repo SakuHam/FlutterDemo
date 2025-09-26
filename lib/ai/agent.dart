@@ -1350,8 +1350,9 @@ class PolicyNetwork {
       teacherThrRate /= actionCaches.length;
       final logitTarget = nn.Ops.logit(teacherThrRate);
       final calibStep = 0.25;
-      // always calibrate bias (kept behavior)
-      heads.thr.b[0] += (logitTarget - meanThrLogit) * calibStep;
+      if (_trainAction) {
+        heads.thr.b[0] += (logitTarget - meanThrLogit) * calibStep;
+      }
     }
 
     // ----- Duration head supervision (optional) -----
@@ -1685,7 +1686,7 @@ class Trainer {
     final durationCaches = <ForwardCache>[];
     final durationTargets = <double>[];
 
-    env.reset(seed: r.nextInt(1 << 30));
+//    env.reset(seed: r.nextInt(1 << 30));
     double totalCost = 0.0;
 
     double segSum = 0.0;
@@ -1799,7 +1800,7 @@ class Trainer {
 
         // blend model & teacher
         final useHold = (durationBlend * predHold) + ((1.0 - durationBlend) * teacherHold);
-        framesLeft = useHold.round().clamp(1, 120);
+        framesLeft = useHold.round().clamp(1, 24);
 
         // stash duration training data
         if (train) {
