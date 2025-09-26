@@ -15,6 +15,7 @@ import 'agent.dart';
 import 'curriculum/final_approach.dart';
 import 'curriculum/final_dagger.dart';
 import 'curriculum/final_simple.dart';
+import 'curriculum/pad_align_progressive.dart';
 import 'nn_helper.dart' as nn;
 import 'potential_field.dart'; // buildPotentialField, PotentialField
 
@@ -391,11 +392,11 @@ void main(List<String> argv) async {
   final registry = CurriculumRegistry()
     ..register('speedmin', () => SpeedMinCurriculum())
     ..register('padalign', () => PadAlignCurriculum())
+    ..register('padalign_progressive', () => PadAlignProgressiveCurriculum())
     ..register('hardapp', () => HardApproach())
     ..register('final_simple', () => FinalSimple())
     ..register('final_dagger', () => FinalDagger())
     ..register('final', () => FinalApproach());
-
   // ---- Common CLI ----
   final seed = args.getInt('seed', def: 7);
 
@@ -659,6 +660,7 @@ void main(List<String> argv) async {
       cur.key == 'hardapp'   && hardappIters > 0 ? hardappIters :
       cur.key == 'speedmin'  && lowaltIters  > 0 ? lowaltIters  :
       cur.key == 'padalign'  && lowaltIters  > 0 ? lowaltIters  :
+      cur.key == 'padalign_progressive'  && lowaltIters  > 0 ? lowaltIters  :
       cur.key == 'final'  && lowaltIters  > 0 ? lowaltIters  :
       cur.key == 'final_simple'  && lowaltIters  > 0 ? lowaltIters  :
       cur.key == 'final_dagger'  && lowaltIters  > 0 ? lowaltIters  :
