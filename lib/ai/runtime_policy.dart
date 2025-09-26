@@ -300,12 +300,15 @@ class _RuntimeFE_Rays implements _RuntimeFE {
    ========================================================================== */
 
 List<double> _matVec(List<List<double>> W, List<double> x) {
-  final m = W.length, n = x.length;
+  final m = W.length, k = W.isEmpty ? 0 : W[0].length;
+  if (x.length != k) {
+    throw StateError('Feature dim ${x.length} != expected $k');
+  }
   final out = List<double>.filled(m, 0.0);
   for (int i = 0; i < m; i++) {
-    double s = 0.0;
     final Wi = W[i];
-    for (int j = 0; j < n; j++) s += Wi[j] * x[j];
+    double s = 0.0;
+    for (int j = 0; j < k; j++) s += Wi[j] * x[j];
     out[i] = s;
   }
   return out;
@@ -592,17 +595,20 @@ _controllerForIntentExt(
    Runtime policy
    ========================================================================== */
 
+/// Live planner selector: NN intent head vs teacher (pad-align progressive)
+enum PlannerMode { nn, padAlign }
+
 class RuntimeTwoStagePolicy {
   // Architecture (inferred)
   final int inputSize;
-  final _MLP trunk;       // arbitrary hidden layers (tanh)
+  final _MLP trunk;         // arbitrary hidden layers (tanh)
   final _Linear headIntent; // (K, Hlast)
   // Optional loaded heads (not used by planner, kept for parity)
-  final _Linear? headTurn; // (3, Hlast)
-  final _Linear? headThr;  // (1, Hlast)
-  final _Linear? headVal;  // (1, Hlast)
+  final _Linear? headTurn;  // (3, Hlast)
+  final _Linear? headThr;   // (1, Hlast)
+  final _Linear? headVal;   // (1, Hlast)
   // NEW: optional learned duration/hold head (seconds)
-  final _Linear? headDur;  // (1, Hlast)
+  final _Linear? headDur;   // (1, Hlast)
 
   // FE & planner config
   final _RuntimeFE fe;
@@ -641,9 +647,14 @@ class RuntimeTwoStagePolicy {
   final bool mirrorX; // hard flip left/right mapping (debug/safety)
 
   // ===== NEW: runtime knobs =====
-  double intentTemp;           // 1.0 = unchanged; >1.0 flatter; <1.0 sharper
-  bool stochasticPlanner;      // if true, sample intent ~ softmax(logits / T)
+  PlannerMode mode = PlannerMode.nn; // <— planner selector
+  double intentTemp;                 // 1.0 = unchanged; >1.0 flatter; <1.0 sharper
+  bool stochasticPlanner;            // if true, sample intent ~ softmax(logits / T)
   final math.Random _rnd;
+
+  // Quick toggles for UI
+  void useNNPlanner()        { mode = PlannerMode.nn; }
+  void usePadAlignPlanner()  { mode = PlannerMode.padAlign; }
 
   RuntimeTwoStagePolicy._({
     required this.inputSize,
@@ -921,6 +932,116 @@ class RuntimeTwoStagePolicy {
 
   double _vCapBrakeUp(double h) => (0.07 * h + 6.0).clamp(6.0, 16.0);
 
+  /// ---- Runtime port of pad_align_progressive teacher (intent index) ----
+  int _predictiveIntentLabelAdaptiveRuntime({
+    required LanderState L,
+    required Terrain T,
+    required RuntimePhysics phys,
+    required double worldW,
+    required List<RayHit> rays,
+  }) {
+    final px = L.pos.x.toDouble();
+    final py = L.pos.y.toDouble();
+    final vx = L.vel.x.toDouble();
+    final vy = L.vel.y.toDouble();
+
+    final padCx = (T.padX1 + T.padX2) * 0.5;
+    final gy    = T.heightAt(px);
+    final h     = (gy - py).toDouble().clamp(0.0, 1e9);
+    final W     = worldW.toDouble();
+
+    // height-adaptive horizon
+    final baseTauSec = 1.0, minTauSec = 0.45, maxTauSec = 1.35;
+    final hNorm = (h / 320.0).clamp(0.0, 1.6);
+    final tau   = (baseTauSec * (0.7 + 0.5 * hNorm)).clamp(minTauSec, maxTauSec);
+
+    // predict short-term future
+    final g   = phys.gravity;
+    final xF  = px + vx * tau;
+    final vyF = vy + g * tau;
+
+    // pad vector (rays preferred)
+    double pdx = 0.0, pdy = 0.0; bool padVecValid = false;
+    double sx = 0.0, sy = 0.0, wsum = 0.0;
+    for (final r in rays) {
+      if (r.kind != RayHitKind.pad) continue;
+      final dx = r.p.x - px;
+      final dy = r.p.y - py;
+      final d2 = dx*dx + dy*dy;
+      if (d2 <= 1e-9) continue;
+      final w = 1.0 / math.sqrt(d2 + 1e-6);
+      sx += w * dx; sy += w * dy; wsum += w;
+    }
+    if (wsum > 0.0) { final inv = 1.0 / wsum; pdx = sx * inv; pdy = sy * inv; padVecValid = true; }
+    else            { pdx = (padCx - px); pdy = 0.0; }
+
+    double crossZ(double ax, double ay, double bx, double by) => ax*by - ay*bx;
+    double dot   (double ax, double ay, double bx, double by) => ax*bx + ay*by;
+
+    final padLen = math.sqrt(pdx*pdx + pdy*pdy);
+    final vFx = vx;
+    final vFy = vyF;
+    final vFmag = math.sqrt(vFx*vFx + vFy*vFy) + 1e-9;
+
+    double _vCapBrakeUp(double hh) => (0.07 * hh + 6.0).clamp(6.0, 16.0);
+
+    // Emergency brake-up near pad center
+    final vCapStrong   = _vCapBrakeUp(h);
+    final tooLow       = h < 140.0;
+    final tooFastDown  = vyF > math.max(40.0, vCapStrong + 10.0);
+    final nearPadLat   = (px - padCx).abs() <= 0.18 * W;
+    if (tooLow && tooFastDown && nearPadLat) {
+      return Intent.brakeUp.index;
+    }
+
+    // centered laterally → manage locally
+    final padEnter = 0.08 * W;
+    final dxNow    = px - padCx;
+    if (dxNow.abs() <= padEnter) {
+      if (vx >  25.0) return Intent.brakeRight.index;
+      if (vx < -25.0) return Intent.brakeLeft.index;
+      return Intent.descendSlow.index;
+    }
+
+    // will cross center within τ?
+    final dxF = xF - padCx;
+    final crossesCenter = (dxNow * dxF) < 0.0;
+    if (crossesCenter) {
+      if (vx >  12.0) return Intent.brakeRight.index;
+      if (vx < -12.0) return Intent.brakeLeft.index;
+      return Intent.descendSlow.index;
+    }
+
+    // drifting away?
+    final driftingAway = dxF.abs() > dxNow.abs() + 2.0;
+    if (driftingAway) return (dxNow > 0.0) ? Intent.goLeft.index : Intent.goRight.index;
+
+    if (padVecValid) {
+      final cp = crossZ(vFx, vFy, pdx, pdy);   // >0: pad left of vF
+      final dp = dot   (vFx, vFy, pdx, pdy);
+
+      final cpThresh = 0.015 * vFmag * (padLen > 1.0 ? padLen : 1.0);
+      final dpBad    = -0.030 * vFmag * (padLen > 1.0 ? padLen : 1.0);
+
+      final misaligned = (cp.abs() > cpThresh) || (dp < dpBad);
+      if (misaligned) return (cp > 0.0) ? Intent.goLeft.index : Intent.goRight.index;
+    } else {
+      double _vCapHover(double hh) => (0.06 * hh + 6.0).clamp(6.0, 18.0);
+      final vCapHover = _vCapHover(h);
+      final needUp    = (vy > vCapHover) || (vyF > 0.85 * vCapHover);
+      if (needUp) return Intent.brakeUp.index;
+    }
+
+    final padExit     = 0.14 * W;
+    final willExitSoon = (dxF.abs() > padEnter) && (dxNow.abs() <= padEnter);
+    final vxIsOutward  = (dxNow.sign == vx.sign) && vx.abs() > 18.0;
+    if ((willExitSoon || vxIsOutward) && h > 90.0) {
+      return (dxNow >= 0.0) ? Intent.goLeft.index : Intent.goRight.index;
+    }
+
+    return Intent.descendSlow.index;
+  }
+
   /// Back-compat: original API (no side/down thrusters).
   /// If your engine supports extra channels, call [actWithIntentExt] instead.
   (bool thrust, bool left, bool right, int intentIdx, List<double> probs) actWithIntent({
@@ -928,56 +1049,17 @@ class RuntimeTwoStagePolicy {
     required Terrain terrain,
     required double worldW,
     required double worldH,
-    List<RayHit>? rays, // REQUIRED when FE is rays
+    List<RayHit>? rays, // REQUIRED when FE is rays or when padAlign planner is used
     int step = 0,
     double uiMaxFuel = 100.0,
   }) {
     // Re-plan if needed
     if (_framesLeft <= 0) {
-      var x = fe.extract(
-        lander: lander,
-        terrain: terrain,
-        worldW: worldW,
-        worldH: worldH,
-        rays: rays,
-        uiMaxFuel: uiMaxFuel,
-      );
-      if (norm != null) x = norm!.apply(x);
-
-      final h = trunk.forward(x);
-      final rawLogits = headIntent.forward(h);
-
-      // ===== Temperature + (optional) sampling =====
-      final z = List<double>.generate(rawLogits.length, (i) => rawLogits[i] / intentTemp);
-      final probs = _softmax(z);
-
       int idx;
-      if (stochasticPlanner) {
-        final u = _rnd.nextDouble();
-        double acc = 0.0;
-        idx = probs.length - 1;
-        for (int i = 0; i < probs.length; i++) {
-          acc += probs[i];
-          if (u <= acc) { idx = i; break; }
-        }
-      } else {
-        idx = _argmax(probs);
-      }
-
-      _currentIntentIdx = idx;
-
-      // Optional polarity fix using average pad vector
-      if (fixPolarityWithPadRays && rays != null && rays.isNotEmpty) {
-        final av = _avgPadVector(rays: rays, px: lander.pos.x, py: lander.pos.y);
-        if (av.valid) {
-          final padIsLeft = av.x < 0.0;
-          final isLeft = _currentIntentIdx == Intent.goLeft.index;
-          final isRight = _currentIntentIdx == Intent.goRight.index;
-          if ((isLeft && !padIsLeft) || (isRight && padIsLeft)) {
-            _currentIntentIdx = isLeft ? Intent.goRight.index : Intent.goLeft.index;
-          }
-        }
-      }
+      List<double> probs;
+      double learnedHoldSec = 0.0; // only used in NN mode
+      int baseHoldFrames;
+      int combinedHold;
 
       // Pad visibility diagnostics (for overlays/logs)
       if (rays != null && rays.isNotEmpty) {
@@ -988,30 +1070,127 @@ class RuntimeTwoStagePolicy {
         _padSeenFrac = 0.0;
       }
 
-      // === Compute plan hold (heuristic + learned duration) ===
-      final holdMul = _dynamicPlanHoldMul(
-          lander: lander, terrain: terrain, worldW: worldW);
-      final int baseHoldFrames = (planHold * holdMul).clamp(1, 120);
+      // === Intent selection path ===
+      if (mode == PlannerMode.padAlign) {
+        // Use teacher directly (rays preferred; if null, pass empty list)
+        final rr = rays ?? const <RayHit>[];
+        idx = _predictiveIntentLabelAdaptiveRuntime(
+          L: lander, T: terrain, phys: physics, worldW: worldW, rays: rr,
+        );
+        // One-hot probs for UI
+        probs = List<double>.filled(kIntentNames.length, 0.0)..[idx] = 1.0;
 
-      // Optional learned seconds → frames
-      int learnedHoldFrames = 0;
-      double learnedHoldSec = 0.0;
-      if (headDur != null) {
-        final zDur = headDur!.forward(h)[0]; // raw logit
-        learnedHoldSec = _softplus(zDur);    // >= 0 s
-        const double maxLearnedSec = 2.0;    // cap (tune as needed)
-        final secClamped = learnedHoldSec.clamp(0.0, maxLearnedSec);
-        learnedHoldFrames = (secClamped * 60.0).round();
+        // Hold: heuristic only (no learned duration)
+        final holdMul = _dynamicPlanHoldMul(
+          lander: lander, terrain: terrain, worldW: worldW,
+        );
+        baseHoldFrames = (planHold * holdMul).clamp(1, 120);
+        combinedHold = baseHoldFrames;
+
+        // Publish intent event early with planner tag
+        IntentBus.instance.publishIntent(
+          IntentEvent(
+            intent: kIntentNames[idx],
+            probs: probs,
+            step: step,
+            meta: {
+              'planner': 'padAlign',
+              'plan_hold': planHold,
+              'hold_mul': holdMul,
+              'hold_frames_base': baseHoldFrames,
+              'hold_learned_sec': 0.0,
+              'hold_frames_combined': combinedHold,
+              'padSeenFrac': _padSeenFrac,
+            },
+          ),
+        );
+      } else {
+        // ===== NN path (original) =====
+        var x = fe.extract(
+          lander: lander,
+          terrain: terrain,
+          worldW: worldW,
+          worldH: worldH,
+          rays: rays,
+          uiMaxFuel: uiMaxFuel,
+        );
+        if (norm != null) x = norm!.apply(x);
+
+        final h = trunk.forward(x);
+        final rawLogits = headIntent.forward(h);
+
+        // Temperature + (optional) sampling
+        final z = List<double>.generate(rawLogits.length, (i) => rawLogits[i] / intentTemp);
+        probs = _softmax(z);
+
+        if (stochasticPlanner) {
+          final u = _rnd.nextDouble();
+          double acc = 0.0;
+          idx = probs.length - 1;
+          for (int i = 0; i < probs.length; i++) {
+            acc += probs[i];
+            if (u <= acc) { idx = i; break; }
+          }
+        } else {
+          idx = _argmax(probs);
+        }
+
+        // Optional polarity fix using average pad vector (only for NN)
+        if (fixPolarityWithPadRays && rays != null && rays.isNotEmpty) {
+          final av = _avgPadVector(rays: rays, px: lander.pos.x, py: lander.pos.y);
+          if (av.valid) {
+            final padIsLeft = av.x < 0.0;
+            final isLeft  = idx == Intent.goLeft.index;
+            final isRight = idx == Intent.goRight.index;
+            if ((isLeft && !padIsLeft) || (isRight && padIsLeft)) {
+              idx = isLeft ? Intent.goRight.index : Intent.goLeft.index;
+            }
+          }
+        }
+
+        // Hold computation (heuristic + learned duration)
+        final holdMul = _dynamicPlanHoldMul(
+            lander: lander, terrain: terrain, worldW: worldW);
+        baseHoldFrames = (planHold * holdMul).clamp(1, 120);
+
+        int learnedHoldFrames = 0;
+        if (headDur != null) {
+          final zDur = headDur!.forward(h)[0]; // raw logit
+          learnedHoldSec = _softplus(zDur);    // >= 0 s
+          const double maxLearnedSec = 2.0;    // cap (tune as needed)
+          final secClamped = learnedHoldSec.clamp(0.0, maxLearnedSec);
+          learnedHoldFrames = (secClamped * 60.0).round();
+        }
+
+        combinedHold = (baseHoldFrames + learnedHoldFrames).clamp(1, 120);
+
+        IntentBus.instance.publishIntent(
+          IntentEvent(
+            intent: kIntentNames[idx],
+            probs: probs,
+            step: step,
+            meta: {
+              'planner': 'nn',
+              'plan_hold': planHold,                 // base config
+              'hold_mul': holdMul,                   // dynamic multiplier
+              'hold_frames_base': baseHoldFrames,    // heuristic frames
+              'hold_learned_sec': learnedHoldSec,    // NN predicted seconds (softplus)
+              'hold_frames_combined': combinedHold,  // final frames after smoothing
+              'T': intentTemp,
+              'stochastic': stochasticPlanner,
+              'padSeenFrac': _padSeenFrac,
+            },
+          ),
+        );
       }
 
-      final int combinedHold = (baseHoldFrames + learnedHoldFrames).clamp(1, 120);
-
-      // Smooth to avoid jitter (EMA)
+      // Finalize hold with smoothing (time-consistent)
       const double a = 0.65; // higher → smoother/laggier
       if (_holdEma <= 0.0) _holdEma = combinedHold.toDouble();
       _holdEma = a * _holdEma + (1.0 - a) * combinedHold.toDouble();
       _framesLeft = _holdEma.round();
 
+      _currentIntentIdx = idx;
       _lastReplanProbs = probs;
 
       // === Publish a plan preview for the overlay (if PF available) ===
@@ -1036,24 +1215,6 @@ class RuntimeTwoStagePolicy {
       } catch (_) {
         // ignore planning errors
       }
-
-      IntentBus.instance.publishIntent(
-        IntentEvent(
-          intent: kIntentNames[_currentIntentIdx],
-          probs: probs,
-          step: step,
-          meta: {
-            'plan_hold': planHold,                 // base config
-            'hold_mul': holdMul,                   // dynamic multiplier
-            'hold_frames_base': baseHoldFrames,    // heuristic frames
-            'hold_learned_sec': learnedHoldSec,    // NN predicted seconds (softplus)
-            'hold_frames_combined': _framesLeft,   // final frames after smoothing
-            'T': intentTemp,
-            'stochastic': stochasticPlanner,
-            'padSeenFrac': _padSeenFrac,
-          },
-        ),
-      );
     }
 
     final idxNow = _currentIntentIdx < 0 ? 0 : _currentIntentIdx;
@@ -1093,6 +1254,7 @@ class RuntimeTwoStagePolicy {
         step: step,
         meta: {
           'intent': kIntentNames[idxNow],
+          'planner': mode == PlannerMode.padAlign ? 'padAlign' : 'nn',
           'mirrorX': true,
           'hold_left': _framesLeft,
           'thrust_latch': _thrustLatch,
@@ -1111,6 +1273,7 @@ class RuntimeTwoStagePolicy {
         step: step,
         meta: {
           'intent': kIntentNames[idxNow],
+          'planner': mode == PlannerMode.padAlign ? 'padAlign' : 'nn',
           'hold_left': _framesLeft,
           'thrust_latch': _thrustLatch,
           'padSeenFrac': _padSeenFrac,
@@ -1172,6 +1335,7 @@ class RuntimeTwoStagePolicy {
       step: step,
       meta: {
         'intent': kIntentNames[idxNow],
+        'planner': mode == PlannerMode.padAlign ? 'padAlign' : 'nn',
         'sideLeft': sideLeft,
         'sideRight': sideRight,
         'downThrust': ext.downThrust,

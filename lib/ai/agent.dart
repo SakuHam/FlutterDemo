@@ -469,6 +469,15 @@ int predictiveIntentLabelAdaptive(
         : intentToIndex(Intent.goRight);
   }
 
+  final bool nearlyNoVx = vx.abs() < 6.0;
+  if (!crossesCenter && !driftingAway && nearlyNoVx) {
+    final double padEnter = 0.08 * W; // same as earlier
+    if (dxNow.abs() > padEnter) {
+      return (dxNow > 0.0) ? intentToIndex(Intent.goLeft)
+          : intentToIndex(Intent.goRight);
+    }
+  }
+
   if (padVecValid) {
     final cp = crossZ(vFx, vFy, pdx, pdy);   // >0: pad left of vF
     final dp = dot   (vFx, vFy, pdx, pdy);

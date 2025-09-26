@@ -24,7 +24,7 @@ class GameEngine {
   static const double _autoLevelGain  = 3.0;     // 1/sec
   static const double _flareBelow     = 40.0;    // px
   static const double _flareGain      = 8.0;     // 1/sec
-  static const double _rotFriction    = 0.6;     // rad/sec toward 0 (currently unused)
+  static const double _rotFriction    = 0.6;     // rad/sec toward 0
 
   // Substep limits (anti-tunneling)
   static const double _maxVertexStepPx = 3.0;      // max vertex travel per substep
@@ -37,6 +37,9 @@ class GameEngine {
   List<RayHit> get rays => _rays;
   RayConfig get rayCfg => _sensors.cfg;
   set rayCfg(RayConfig v) => _sensors = RayCaster(v);
+
+  // Bearing polarity auto-calibration (true = invert ray bearing)
+  bool _bearingFlip = false;
 
   GameEngine(this.cfg) : _rnd = math.Random(cfg.seed) {
     reset(seed: cfg.seed);
@@ -152,14 +155,29 @@ class GameEngine {
       origin: lander.pos,
       angle: lander.angle,
     );
+
+    // ---- Auto-calibrate bearing sign once per reset ----
+    // Expectation: bearing > 0 means pad is to the RIGHT in world X.
+    // Compare sign(bearing) vs sign(padCx - x); if they often disagree, flip.
+        {
+      final padCx = terrain.padCenter.toDouble();
+      final dx = padCx - lander.pos.x.toDouble();
+      final ps = padSummary(); // uses _rays from above
+      if (ps.visible > 0.05) {
+        final sBearing = ps.bearing >= 0 ? 1.0 : -1.0;
+        final sTruth   = dx >= 0 ? 1.0 : -1.0;
+        _bearingFlip = (sBearing != sTruth);
+      } else {
+        _bearingFlip = false; // fallback: do nothing when pad unseen
+      }
+    }
   }
 
-  // === NEW: helpers for pad/upward desired direction & velocity-alignment cost ===
+  // === Desired direction helper ===
 
   // Desired approach direction: toward pad if visible; else straight up.
   Vector2 _desiredDirection(Vector2 pos) {
     final ps = padSummary(); // uses _rays from the last sensor cast
-    // ps.visible in [0,1], ps.bearing is bearing from ship frame (already computed by RayCaster)
     if (ps.visible > 0.0) {
       // Aim to pad center in world frame
       final padCx = terrain.padCenter.toDouble();
@@ -169,7 +187,7 @@ class GameEngine {
       final len = math.sqrt(dx*dx + dy*dy);
       if (len > 1e-6) return Vector2(dx/len, dy/len);
     }
-    // Default: go up (negative Y in screen coordinates for y-down)
+    // Default: go up (negative Y in screen coordinates)
     return Vector2(0.0, -1.0);
   }
 
@@ -252,20 +270,19 @@ class GameEngine {
 
       // ----- Acceleration & fuel burn -----
       final double thrustA = t.thrustAccel * 0.05; // EQUALIZED THRUST POWER
-      Vector2 accel = Vector2(0, t.gravity * 0.05); // +Y is down in y-down coords
+      Vector2 accel = Vector2(0, t.gravity * 0.05); // +Y is down
       double fuel = lander.fuel;
 
-      // Main engine: up thrust at angle==0 (negative Y)
+      // Main engine
       final bool mainOn = u.thrust && fuel > 0.0;
       final double power = mainOn ? 1.0 : 0.0;
       if (mainOn) {
         accel.x += math.sin(angle) * thrustA;
-        accel.y += -math.cos(angle) * thrustA;
+        accel.y += -math.cos(angle) * thrustA; // up at angle==0
         fuel = (fuel - 20.0 * dtk).clamp(0.0, t.maxFuel);
       }
 
       // Side thrusters (equal power to main, per-thruster fuel)
-      // NOTE: sideLeft fires the LEFT pod, which pushes to +X in body frame (rightward).
       if (t.rcsEnabled && fuel > 0.0) {
         final bool l = u.sideLeft;
         final bool r = u.sideRight;
@@ -290,7 +307,7 @@ class GameEngine {
         }
       }
 
-      // "Top" thruster (pushes downward) — equal power & equal burn to main
+      // "Top" thruster (pushes downward)
       if (t.downThrEnabled && u.downThrust && fuel > 0.0) {
         accel.x += -math.sin(angle) * thrustA;
         accel.y +=  math.cos(angle) * thrustA;
@@ -376,7 +393,6 @@ class GameEngine {
       stepCost += score.cost;
 
       // --- Directional pad-toward shaping (robust, symmetric) ---
-      // FIXED: use current microstep pos/vel and correct desired-velocity sign.
           {
         final double x  = pos.x.toDouble();
         final double vxNow = vel.x.toDouble();
@@ -385,25 +401,27 @@ class GameEngine {
         final double gy = terrain.heightAt(x);
         final double h  = (gy - pos.y).toDouble().clamp(0.0, 1e9);
 
-        // pad rays summary: minD, bearing (rad, +right), visible∈[0,1]
+        // pad rays summary
         final ps = padSummary();
-        final bool padSeen = ps.visible > 0.05; // tune
-
-        // If rays see pad, sign from bearing; otherwise fallback to pad center
         final double padCx = terrain.padCenter.toDouble();
+
+        // Effective bearing after auto-calibration
+        final double bearingEff = _bearingFlip ? -ps.bearing : ps.bearing;
+
+        final bool padSeen = ps.visible > 0.05;
         final double sLR = padSeen
-            ? (ps.bearing >= 0 ? 1.0 : -1.0)         // +right, -left
-            : ((padCx - x) >= 0 ? 1.0 : -1.0);       // fallback heuristic
+            ? (bearingEff >= 0 ? 1.0 : -1.0)      // +right, -left
+            : ((padCx - x) >= 0 ? 1.0 : -1.0);    // fallback heuristic
 
         // desirables: gently head toward pad, fade near touchdown
         const double vTargetFar  = 12.0;   // px/s
         const double vTargetNear =  4.0;   // px/s
-        final double a = (h / 300.0).clamp(0.0, 1.0);  // far→near blend
+        final double a = (h / 300.0).clamp(0.0, 1.0);
         final double vTarget = vTargetNear + a * (vTargetFar - vTargetNear);
 
         // weight by visibility/height; weaker when pad unseen
         final double baseW = padSeen ? 1.0 : 0.35;
-        final double w = baseW * math.exp(- (h * h) / (220.0 * 220.0 + 1e-6));
+        final double wDir = baseW * math.exp(- (h * h) / (220.0 * 220.0 + 1e-6));
 
         // desired lateral velocity toward pad (positive when pad is to the right)
         final double vDesired = sLR * vTarget;
@@ -412,13 +430,12 @@ class GameEngine {
         final double err = vDesired - vxNow;
         final double away = err > 0 ? err : 0.0;
 
-        const double lambdaDir = 0.002; // 0.001–0.006 reasonable
-        stepCost += lambdaDir * w * away;
+        const double lambdaDir = 0.003; // slightly stronger so PF can't drown it
+        stepCost += lambdaDir * wDir * away;
       }
 
-      // === NEW: velocity alignment shaping w.r.t pad / upward ===
+      // === Velocity alignment shaping w.r.t pad / upward ===
           {
-        // Desired unit direction (pad if visible else up)
         final Vector2 dHat = _desiredDirection(pos);
 
         // Current and short-horizon future velocities
@@ -440,7 +457,6 @@ class GameEngine {
         final double w = dtk;
         stepCost += w * (kNow * pNow + kFut * pFut);
       }
-      // === END NEW ===
 
       // Commit microstep physics
       lander = LanderState(pos: pos, vel: vel, angle: angle, fuel: fuel);

@@ -117,6 +117,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
       if (!mounted) return;
 
+      p.usePadAlignPlanner();
+
       _applyPolicyPhysicsToEngine(p);
 
       setState(() {
