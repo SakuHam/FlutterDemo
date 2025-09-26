@@ -1,23 +1,30 @@
 // lib/ai/curriculum/pad_align_progressive.dart
 //
-// Progressive pad-align curriculum ("pad_align_progressive").
-// - Stage 0: pure L/R intent from pad offset sign (tiny rollouts)
-// - Stage 1: longer rollouts + jitter; must keep correct intent
-// - Stage 2: higher spawn (h, vy up), free-drift before labeling
-// - Stage 3: mini-landing drill; optional action-head teacher (turn/thrust)
+// Progressive pad-align curriculum ("pad_align_progressive") with a reliable
+// micro-probe that forces translation toward the pad during measurement.
+// The probe saves/restores the lander state so it does not affect training.
 //
-// Notes:
-// • Key is 'pad_align_progressive' — make sure your registry/CLI matches.
-// • Progress probe now uses kinematics only: progress = -sign(dx) * vx  (px/s)
-//   This avoids lying feedback from a teacher "tap" when controls are rotational.
-// • The log still says "Δ|dx|/step=" to keep external scripts stable.
+// Stages:
+//   0: tiny near-pad drills
+//   1: longer near-pad
+//   2: higher spawn + free drift
+//   3: mini-landing flavor + (optional) action head teacher
+//
+// Progress metric:
+//   We measure Δ|dx|/sec by running a short burst of "toward-pad" control
+//   with thrust. This avoids the "tilt only → no lateral movement yet" issue
+//   that made the old vx-proxy unreliable.
+//
+// CLI knobs added:
+//   --padprog_micro_k=36            // total probe frames (warmup+measured)
+//   --padprog_micro_warm_frac=0.25  // fraction of K spent as warmup
 
 import 'dart:math' as math;
 
 import '../../engine/types.dart' as et;
 import '../../engine/game_engine.dart' as eng;
 
-import '../agent.dart'; // FeatureExtractorRays, PolicyNetwork, RunningNorm
+import '../agent.dart'; // FeatureExtractorRays, PolicyNetwork, RunningNorm, controllerForIntent, Intent, intentToIndex, indexToIntent
 import 'core.dart';
 
 class PadAlignProgressiveCfg {
@@ -34,7 +41,7 @@ class PadAlignProgressiveCfg {
 
   // Promotion gates (rolling-window targets)
   final double promoAcc;   // mean accuracy to promote stage
-  final double promoDx;    // mean progress metric (px/s), >= this
+  final double promoDx;    // mean progress metric (px/sec), >= this
   final int maxStage;      // clamp max stage [0..3]
 
   // Stage 0..3 base parameters
@@ -58,6 +65,10 @@ class PadAlignProgressiveCfg {
   final bool balanceLR;           // ~50/50 left/right spawns
   final bool allowActionAlign;    // optional: provide turn/thrust teacher in S3
 
+  // Micro-probe knobs
+  final int microK;               // total frames for probe (warm+meas)
+  final double microWarmFrac;     // fraction of K spent warming (no measurement)
+
   const PadAlignProgressiveCfg({
     this.iters = 1600,
     this.batch = 32,
@@ -67,7 +78,7 @@ class PadAlignProgressiveCfg {
     this.sparkGamma = 0.65,
     this.verbose = true,
     this.promoAcc = 0.84,
-    this.promoDx = 0.8, // px/s; suitable starting point for progress gate
+    this.promoDx = 8.0, // px/sec target AFTER using reliable probe
     this.maxStage = 3,
     this.s0MinSteps = 6,  this.s0MaxSteps = 12,  this.s0BandFrac = 0.15, this.s0MinOffPx = 20.0,
     this.s1MinSteps = 10, this.s1MaxSteps = 18,  this.s1BandFrac = 0.22, this.s1MinOffPx = 14.0,
@@ -75,6 +86,9 @@ class PadAlignProgressiveCfg {
     this.s3MinSteps = 26, this.s3MaxSteps = 46,  this.s3BandFrac = 0.30, this.s3MinOffPx = 8.0,
     this.balanceLR = true,
     this.allowActionAlign = false,
+
+    this.microK = 36,             // 0.6 sec at 60 Hz
+    this.microWarmFrac = 0.25,    // first 25% warmup; last 75% measured
   });
 
   PadAlignProgressiveCfg copyWith({
@@ -87,6 +101,7 @@ class PadAlignProgressiveCfg {
     int? s2MinSteps, int? s2MaxSteps, double? s2BandFrac, double? s2MinOffPx,
     int? s3MinSteps, int? s3MaxSteps, double? s3BandFrac, double? s3MinOffPx,
     bool? balanceLR, bool? allowActionAlign,
+    int? microK, double? microWarmFrac,
   }) => PadAlignProgressiveCfg(
     iters: iters ?? this.iters,
     batch: batch ?? this.batch,
@@ -116,6 +131,8 @@ class PadAlignProgressiveCfg {
     s3MinOffPx: s3MinOffPx ?? this.s3MinOffPx,
     balanceLR: balanceLR ?? this.balanceLR,
     allowActionAlign: allowActionAlign ?? this.allowActionAlign,
+    microK: microK ?? this.microK,
+    microWarmFrac: microWarmFrac ?? this.microWarmFrac,
   );
 }
 
@@ -137,9 +154,13 @@ class PadAlignProgressiveCurriculum extends Curriculum {
       sparkGamma: cli.getDouble('padprog_gamma', def: 0.65),
       verbose: cli.getFlag('padprog_verbose', def: true),
       promoAcc: cli.getDouble('padprog_promo_acc', def: 0.84),
-      promoDx: cli.getDouble('padprog_promo_dx', def: 0.8),
+      promoDx: cli.getDouble('padprog_promo_dx', def: 8.0), // px/sec gate
       maxStage: cli.getInt('padprog_max_stage', def: 3),
       allowActionAlign: cli.getFlag('padprog_action_align', def: false),
+
+      // NEW probe knobs
+      microK: cli.getInt('padprog_micro_k', def: 36),
+      microWarmFrac: cli.getDouble('padprog_micro_warm_frac', def: 0.25),
     );
     return this;
   }
@@ -166,10 +187,17 @@ class PadAlignProgressiveCurriculum extends Curriculum {
   }
 
   // ---------- Rolling stats ----------
-  final _accHistory = <double>[];       // per-episode 0/1 accuracy
-  final _dxDeltaPerStep = <double>[];   // "Δ|dx|/step" display; actually px/s progress
-  void _pushAcc(double v, int win) { _accHistory.add(v.clamp(0.0, 1.0)); if (_accHistory.length > win) _accHistory.removeAt(0); }
-  void _pushDx(double v, int win) { _dxDeltaPerStep.add(v); if (_dxDeltaPerStep.length > win) _dxDeltaPerStep.removeAt(0); }
+  final _accHistory = <double>[];
+  final _dxPerSecHistory = <double>[];
+
+  void _pushAcc(double v, int win) {
+    _accHistory.add(v.clamp(0.0, 1.0));
+    if (_accHistory.length > win) _accHistory.removeAt(0);
+  }
+  void _pushDxPerSec(double v, int win) {
+    _dxPerSecHistory.add(v);
+    if (_dxPerSecHistory.length > win) _dxPerSecHistory.removeAt(0);
+  }
 
   String _fmtPct(double x) => '${(100.0 * x).toStringAsFixed(1)}%';
 
@@ -181,8 +209,8 @@ class PadAlignProgressiveCurriculum extends Curriculum {
     double acc = 0.0; for (final a in _accHistory) acc += a;
     acc = _accHistory.isEmpty ? 0.0 : acc / _accHistory.length;
 
-    double dxm = 0.0; for (final d in _dxDeltaPerStep) dxm += d;
-    dxm = _dxDeltaPerStep.isEmpty ? 0.0 : dxm / _dxDeltaPerStep.length;
+    double dxs = 0.0; for (final d in _dxPerSecHistory) dxs += d;
+    dxs = _dxPerSecHistory.isEmpty ? 0.0 : dxs / _dxPerSecHistory.length;
 
     final lOk = nL == 0 ? 0.0 : okL / nL.toDouble();
     final rOk = nR == 0 ? 0.0 : okR / nR.toDouble();
@@ -191,7 +219,7 @@ class PadAlignProgressiveCurriculum extends Curriculum {
     final spark = _sparkline(_accHistory, width: cfg.sparkWidth, gamma: cfg.sparkGamma);
     return '[PADPROG/FIT] it=$iter st=$stage acc=${_fmtPct(acc)} '
         'L_ok=${_fmtPct(lOk)} R_ok=${_fmtPct(rOk)} bias(L)=${_fmtPct(biasL)} '
-        '$spark  Δ|dx|/step=${dxm.toStringAsFixed(2)}';
+        '$spark  Δ|dx|/sec=${dxs.toStringAsFixed(2)}  gateDx=${cfg.promoDx.toStringAsFixed(2)}';
   }
 
   // ---------- Spawning (stage-aware) ----------
@@ -258,10 +286,78 @@ class PadAlignProgressiveCurriculum extends Curriculum {
     return dx >= 0 ? intentToIndex(Intent.goRight) : intentToIndex(Intent.goLeft);
   }
 
-  // Optional simple "teacher" for Stage 3 mini-landing drills (turn/thrust).
-  // Returns (turnTarget, thrustTarget):
-  //   turnTarget ∈ {-1, 0, +1}  (left / neutral / right)
-  //   thrustTarget ∈ {false, true}
+  // ----- Reliable micro-probe to measure Δ|dx|/sec -----
+  // Saves lander state, runs a toward-pad control with thrust for K frames,
+  // measures |dx| reduction during the measured window, restores state.
+  double _measureProgressDxPerSec({
+    required eng.GameEngine env,
+    required int K,
+    required double warmFrac,
+  }) {
+    final L = env.lander;
+    // Snapshot lander (minimal fields we mutate/need)
+    final snap = (
+    x: L.pos.x.toDouble(),
+    y: L.pos.y.toDouble(),
+    vx: L.vel.x.toDouble(),
+    vy: L.vel.y.toDouble(),
+    ang: L.angle.toDouble(),
+    fuel: L.fuel.toDouble(),
+    );
+
+    double towardSign() {
+      final padCx = env.terrain.padCenter.toDouble();
+      final dx = padCx - env.lander.pos.x.toDouble();
+      return dx >= 0 ? 1.0 : -1.0; // +1 → need goRight, -1 → goLeft
+    }
+
+    et.ControlInput _towardPad() {
+      final sign = towardSign();
+      final intent = (sign >= 0) ? Intent.goRight : Intent.goLeft;
+      final u0 = controllerForIntent(intent, env);
+      // Force thrust during probe so tilt → vx happens within short K
+      return et.ControlInput(
+        thrust: true,
+        left: u0.left,
+        right: u0.right,
+        sideLeft: u0.sideLeft,
+        sideRight: u0.sideRight,
+        downThrust: u0.downThrust,
+      );
+    }
+
+    final int warm = (K * warmFrac).clamp(0, K - 1).toInt();
+    final int meas = (K - warm).clamp(1, K);
+
+    // Warmup (unmeasured)
+    for (int i = 0; i < warm; i++) {
+      env.step(1 / 60.0, _towardPad());
+    }
+
+    // Baseline AFTER warmup
+    final padCx = env.terrain.padCenter.toDouble();
+    final dx0Abs = (padCx - env.lander.pos.x.toDouble()).abs();
+
+    // Measured segment
+    for (int i = 0; i < meas; i++) {
+      env.step(1 / 60.0, _towardPad());
+    }
+
+    final dx1Abs = (padCx - env.lander.pos.x.toDouble()).abs();
+    final dPerSec = (dx0Abs - dx1Abs) / (meas / 60.0);
+
+    // Restore snapshot
+    L.pos.x = snap.x;
+    L.pos.y = snap.y;
+    L.vel.x = snap.vx;
+    L.vel.y = snap.vy;
+    L.angle = snap.ang;
+    L.fuel  = snap.fuel;
+
+    return dPerSec; // positive if we reduced |dx|
+  }
+
+  // Optional simple teacher for Stage 3 mini-landing drills (turn/thrust).
   (int turn, bool thrust) _teacherS3(eng.GameEngine env) {
     final padCx = env.terrain.padCenter.toDouble();
     final x = env.lander.pos.x.toDouble();
@@ -317,7 +413,7 @@ class PadAlignProgressiveCurriculum extends Curriculum {
     required PolicyNetwork policy,
     required List<ForwardCache> actionCaches,
     required List<int> turnTargets,
-    required List<bool> thrustTargets,   // bools
+    required List<bool> thrustTargets,
     required double lr,
     required double actionAlignWeight,
   }) {
@@ -326,7 +422,7 @@ class PadAlignProgressiveCurriculum extends Curriculum {
     policy.updateFromEpisode(
       decisionCaches: const [],
       intentChoices: const [],
-      decisionReturns: returns,            // not used for SL
+      decisionReturns: returns,
       alignLabels: const [],
       alignWeight: 0.0,
       intentPgWeight: 0.0,
@@ -334,10 +430,10 @@ class PadAlignProgressiveCurriculum extends Curriculum {
       entropyBeta: 0.0,
       valueBeta: 0.0,
       huberDelta: 1.0,
-      intentMode: false,                   // train action head
+      intentMode: false,
       actionCaches: actionCaches,
       actionTurnTargets: turnTargets,
-      actionThrustTargets: thrustTargets,  // List<bool>
+      actionThrustTargets: thrustTargets,
       actionAlignWeight: actionAlignWeight,
     );
   }
@@ -367,6 +463,7 @@ class PadAlignProgressiveCurriculum extends Curriculum {
     if (cfg.verbose || gateVerbose) {
       print('[CUR/pad_align_progressive] start iters=${cfg.iters} '
           'batch=${cfg.batch} maxStage=${cfg.maxStage} promoAcc=${cfg.promoAcc} promoDx=${cfg.promoDx} '
+          'microK=${cfg.microK} warm=${(cfg.microWarmFrac*100).toStringAsFixed(0)}% '
           'actionAlign=${cfg.allowActionAlign ? "Y" : "N"}');
       print(_fitnessLine(iter: 0, stage: stage, nL: 0, nR: 0, okL: 0, okR: 0));
     }
@@ -443,12 +540,13 @@ class PadAlignProgressiveCurriculum extends Curriculum {
         intentChoices.add(idxGreedy);
         intentLabels.add(trueLabel);
 
-        // --- Progress probe (non-invasive): progress = -sign(dx) * vx (px/s) ---
-        final padCx = env.terrain.padCenter.toDouble();
-        final dx = padCx - env.lander.pos.x.toDouble(); // + if pad is right
-        final vx = env.lander.vel.x.toDouble();         // + if moving right
-        final progress =  -(dx == 0.0 ? 0.0 : dx.sign) * vx;
-        _pushDx(progress.clamp(-8.0, 8.0), cfg.probeWindow);
+        // --- Reliable micro-probe for progress (does not alter episode state)
+        final dxPerSec = _measureProgressDxPerSec(
+          env: env,
+          K: cfg.microK,
+          warmFrac: cfg.microWarmFrac,
+        );
+        _pushDxPerSec(dxPerSec, cfg.probeWindow);
 
         // Stage 3: optional supervised action hints (mini-landing flavor)
         if (stage >= 3 && cfg.allowActionAlign) {
@@ -465,7 +563,6 @@ class PadAlignProgressiveCurriculum extends Curriculum {
             );
             if (norm != null) { norm.observe(x2); x2 = norm.normalize(x2, update: false); }
 
-            // If PolicyNetwork exposes a dedicated action forward, use it here.
             final (_, __, cacheAction) = policy.actIntentGreedy(x2);
             actionCaches.add(cacheAction);
             turnTargets.add(turnT);
@@ -479,8 +576,7 @@ class PadAlignProgressiveCurriculum extends Curriculum {
             env.step(1 / 60.0, u);
           }
         }
-
-        // Micro-episode ends here; we only needed caches & probes.
+        // Micro-episode ends here.
       }
 
       // Intent head supervised update
@@ -514,14 +610,14 @@ class PadAlignProgressiveCurriculum extends Curriculum {
             double acc = 0.0; for (final a in _accHistory) acc += a;
             acc = _accHistory.isEmpty ? 0.0 : acc / _accHistory.length;
 
-            double dxm = 0.0; for (final d in _dxDeltaPerStep) dxm += d;
-            dxm = _dxDeltaPerStep.isEmpty ? 0.0 : dxm / _dxDeltaPerStep.length;
+            double dxs = 0.0; for (final d in _dxPerSecHistory) dxs += d;
+            dxs = _dxPerSecHistory.isEmpty ? 0.0 : dxs / _dxPerSecHistory.length;
 
-            if (acc >= cfg.promoAcc && dxm >= cfg.promoDx) {
+            if (acc >= cfg.promoAcc && dxs >= cfg.promoDx) {
               stage = (stage + 1).clamp(0, cfg.maxStage);
-              print('[PADPROG] ↑ promoted to stage=$stage (acc=${_fmtPct(acc)} Δ|dx|/step=${dxm.toStringAsFixed(2)})');
+              print('[PADPROG] ↑ promoted to stage=$stage (acc=${_fmtPct(acc)} Δ|dx|/sec=${dxs.toStringAsFixed(2)})');
               _accHistory.clear();
-              _dxDeltaPerStep.clear();
+              _dxPerSecHistory.clear();
               nL = nR = okL = okR = 0;
             }
           }
