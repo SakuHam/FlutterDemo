@@ -1509,6 +1509,12 @@ double _entropyFromLogits(List<double> logits) {
   return H;
 }
 
+class TeacherSignal {
+  final int intentIdx;
+  final bool thrust, left, right;
+  TeacherSignal(this.intentIdx, this.thrust, this.left, this.right);
+}
+
 class Trainer {
   final eng.GameEngine env;
   final FeatureExtractorRays fe;
@@ -1518,8 +1524,8 @@ class Trainer {
   final int seed;
   final bool twoStage;
   final int planHold;               // kept for back-compat; not used directly now
-  final double tempIntent;
-  final double intentEntropyBeta;
+  double tempIntent;
+  double intentEntropyBeta;
   final bool useLearnedController;
   final double blendPolicy; // probability-space blend for thrust
   final double intentAlignWeight;

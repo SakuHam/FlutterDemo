@@ -16,7 +16,7 @@ import 'curriculum/final_dagger.dart';
 import 'curriculum/final_simple.dart';
 import 'curriculum/pad_align_progressive.dart' as padprog show PadAlignProgressiveCurriculum;
 import 'nn_helper.dart' as nn;
-import 'policy_io.dart'; // ← all I/O here
+import 'policy_io.dart'; // PolicyBundle I/O
 import 'potential_field.dart'; // buildPotentialField, PotentialField
 
 // MODULAR CURRICULA
@@ -165,14 +165,25 @@ Future<void> main(List<String> argv) async {
   // ---- Common CLI ----
   final seed = args.getInt('seed', def: 7);
 
-  // Determine if curricula are planned
+  // Optional load (explicit), else default to curriculum snapshot if present
+  String? loadPath = args.getStr('load_policy');
+  if ((loadPath == null || loadPath.trim().isEmpty) &&
+      File('policy_curriculum.json').existsSync()) {
+    loadPath = 'policy_curriculum.json';
+    print('No --load_policy provided; found and will load "$loadPath".');
+  }
+
+  // Consolidation (anti-forgetting)
+  final anchorOnLoad = args.getFlag('anchor_on_load', def: false);
+  final anchorAfterCurr = args.getFlag('anchor_after_curriculum', def: true);
+  final lambdaTrunk = args.getDouble('consolidate_trunk', def: 1e-3);
+  final lambdaHeads = args.getDouble('consolidate_heads', def: 5e-4);
+
+  // Curricula selection
+  String curriculaSpec = args.getStr('curricula', def: '') ?? '';
   final legacyCurr = args.getFlag('curriculum', def: false);
   final lowaltIters = args.getInt('lowalt_iters', def: 0);
   final hardappIters = args.getInt('hardapp_iters', def: 0);
-  final curriculaSpecCli = args.getStr('curricula', def: '') ?? '';
-  final curItersDefault = args.getInt('curriculum_iters', def: 0);
-
-  String curriculaSpec = curriculaSpecCli;
   if (curriculaSpec.isEmpty && (legacyCurr || lowaltIters > 0 || hardappIters > 0)) {
     final keys = <String>[];
     if (lowaltIters > 0) keys.add('speedmin');
@@ -181,15 +192,12 @@ Future<void> main(List<String> argv) async {
     curriculaSpec = keys.join(',');
   }
   final curricula = registry.fromConfig(curriculaSpec);
-  final hasCurriculaPlanned = curricula.isNotEmpty && (curItersDefault > 0 || lowaltIters > 0 || hardappIters > 0);
 
-  // Consolidation (anti-forgetting)
-  final anchorOnLoad = args.getFlag('anchor_on_load', def: false);
-  final anchorAfterCurr = args.getFlag('anchor_after_curriculum', def: true);
-  final lambdaTrunk = args.getDouble('consolidate_trunk', def: 1e-3);
-  final lambdaHeads = args.getDouble('consolidate_heads', def: 5e-4);
+  // Global default iterations
+  int curIters = args.getInt('curriculum_iters', def: 0);
 
-  final warmAfterCurr = args.getFlag('warm_norm_after_curriculum', def: true);
+  // Only warm if we did NOT restore a norm
+  bool warmAfterCurr = args.getFlag('warm_norm_after_curriculum', def: true);
 
   // Stage 2 (PF)
   final iters = args.getInt('train_iters', def: args.getInt('iters', def: 200));
@@ -239,7 +247,7 @@ Future<void> main(List<String> argv) async {
   final pfAccEma   = args.getDouble('pf_acc_ema',   def: 0.2);
   final pfDebug    = args.getFlag('pf_debug',       def: false);
 
-  // NEW: extra shaping CLI
+  // extra shaping CLI
   final pfVyCapW = args.getDouble('pf_vy_cap_w', def: 0.02);
   final pfPadTowW = args.getDouble('pf_pad_tow_w', def: 0.12);
 
@@ -260,7 +268,7 @@ Future<void> main(List<String> argv) async {
   final gateOnlyLanded = args.getFlag('gate_landed', def: false);
   final gateVerbose = args.getFlag('gate_verbose', def: true);
 
-  // Probabilistic gating CLI
+  // Probabilistic gating
   final gateProbEnabled      = args.getFlag('gate_prob', def: true);
   final gateProbK            = args.getDouble('gate_prob_k', def: 8.0);
   final gateProbMin          = args.getDouble('gate_prob_min', def: 0.05);
@@ -284,8 +292,13 @@ Future<void> main(List<String> argv) async {
 
   final hebbModGain   = args.getDouble('hebb_mod_gain', def: 0.6);
   final hebbModClip   = args.getDouble('hebb_mod_clip', def: 1.5);
-  final minIntEntropy = args.getDouble('min_intent_entropy', def: 0.5);
+  final minIntentEntropy = args.getDouble('min_intent_entropy', def: 0.5);
   final maxSameIntentRun = args.getInt('max_same_intent_run', def: 48);
+
+  // ----- DAgger controls (teacher-assisted pre-PF stage) -----
+  final daggerOn      = args.getFlag('dagger_on', def: false);
+  final daggerIters   = args.getInt('dagger_iters', def: 0); // if >0 & dagger_on → run FinalDagger before PF
+  // You can pass additional flags to FinalDagger via CLI; it reads args.kv/flags in its configure()
 
   // ----- Build env -----
   final cfg = makeConfig(
@@ -295,12 +308,15 @@ Future<void> main(List<String> argv) async {
     randomSpawnX: randomSpawnX,
     maxFuel: maxFuel,
     crashOnTilt: crashOnTilt,
+
     gravity: gravity,
     thrustAccel: thrustAccel,
     rotSpeed: rotSpeed,
+
     rcsEnabled: rcsEnabled,
     rcsAccel: rcsAccel,
     rcsBodyFrame: rcsBodyFrame,
+
     downThrEnabled: downThrEnabled,
     downThrAccel: downThrAccel,
     downThrBurn: downThrBurn,
@@ -314,15 +330,13 @@ Future<void> main(List<String> argv) async {
   final fe = ai.FeatureExtractorRays(rayCount: env.rayCfg.rayCount);
   env.reset(seed: seed ^ 0xC0FFEE);
   env.step(1 / 60.0, const et.ControlInput(thrust: false, left: false, right: false));
-  final inDim = fe
-      .extract(
+  final inDim = fe.extract(
     lander: env.lander,
     terrain: env.terrain,
     worldW: env.cfg.worldW,
     worldH: env.cfg.worldH,
     rays: env.rays,
-  )
-      .length;
+  ).length;
   final kindsOneHot = (inDim == 5 + env.rayCfg.rayCount * 4);
 
   // ----- Policy -----
@@ -335,19 +349,8 @@ Future<void> main(List<String> argv) async {
   print('[STAGE] Curricula: trainable { trunk=ON, intent=ON, action=ON, value=OFF }');
 
   // ===== Optional: LOAD existing policy bundle =====
-  String? loadPath = args.getStr('load_policy');
-
-  // Only auto-load when NOT running curricula (PF/free-flight start)
-  if ((loadPath == null || loadPath.trim().isEmpty) && !hasCurriculaPlanned) {
-    final f = File('policy_curriculum.json');
-    if (f.existsSync()) {
-      loadPath = 'policy_curriculum.json';
-      print('[LOAD] Using policy_curriculum.json (no curricula requested)');
-    }
-  }
-
   PolicyBundle? loadedBundle;
-  if (loadPath != null && loadPath.trim().isNotEmpty) {
+  if (loadPath != null && loadPath.trim().isNotEmpty && File(loadPath).existsSync()) {
     loadedBundle = PolicyBundle.loadFromPath(loadPath);
 
     // Strict FE / arch / head shape checks + copy into network
@@ -357,18 +360,7 @@ Future<void> main(List<String> argv) async {
       env: env,
     );
 
-    if (hasCurriculaPlanned) {
-      // We ARE going to run curricula → keep learning on trunk+intent
-      policy.setTrunkTrainable(true);
-      policy.setHeadsTrainable(intent: true, action: true, value: false);
-      print('[STAGE] Loaded bundle + curricula planned: trainable { trunk=ON, intent=ON, action=ON, value=OFF }');
-    } else {
-      // No curricula → PF/free-flight typical setting
-      policy.setTrunkTrainable(false);
-      policy.setHeadsTrainable(intent: false, action: true, value: false);
-      print('[STAGE] Loaded bundle: trainable { trunk=OFF, intent=OFF, action=ON, value=OFF }');
-    }
-
+    // Consolidation anchor (optional)
     if (anchorOnLoad) {
       policy.captureConsolidationAnchor();
       policy.consolidateEnabled = true;
@@ -377,6 +369,8 @@ Future<void> main(List<String> argv) async {
       print('Consolidation anchor captured from loaded policy. '
           'λ_trunk=${policy.consolidateTrunk} λ_heads=${policy.consolidateHeads}');
     }
+  } else if (loadPath != null && loadPath.trim().isNotEmpty) {
+    print('WARNING: --load_policy="$loadPath" not found on disk. Proceeding from scratch.');
   }
 
   // ===== Trainer (norm will be restored from bundle if present) =====
@@ -434,7 +428,7 @@ Future<void> main(List<String> argv) async {
     ),
     hebbModGain: hebbModGain,
     hebbModAbsClip: hebbModClip,
-    minIntentEntropy: minIntEntropy,
+    minIntentEntropy: minIntentEntropy,
     maxSameIntentRun: maxSameIntentRun,
   );
 
@@ -442,6 +436,10 @@ Future<void> main(List<String> argv) async {
   bool normReady = false;
   if (loadedBundle != null && trainer.norm != null) {
     normReady = restoreNormFromBundle(bundle: loadedBundle, runtimeNorm: trainer.norm!);
+    if (normReady) {
+      // If we restored a norm from JSON, don't warm over it.
+      warmAfterCurr = false;
+    }
   }
 
   // Determinism probe
@@ -455,18 +453,18 @@ Future<void> main(List<String> argv) async {
   }
 
   // ===== MODULAR CURRICULA =====
-  if (curricula.isNotEmpty && (curItersDefault > 0 || lowaltIters > 0 || hardappIters > 0)) {
+  if (curricula.isNotEmpty && (curIters > 0 || lowaltIters > 0 || hardappIters > 0)) {
     print('=== Curricula: ${curricula.map((c) => c.key).join(", ")} ===');
     for (final cur in curricula) {
       final itersThis =
       cur.key == 'hardapp' && hardappIters > 0 ? hardappIters :
-      cur.key == 'speedmin' && lowaltIters > 0 ? lowaltIters :
-      cur.key == 'padalign' && lowaltIters > 0 ? lowaltIters :
+      cur.key == 'speedmin' && lowaltIters  > 0 ? lowaltIters  :
+      cur.key == 'padalign' && lowaltIters  > 0 ? lowaltIters  :
       cur.key == 'padalign_progressive' && lowaltIters > 0 ? lowaltIters :
       cur.key == 'final' && lowaltIters > 0 ? lowaltIters :
       cur.key == 'final_simple' && lowaltIters > 0 ? lowaltIters :
       cur.key == 'final_dagger' && lowaltIters > 0 ? lowaltIters :
-      curItersDefault;
+      curIters;
 
       if (itersThis <= 0) continue;
 
@@ -534,6 +532,47 @@ Future<void> main(List<String> argv) async {
       print('[STAGE] PF: consolidation L2-SP active (λ_trunk=${policy.consolidateTrunk}, λ_heads=${policy.consolidateHeads})');
     }
   } else {
+    // Optional DAgger pre-phase even without other curricula
+    if (daggerOn && daggerIters > 0) {
+      print('=== DAgger pre-phase: FinalDagger ($daggerIters iters) ===');
+      final cur = FinalDagger();
+      cur.configure(args.kv, args.flags);
+      await cur.run(
+        iters: daggerIters,
+        env: env,
+        fe: fe,
+        policy: policy,
+        norm: trainer.norm,
+        planHold: planHold,
+        tempIntent: tempIntent,
+        gamma: 0.99,
+        lr: lr,
+        intentAlignWeight: intentAlignWeight,
+        intentPgWeight: intentPgWeight,
+        actionAlignWeight: actionAlignWeight,
+        gateVerbose: gateVerbose,
+        seed: seed,
+      );
+
+      savePolicyBundle(
+        path: 'policy_after_dagger.json',
+        p: policy,
+        env: env,
+        norm: trainer.norm,
+      );
+      print('★ DAgger complete → saved policy_after_dagger.json');
+
+      // Small consolidation after DAgger (optional)
+      if (anchorAfterCurr) {
+        policy.captureConsolidationAnchor();
+        policy.consolidateEnabled = true;
+        policy.consolidateTrunk = lambdaTrunk;
+        policy.consolidateHeads = lambdaHeads;
+        print('Consolidation anchor captured after DAgger. '
+            'λ_trunk=${policy.consolidateTrunk} λ_heads=${policy.consolidateHeads}');
+      }
+    }
+
     // Free-flight directly: if no norm restoration, optionally warm before PF
     if (!normReady && warmAfterCurr && trainer.norm != null && !trainer.norm!.inited) {
       final episodes = 8;
@@ -552,6 +591,11 @@ Future<void> main(List<String> argv) async {
       print('Norm warm complete.');
       normReady = true;
     }
+
+    // Freeze curriculum features/intent; train action in PF
+    policy.setTrunkTrainable(false);
+    policy.setHeadsTrainable(intent: false, action: true, value: false);
+    print('[STAGE] PF: trainable { trunk=OFF, intent=OFF, action=ON, value=OFF }');
   }
 
   // ===== Baseline eval =====
@@ -587,7 +631,7 @@ Future<void> main(List<String> argv) async {
 
   // ===== MAIN TRAIN LOOP (PF) =====
   final rnd = math.Random(seed ^ 0xDEADBEEF);
-  double bestMeanCost = double.infinity;
+  final rayCount = env.rayCfg.rayCount;
 
   int terrAttempts = 0;
   int currentTerrainSeed = rnd.nextInt(1 << 30);
@@ -608,6 +652,8 @@ Future<void> main(List<String> argv) async {
     wPadTow: pfPadTowW,
   );
 
+  double bestMeanCost = double.infinity;
+
   for (int it = 0; it < iters; it++) {
     double lastCost = 0.0;
     int lastSteps = 0;
@@ -619,7 +665,6 @@ Future<void> main(List<String> argv) async {
         currentTerrainSeed = rnd.nextInt(1 << 30);
       }
       env.reset(seed: currentTerrainSeed);
-
       // Rebuild PF per episode so it matches terrain/pad
       pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
@@ -704,7 +749,8 @@ Future<void> main(List<String> argv) async {
 
   if (curricula.isEmpty) {
     print('Tip: you can run modular curricula with --curricula="speedmin,hardapp" '
-        'or legacy flags --curriculum --lowalt_iters=... --hardapp_iters=...');
+        'or legacy flags --curriculum --lowalt_iters=... --hardapp_iters=... '
+        '(padalign_progressive and final_dagger are also available).');
   } else {
     print('Curricula used: ${curricula.map((c) => c.key).join(", ")}');
   }

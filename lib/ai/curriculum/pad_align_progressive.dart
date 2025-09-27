@@ -1,12 +1,7 @@
 // lib/ai/curriculum/pad_align_progressive.dart
 //
-// Progressive pad-align curriculum ("pad_align_progressive") with
-// automatic LR polarity detection/flip to robustly move toward the pad.
-//
-// Stages 0..3: same idea as before (short → longer drills).
-// Probe uses absolute dx shrink per second:
-//   progress/sec = (|dx_before| - |dx_after|) / (steps * dt)
-// Positive means we moved closer to pad; negative means we drifted away.
+// Progressive pad-align curriculum with LR polarity auto-detection.
+// Now emits UI heartbeats via `progressSink` in addition to console prints.
 
 import 'dart:math' as math;
 
@@ -131,13 +126,18 @@ class PadAlignProgressiveCfg {
 
 /* =============================== Curriculum =============================== */
 
+typedef CurProgressSink = void Function(Map<String, Object?>);
+
 class PadAlignProgressiveCurriculum extends Curriculum {
   @override
   String get key => 'padalign_progressive';
 
   PadAlignProgressiveCfg cfg = const PadAlignProgressiveCfg();
 
-  // ---- NEW: LR polarity auto-detection state ----
+  /// Optional: the trainer can set this to receive mid-chunk UI pulses.
+  CurProgressSink? progressSink;
+
+  // ---- LR polarity auto-detection state ----
   bool _invertLR = false;       // if true, swap goLeft <-> goRight
   int _polVotes = 0;
   int _polAgree = 0;
@@ -331,11 +331,6 @@ class PadAlignProgressiveCurriculum extends Curriculum {
       final agreeFrac = _polAgree / _polVotes;
       if (agreeFrac < 0.20) {
         _invertLR = !_invertLR;
-//        print('[PADPROG/POLARITY] Flipping LR mapping. invertLR=${_invertLR ? "ON" : "OFF"} '
-//            '(agree=${(100*agreeFrac).toStringAsFixed(1)}% over $_polVotes votes)');
-      } else {
-//        print('[PADPROG/POLARITY] Keeping mapping. invertLR=${_invertLR ? "ON" : "OFF"} '
-//            '(agree=${(100*agreeFrac).toStringAsFixed(1)}% over $_polVotes votes)');
       }
       _polVotes = 0; _polAgree = 0;
     }
@@ -425,6 +420,7 @@ class PadAlignProgressiveCurriculum extends Curriculum {
     policy.trunk.trainMode = false; // freeze trunk during micro-drills
 
     int stage = 0.clamp(0, cfg.maxStage);
+
     if (cfg.verbose || gateVerbose) {
       print('[CUR/pad_align_progressive] start iters=${cfg.iters} '
           'batch=${cfg.batch} maxStage=${cfg.maxStage} promoAcc=${cfg.promoAcc} promoDx=${cfg.promoDx} '
@@ -432,6 +428,17 @@ class PadAlignProgressiveCurriculum extends Curriculum {
       // initial line
       print(_fitnessLine(iter: 0, stage: stage, nL: 0, nR: 0, okL: 0, okR: 0, gateDx: cfg.promoDx));
     }
+
+    // Initial UI pulse
+    progressSink?.call({
+      'type': 'progress',
+      'phase': 'curriculum',
+      'it': 0,
+      'total': iters,
+      'stage': stage,
+      'accWindow': 0.0,
+      'dxPerSec': 0.0,
+    });
 
     var nL = 0, nR = 0, okL = 0, okR = 0;
 
@@ -450,7 +457,7 @@ class PadAlignProgressiveCurriculum extends Curriculum {
 
     final dtProbe = cfg.probeDt;
 
-    for (int it = 1; it <= cfg.iters; it++) {
+    for (int it = 1; it <= iters; it++) {
       intentCaches.clear(); intentChoices.clear(); intentLabels.clear();
       actionCaches.clear(); turnTargets.clear(); thrustTargets.clear();
 
@@ -587,29 +594,39 @@ class PadAlignProgressiveCurriculum extends Curriculum {
         );
       }
 
-      // Fitness print + promotion
-      if (cfg.verbose || gateVerbose) {
-        if (it % cfg.fitEvery == 0 || it == cfg.iters) {
-          // Average progress/sec in window
-          double dxm = 0.0; for (final d in _dxPerSec) dxm += d;
-          final progAvg = _dxPerSec.isEmpty ? 0.0 : (dxm / _dxPerSec.length);
+      // Fitness print + promotion + UI heartbeat
+      if ((cfg.verbose || gateVerbose) && (it % cfg.fitEvery == 0 || it == iters)) {
+        // Average progress/sec in window
+        double dxm = 0.0; for (final d in _dxPerSec) dxm += d;
+        final progAvg = _dxPerSec.isEmpty ? 0.0 : (dxm / _dxPerSec.length);
 
-          final gateDx = cfg.promoDx; // fixed target; you can make it adaptive if you prefer
-          print(_fitnessLine(
-            iter: it, stage: stage, nL: nL, nR: nR, okL: okL, okR: okR, gateDx: gateDx,
-          ));
+        final gateDx = cfg.promoDx; // fixed target; you can make it adaptive if you prefer
+        print(_fitnessLine(
+          iter: it, stage: stage, nL: nL, nR: nR, okL: okL, okR: okR, gateDx: gateDx,
+        ));
 
-          if (stage < cfg.maxStage) {
-            double acc = 0.0; for (final a in _accHistory) acc += a;
-            final accAvg = _accHistory.isEmpty ? 0.0 : (acc / _accHistory.length);
-            if (accAvg >= cfg.promoAcc && progAvg >= gateDx) {
-              stage = (stage + 1).clamp(0, cfg.maxStage);
-              print('[PADPROG] ↑ promoted to stage=$stage '
-                  '(acc=${_fmtPct(accAvg)} Δ|dx|/sec=${progAvg.toStringAsFixed(2)})');
-              _accHistory.clear();
-              _dxPerSec.clear();
-              nL = nR = okL = okR = 0;
-            }
+        // UI heartbeat: send compact numbers the HUD can show
+        double accSum = 0.0; for (final a in _accHistory) accSum += a;
+        final accAvg = _accHistory.isEmpty ? 0.0 : (accSum / _accHistory.length);
+
+        progressSink?.call({
+          'type': 'progress',
+          'phase': 'curriculum',
+          'it': it,
+          'total': iters,
+          'stage': stage,
+          'accWindow': accAvg,     // 0..1
+          'dxPerSec': progAvg,     // px/s toward pad (+ good)
+        });
+
+        if (stage < cfg.maxStage) {
+          if (accAvg >= cfg.promoAcc && progAvg >= gateDx) {
+            stage = (stage + 1).clamp(0, cfg.maxStage);
+            print('[PADPROG] ↑ promoted to stage=$stage '
+                '(acc=${_fmtPct(accAvg)} Δ|dx|/sec=${progAvg.toStringAsFixed(2)})');
+            _accHistory.clear();
+            _dxPerSec.clear();
+            nL = nR = okL = okR = 0;
           }
         }
       }

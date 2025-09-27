@@ -1,5 +1,6 @@
 // lib/game_page.dart
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -7,19 +8,22 @@ import 'package:flutter/scheduler.dart' show Ticker;
 
 // Engine
 import 'engine/types.dart' as et;
-import 'engine/types.dart';
 import 'engine/game_engine.dart';
 import 'engine/raycast.dart';
 import 'engine/polygon_carver.dart';
 
 // Runtime policy (AI)
-import 'ai/runtime_policy.dart';
+import 'ai/runtime_policy.dart' hide kIntentNames;
 
-// Intent/plan bus
+// Potential field + plan bus
+import 'ai/potential_field.dart';
 import 'ai/plan_bus.dart';
 
-// Potential field
-import 'ai/potential_field.dart';
+// Live trainer isolate
+import 'ai/live_trainer_isolate.dart';
+
+// Intent names (for HUD tooltip)
+import 'ai/agent.dart' show kIntentNames;
 
 /// Simple UI particle for exhaust/smoke
 class Particle {
@@ -30,6 +34,24 @@ class Particle {
 }
 
 enum DebugVisMode { rays, potential, velocity, none }
+
+/// Progress phases and simple model for the live trainer HUD
+enum ProgressPhase { idle, starting, training, evaluating, stopped }
+
+class _ProgressModel {
+  ProgressPhase phase = ProgressPhase.idle;
+  int it = 0;
+  int total = 0;
+  double landPct = 0;
+  double meanCost = 0;
+  double meanSteps = 0;
+
+  void reset() {
+    phase = ProgressPhase.idle;
+    it = total = 0;
+    landPct = meanCost = meanSteps = 0;
+  }
+}
 
 class GamePage extends StatefulWidget {
   const GamePage({super.key});
@@ -70,7 +92,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   bool _terrainDirty = false;
 
   // ===== AI runtime policy =====
-  RuntimeTwoStagePolicy? _policy;   // loaded async from assets
+  RuntimeTwoStagePolicy? _policy;   // loaded async from disk/asset
   bool get _aiReady => _policy != null;
 
   // HUD: last AI intent/probs (optional)
@@ -90,11 +112,18 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   List<double>? _planWidths;
   int _planVersion = 0;
 
+  // ===== Live training isolate & progress =====
+  Isolate? _trainerIso;
+  SendPort? _trainerSend;
+  ReceivePort? _trainerRecv;
+  String _livePath = 'policy_live.json'; // writable path; change to path_provider if you wish
+  final _progress = _ProgressModel();
+
   @override
   void initState() {
     super.initState();
     _ticker = createTicker(_onTick)..start();
-    _loadPolicy(); // fire-and-forget asset load
+    _loadPolicy(); // load runtime policy from assets (or live later)
 
     // Subscribe to plan bus for PF/fallback plans
     _planSub = PlanBus.instance.stream.listen((e) {
@@ -114,16 +143,12 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       );
       p.setStochasticPlanner(true);
       p.setIntentTemperature(1.8);
-
       if (!mounted) return;
 
       p.usePadAlignPlanner();
-
       _applyPolicyPhysicsToEngine(p);
 
-      setState(() {
-        _policy = p;
-      });
+      setState(() => _policy = p);
       _toast('AI model loaded');
     } catch (e) {
       debugPrint('Failed to load AI policy: $e');
@@ -160,6 +185,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   void dispose() {
     _ticker.dispose();
     _planSub?.cancel();
+    _stopLiveTraining(); // ensure isolate is killed
     super.dispose();
   }
 
@@ -169,17 +195,17 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         _engine == null) {
       _worldSize = size;
 
-      final cfg = EngineConfig(
+      final cfg = et.EngineConfig(
         worldW: size.width,
         worldH: size.height,
-        t: Tunables(),
+        t: et.Tunables(),
       );
 
       _engine = GameEngine(cfg);
       _engine!.rayCfg = RayConfig(
         rayCount: 180,
         includeFloor: false,
-        forwardAligned: _forwardAligned, // ← ship-forward aligned by default
+        forwardAligned: _forwardAligned, // ship-forward aligned
       );
 
       final p = _policy;
@@ -203,7 +229,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       e,
       nx: 160,
       ny: 120,
-      iters: 1200,
+      iters: 300000,
       omega: 1.7,
       tol: 1e-4,
     );
@@ -360,7 +386,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
     final engine = _engine;
     if (engine == null) return;
-    if (engine.status != GameStatus.playing) return;
+    if (engine.status != et.GameStatus.playing) return;
 
     // Compute per-frame velocity vectors for debug view
     final pf = _pf;
@@ -398,7 +424,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
     final info = engine.step(
       dt,
-      ControlInput(
+      et.ControlInput(
         thrust: _thrust,
         left: _left,
         right: _right,
@@ -430,9 +456,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     setState(() {});
   }
 
-  void _maybeEmitMainFlame(LanderState lander) {
+  void _maybeEmitMainFlame(et.LanderState lander) {
     final engine = _engine!;
-    if (_thrust && lander.fuel > 0 && engine.status == GameStatus.playing) {
+    if (_thrust && lander.fuel > 0 && engine.status == et.GameStatus.playing) {
       final c = math.cos(lander.angle);
       final s = math.sin(lander.angle);
       const halfH = 18.0;
@@ -449,7 +475,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     }
   }
 
-  void _maybeEmitSideRCS(LanderState lander) {
+  void _maybeEmitSideRCS(et.LanderState lander) {
     if ((!_sideLeft && !_sideRight) || lander.fuel <= 0) return;
 
     final c = math.cos(lander.angle);
@@ -479,7 +505,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     }
   }
 
-  void _maybeEmitDownwardFlame(LanderState lander) {
+  void _maybeEmitDownwardFlame(et.LanderState lander) {
     if (!_downThrust || lander.fuel <= 0) return;
 
     const halfH = 6.0;
@@ -543,6 +569,146 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     );
   }
 
+  // ---------- Live training isolate control ----------
+  Future<void> _startLiveTraining() async {
+    if (_trainerIso != null) return;
+
+    // 0) Make sure _livePath is a WRITABLE FILE (use path_provider)
+    //    e.g., _livePath = '${(await getApplicationDocumentsDirectory()).path}/policy_live.json';
+
+    _progress.phase = ProgressPhase.starting;
+    setState(() {});
+
+    _trainerRecv = ReceivePort();
+    final errPort  = ReceivePort();
+    final exitPort = ReceivePort();
+
+    // 1) LISTEN FIRST, with tolerant parsing (no hard casts)
+    _trainerRecv!.listen((msg) async {
+      // debugPrint('trainer→ui: $msg'); // enable while debugging
+
+      if (msg is SendPort) {
+        _trainerSend = msg;
+
+        // 2) Send a plain MAP (not LiveTrainStart)
+        _trainerSend!.send({
+          'cmd': 'start',
+          'outPath': _livePath,
+          'warmStart': null,  // or a real FILE path you copied from assets
+          'iters': 300000,
+          'seed': 7,
+        });
+        return;
+      }
+
+      if (msg is Map) {
+        final type = msg['type'] as String? ?? '';
+        switch (type) {
+          case 'status': {
+            final ph = (msg['phase'] as String?) ?? 'idle';
+            _progress.phase = ph == 'stopped'
+                ? ProgressPhase.stopped
+                : ph.contains('warm') || ph == 'starting'
+                ? ProgressPhase.starting
+                : ProgressPhase.training;
+            _progress.it = (msg['iters'] is num) ? (msg['iters'] as num).toInt() : _progress.it;
+            if (mounted) setState(() {});
+            break;
+          }
+          case 'progress': {
+            final p = (msg['phase'] as String?) ?? '';
+            final isEval = p.contains('evaluating');
+            final isCurric = p.contains('curriculum'); // NEW
+
+            _progress.phase = isEval ? ProgressPhase.evaluating : ProgressPhase.training;
+
+            _progress.it = (msg['it'] ?? 0) as int;
+            _progress.total = (msg['total'] ?? 0) as int;
+
+            if (isEval) {
+              // real evaluation metrics (unchanged)
+              _progress.landPct  = ((msg['landPct']  ?? 0.0) as num).toDouble();
+              _progress.meanCost = ((msg['meanCost'] ?? 0.0) as num).toDouble();
+              _progress.meanSteps= ((msg['meanSteps']?? 0.0) as num).toDouble();
+            } else if (isCurric) { // NEW: proxy during curriculum ticks
+              final acc = ((msg['accWindow'] ?? 0.0) as num).toDouble(); // 0..1
+              final dx  = ((msg['dxPerSec']  ?? 0.0) as num).toDouble(); // + is good
+
+              // Show curriculum “confidence” as Land% proxy
+              _progress.landPct = (acc * 100.0).clamp(0.0, 100.0);
+
+              // Optional: put something meaningful in the other slots so the HUD moves
+              _progress.meanCost = -dx;         // “lower is better” feel
+              _progress.meanSteps = dx.abs();   // or any small stat you like
+
+              // (You could also add a tiny “Stage” chip in the HUD using msg['stage'] if desired.)
+            } else {
+              // Fallback for any other training progress
+              _progress.landPct  = ((msg['landPct']  ?? _progress.landPct) as num).toDouble();
+              _progress.meanCost = ((msg['meanCost'] ?? _progress.meanCost) as num).toDouble();
+              _progress.meanSteps= ((msg['meanSteps']?? _progress.meanSteps) as num).toDouble();
+            }
+
+            setState(() {});
+            break;
+          }
+          case 'saved': {
+            final path = (msg['path'] as String?) ?? _livePath;
+            await _hotReloadPolicy(path); // must try loadFromFile first
+            _toast('Live policy updated');
+            break;
+          }
+          case 'warn':  debugPrint('trainer warn: ${msg['message']}'); break;
+          case 'hint':  debugPrint('trainer hint: ${msg['message']}'); break;
+          case 'error': debugPrint('trainer error: ${msg['message']}'); break;
+        }
+      }
+    });
+
+    errPort.listen((e) => debugPrint('trainer isolate error: $e'));
+    exitPort.listen((_) => debugPrint('trainer isolate exit'));
+
+    // 3) Spawn AFTER listener is ready
+    _trainerIso = await Isolate.spawn(
+      liveTrainerMain,
+      _trainerRecv!.sendPort,
+      onError: errPort.sendPort,
+      onExit:  exitPort.sendPort,
+      errorsAreFatal: false,
+    );
+  }
+
+  Future<void> _stopLiveTraining() async {
+    final sp = _trainerSend;
+    if (sp != null) sp.send(const LiveTrainStop());
+    _trainerRecv?.close();
+    _trainerIso?.kill(priority: Isolate.immediate);
+    _trainerIso = null;
+    _trainerSend = null;
+    _trainerRecv = null;
+    _progress.reset();
+    setState(() {});
+  }
+
+  Future<void> _hotReloadPolicy(String path) async {
+    try {
+      RuntimeTwoStagePolicy p;
+      try {
+        p = await RuntimeTwoStagePolicy.loadFromAsset(path, planHold: 2);
+      } catch (_) {
+        p = await RuntimeTwoStagePolicy.loadFromAsset(path, planHold: 2);
+      }
+      p.setStochasticPlanner(true);
+      p.setIntentTemperature(1.8);
+      p.usePadAlignPlanner();
+      _applyPolicyPhysicsToEngine(p);
+      if (mounted) setState(() => _policy = p);
+    } catch (e) {
+      debugPrint('Hot reload failed: $e');
+      _toast('Hot reload failed');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -574,7 +740,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                     painter: GamePainter(
                       lander: engine.lander,
                       terrain: engine.terrain,
-                      thrusting: _thrust && engine.lander.fuel > 0 && status == GameStatus.playing,
+                      thrusting: _thrust && engine.lander.fuel > 0 && status == et.GameStatus.playing,
                       status: status,
                       particles: _particles,
                       // Only feed rays to painter when mode == rays
@@ -631,23 +797,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                           ),
                           const SizedBox(width: 8),
 
-                          /*
-                          Tooltip(
-                            message: 'Ray alignment: ${_forwardAligned ? "Forward (ship frame)" : "World"}',
-                            child: FilterChip(
-                              label: Text(_forwardAligned ? 'Rays: FWD' : 'Rays: WORLD'),
-                              selected: _forwardAligned,
-                              onSelected: (v) {
-                                setState(() {
-                                  _forwardAligned = v;
-                                  _syncRayAlignmentToEngine();
-                                });
-                              },
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                           */
-
                           ElevatedButton.icon(
                             onPressed: _reset,
                             icon: const Icon(Icons.refresh),
@@ -657,6 +806,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       ),
                       const SizedBox(height: 10),
 
+                      // Live training quick controls + status
                       Row(
                         children: [
                           _hudBox(title: 'Fuel', value: engine.lander.fuel.toStringAsFixed(0)),
@@ -687,6 +837,17 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                               ),
                             ),
                           const Spacer(),
+                          // Live train buttons
+                          ElevatedButton(
+                            onPressed: (_trainerIso == null) ? _startLiveTraining : _stopLiveTraining,
+                            child: Text(_trainerIso == null ? 'Train Live' : 'Stop Train'),
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton(
+                            onPressed: () => _hotReloadPolicy(_livePath),
+                            child: const Text('Reload'),
+                          ),
+                          const SizedBox(width: 8),
 
                           // Brush button
                           Tooltip(
@@ -715,7 +876,11 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       ),
 
                       const SizedBox(height: 8),
-                      if (status != GameStatus.playing)
+                      // Live training HUD panel
+                      _ProgressPanel(model: _progress),
+
+                      const SizedBox(height: 8),
+                      if (status != et.GameStatus.playing)
                         Center(
                           child: Container(
                             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -725,7 +890,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                               border: Border.all(color: Colors.white24),
                             ),
                             child: Text(
-                              status == GameStatus.landed ? 'Touchdown! 🟢' : 'Crashed 💥',
+                              status == et.GameStatus.landed ? 'Touchdown! 🟢' : 'Crashed 💥',
                               style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
                             ),
                           ),
@@ -771,7 +936,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   }
 
   Widget _buildControls() {
-    final disabled = _engine?.status != GameStatus.playing || _aiPlay;
+    final disabled = _engine?.status != et.GameStatus.playing || _aiPlay;
     return IgnorePointer(
       ignoring: disabled,
       child: Align(
@@ -838,13 +1003,115 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   }
 }
 
-/// Painter that draws polygon terrain (light gray), pad-highlighted edges,
-/// rays/potential/velocity overlays, particles, the plan ribbon, and the lander triangle.
+/// Compact panel to visualize live training progress.
+class _ProgressPanel extends StatelessWidget {
+  final _ProgressModel model;
+  const _ProgressPanel({required this.model});
+
+  String _phaseLabel(ProgressPhase p) {
+    switch (p) {
+      case ProgressPhase.idle: return 'Idle';
+      case ProgressPhase.starting: return 'Starting';
+      case ProgressPhase.training: return 'Training';
+      case ProgressPhase.evaluating: return 'Evaluating';
+      case ProgressPhase.stopped: return 'Stopped';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pct = (model.total > 0) ? (model.it / model.total).clamp(0.0, 1.0) : 0.0;
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.45),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Title row
+          Row(
+            children: [
+              const Icon(Icons.school, size: 16, color: Colors.white70),
+              const SizedBox(width: 6),
+              Text('Live Training • ${_phaseLabel(model.phase)}',
+                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              const Spacer(),
+              Text(model.total > 0 ? '${model.it}/${model.total}' : '',
+                  style: const TextStyle(color: Colors.white70)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          // Iter progress bar
+          _bar(context, pct, labelLeft: 'Iter', labelRight: '${(pct * 100).toStringAsFixed(0)}%'),
+          const SizedBox(height: 8),
+          // Land% bar (eval or pulse)
+          _bar(context, (model.landPct / 100).clamp(0.0, 1.0),
+              labelLeft: 'Land%', labelRight: '${model.landPct.toStringAsFixed(1)}%'),
+          const SizedBox(height: 8),
+          // Stats
+          Row(
+            children: [
+              _stat('Mean Cost', model.meanCost.toStringAsFixed(2)),
+              const SizedBox(width: 12),
+              _stat('Steps', model.meanSteps.toStringAsFixed(1)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _bar(BuildContext context, double t, {required String labelLeft, required String labelRight}) {
+    return Column(
+      children: [
+        Row(
+          children: [
+            Text(labelLeft, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+            const Spacer(),
+            Text(labelRight, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+          ],
+        ),
+        const SizedBox(height: 6),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: LinearProgressIndicator(
+            value: t,
+            minHeight: 8,
+            backgroundColor: Colors.white12,
+            valueColor: const AlwaysStoppedAnimation<Color>(Colors.lightBlueAccent),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _stat(String k, String v) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.white10,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('$k: ', style: const TextStyle(color: Colors.white70, fontSize: 12)),
+          Text(v, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+        ],
+      ),
+    );
+  }
+}
+
 class GamePainter extends CustomPainter {
   final et.LanderState lander;
   final et.Terrain terrain;
   final bool thrusting;
-  final GameStatus status;
+  final et.GameStatus status;
   final List<Particle> particles;
   final List<RayHit> rays;
 
@@ -954,12 +1221,12 @@ class GamePainter extends CustomPainter {
     final Paint padPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 3
-      ..color = (status == GameStatus.crashed ? Colors.red : Colors.greenAccent);
+      ..color = (status == et.GameStatus.crashed ? Colors.red : Colors.greenAccent);
 
     for (final e in edges) {
       final p1 = Offset(e.a.x, e.a.y);
       final p2 = Offset(e.b.x, e.b.y);
-      if (e.kind == PolyEdgeKind.pad) {
+      if (e.kind == et.PolyEdgeKind.pad) {
         canvas.drawLine(p1, p2, padPaint);
       } else {
         canvas.drawLine(p1, p2, ridgePaint);
@@ -1206,7 +1473,7 @@ class GamePainter extends CustomPainter {
         right.add(Offset(p.dx - nx * w, p.dy - ny * w));
       }
 
-      // ONE closed ribbon (don’t use addPolygon twice)
+      // ONE closed ribbon
       final ribbon = Path()
         ..moveTo(left.first.dx, left.first.dy);
       for (int i = 1; i < left.length; i++) {
