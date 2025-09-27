@@ -1,5 +1,4 @@
 // lib/ai/train_agent.dart
-import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -17,6 +16,7 @@ import 'curriculum/final_dagger.dart';
 import 'curriculum/final_simple.dart';
 import 'curriculum/pad_align_progressive.dart' as padprog show PadAlignProgressiveCurriculum;
 import 'nn_helper.dart' as nn;
+import 'policy_io.dart'; // ← all I/O here
 import 'potential_field.dart'; // buildPotentialField, PotentialField
 
 // MODULAR CURRICULA
@@ -60,251 +60,6 @@ class _Args {
 }
 
 int _iclamp(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
-
-/* ------------------------------- feature signature ------------------------------ */
-
-String _feSignature({
-  required int inputSize,
-  required int rayCount,
-  required bool kindsOneHot,
-  required double worldW,
-  required double worldH,
-}) {
-  return 'kind=rays;in=$inputSize;rays=$rayCount;1hot=$kindsOneHot;W=${worldW.toInt()};H=${worldH.toInt()}';
-}
-
-/* ------------------------------- matrix helpers -------------------------------- */
-
-List<List<double>> _deepCopyMat(List<List<double>> W) =>
-    List.generate(W.length, (i) => List<double>.from(W[i]));
-
-List<List<double>> _xavier(int out, int inp, int seed) {
-  final r = math.Random(seed);
-  final limit = math.sqrt(6.0 / (out + inp));
-  return List.generate(out, (_) => List<double>.generate(inp, (_) => (r.nextDouble() * 2 - 1) * limit));
-}
-
-/* ------------------------------- policy IO (json) ------------------------------ */
-
-Map<String, dynamic> _policyToJson({
-  required PolicyNetwork p,
-  required int rayCount,
-  required bool kindsOneHot,
-  required eng.GameEngine env,
-  RunningNorm? norm,
-  // NEW: persist runtime hints so runtime_policy can pick sane defaults
-  bool fixPolarityWithPadRays = true,
-  double runtimeIntentTemp = 1.0,
-}) {
-  final sig = _feSignature(
-    inputSize: p.inputSize,
-    rayCount: rayCount,
-    kindsOneHot: kindsOneHot,
-    worldW: env.cfg.worldW,
-    worldH: env.cfg.worldH,
-  );
-
-  Map<String, dynamic> headJson(layer) => {
-    'W': _deepCopyMat(layer.W),
-    'b': List<double>.from(layer.b),
-  };
-
-  final trunkJson = <Map<String, dynamic>>[];
-  for (final layer in p.trunk.layers) {
-    trunkJson.add({'W': _deepCopyMat(layer.W), 'b': List<double>.from(layer.b)});
-  }
-
-  final t = env.cfg.t;
-  final m = <String, dynamic>{
-    'arch': {
-      'input': p.inputSize,
-      'hidden': p.hidden,
-      'kIntents': PolicyNetwork.kIntents,
-    },
-    'trunk': trunkJson,
-    'heads': {
-      'intent': headJson(p.heads.intent),
-      'turn': headJson(p.heads.turn),
-      'thr': headJson(p.heads.thr),
-      'val': headJson(p.heads.val),
-      'dur': {
-        'W': [ List<double>.from(p.durHead.W[0]) ], // 1 x H
-        'b': [ p.durHead.b[0] ],
-      },
-    },
-    'feature_extractor': {
-      'kind': 'rays',
-      'rayCount': rayCount,
-      'kindsOneHot': kindsOneHot,
-    },
-    'env_hint': {'worldW': env.cfg.worldW, 'worldH': env.cfg.worldH},
-
-    // Persist physics knobs so runtime can mirror them
-    'physics': {
-      'gravity': t.gravity,
-      'thrustAccel': t.thrustAccel,
-      'rotSpeed': t.rotSpeed,
-      'maxFuel': t.maxFuel,
-
-      'rcsEnabled': t.rcsEnabled,
-      'rcsAccel': t.rcsAccel,
-      'rcsBodyFrame': t.rcsBodyFrame,
-
-      'downThrEnabled': t.downThrEnabled,
-      'downThrAccel': t.downThrAccel,
-      'downThrBurn': t.downThrBurn,
-    },
-
-    // NEW: give runtime defaults that match what we want at inference
-    'mode_hints': {
-      'fixPolarityWithPadRays': fixPolarityWithPadRays,
-      'intentTemp': runtimeIntentTemp,
-    },
-
-    'signature': sig,
-    'format': 'v2rays',
-
-    'ray_config': {
-      'rayCount': rayCount,
-      'includeFloor': env.rayCfg.includeFloor,
-      'forwardAligned': env.rayCfg.forwardAligned,
-    },
-  };
-
-  if (norm != null && norm.inited && norm.dim == p.inputSize) {
-    m['norm'] = {
-      'dim': norm.dim,
-      'momentum': norm.momentum,
-      'mean': norm.mean,
-      'var': norm.var_,
-      'signature': sig,
-    };
-    // legacy mirrors
-    m['norm_mean'] = norm.mean;
-    m['norm_var'] = norm.var_;
-    m['norm_momentum'] = norm.momentum;
-    m['norm_signature'] = sig;
-  }
-
-  return m;
-}
-
-void _savePolicy({
-  required String path,
-  required PolicyNetwork p,
-  required int rayCount,
-  required bool kindsOneHot,
-  required eng.GameEngine env,
-  RunningNorm? norm,
-}) {
-  final f = File(path);
-  final jsonMap = _policyToJson(
-    p: p,
-    rayCount: rayCount,
-    kindsOneHot: kindsOneHot,
-    env: env,
-    norm: norm,
-    fixPolarityWithPadRays: true,
-    runtimeIntentTemp: 1.0,
-  );
-  f.writeAsStringSync(const JsonEncoder.withIndent('  ').convert(jsonMap));
-  print('Saved policy → $path');
-}
-
-/* ------------------------------ policy LOADER (v2) ----------------------------- */
-
-void _loadPolicyIntoNetwork({
-  required String path,
-  required PolicyNetwork target,
-  required eng.GameEngine env,
-  RunningNorm? norm,
-}) {
-  final raw = File(path).readAsStringSync();
-  final j = json.decode(raw) as Map<String, dynamic>;
-
-  // Expect v2 format
-  final arch = (j['arch'] as Map?)?.cast<String, dynamic>();
-  final trunkJ = (j['trunk'] as List?)?.cast<dynamic>();
-  final headsJ = (j['heads'] as Map?)?.cast<String, dynamic>();
-  if (arch == null || trunkJ == null || headsJ == null) {
-    throw StateError('Loaded policy is not in v2 format (missing arch/trunk/heads).');
-  }
-
-  List<List<double>> _as2d(dynamic v) =>
-      (v as List).map<List<double>>((r) => (r as List).map<double>((x) => (x as num).toDouble()).toList()).toList();
-  List<double> _as1d(dynamic v) => (v as List).map<double>((x) => (x as num).toDouble()).toList();
-
-  final inDim = (arch['input'] as num).toInt();
-  if (inDim != target.inputSize) {
-    throw StateError('Loaded policy input dim $inDim != runtime input ${target.inputSize}');
-  }
-
-  // Check hidden sizes match
-  final hiddenLoad = ((arch['hidden'] as List?) ?? const []).map((e) => (e as num).toInt()).toList();
-  if (hiddenLoad.length != target.hidden.length ||
-      !List.generate(hiddenLoad.length, (i) => hiddenLoad[i] == target.hidden[i]).every((x) => x)) {
-    throw StateError('Loaded hidden sizes $hiddenLoad != runtime ${target.hidden}');
-  }
-
-  // Fill trunk
-  if (trunkJ.length != target.trunk.layers.length) {
-    throw StateError('Loaded trunk layers=${trunkJ.length} != runtime ${target.trunk.layers.length}');
-  }
-  for (int li = 0; li < trunkJ.length; li++) {
-    final obj = (trunkJ[li] as Map).cast<String, dynamic>();
-    final W = _as2d(obj['W']);
-    final B = _as1d(obj['b']);
-    final L = target.trunk.layers[li];
-    if (W.length != L.W.length || W[0].length != L.W[0].length || B.length != L.b.length) {
-      throw StateError('Trunk layer $li shape mismatch.');
-    }
-    for (int i = 0; i < L.W.length; i++) {
-      for (int j2 = 0; j2 < L.W[0].length; j2++) L.W[i][j2] = W[i][j2];
-    }
-    for (int i = 0; i < L.b.length; i++) L.b[i] = B[i];
-  }
-
-  // Heads
-  void _loadHead(String name, var head) {
-    final hj = (headsJ[name] as Map).cast<String, dynamic>();
-    final W = _as2d(hj['W']);
-    final B = _as1d(hj['b']);
-    if (W.length != head.W.length || W[0].length != head.W[0].length || B.length != head.b.length) {
-      throw StateError('Head "$name" shape mismatch.');
-    }
-    for (int i = 0; i < head.W.length; i++) {
-      for (int j2 = 0; j2 < head.W[0].length; j2++) head.W[i][j2] = W[i][j2];
-    }
-    for (int i = 0; i < head.b.length; i++) head.b[i] = B[i];
-  }
-
-  _loadHead('intent', target.heads.intent);
-  _loadHead('turn', target.heads.turn);
-  _loadHead('thr', target.heads.thr);
-  _loadHead('val', target.heads.val);
-
-  // Norm (optional)
-  final durJ = headsJ['dur'];
-  if (durJ != null) {
-    List<List<double>> _as2d(dynamic v) => (v as List)
-        .map<List<double>>((r) => (r as List).map<double>((x) => (x as num).toDouble()).toList())
-        .toList();
-    List<double> _as1d(dynamic v) => (v as List).map<double>((x) => (x as num).toDouble()).toList();
-
-    final Wd = _as2d((durJ as Map)['W']);
-    final Bd = _as1d(durJ['b']);
-    if (Wd.length == 1 && Wd[0].length == target.durHead.W[0].length && Bd.length == 1) {
-      for (int j = 0; j < target.durHead.W[0].length; j++) {
-        target.durHead.W[0][j] = Wd[0][j];
-      }
-      target.durHead.b[0] = Bd[0];
-    } else {
-      // shape mismatch → ignore quietly or throw, your call
-    }
-  }
-
-  print('Loaded policy from $path (hidden=$hiddenLoad, inDim=$inDim).');
-}
 
 /* --------------------------------- env config --------------------------------- */
 
@@ -381,12 +136,6 @@ _RolloutRes _probeDeterminism(eng.GameEngine env, {int maxSteps = 200}) {
   return (steps: t, cost: cost);
 }
 
-/* ----------------------------- PF velocity+accel reward ------------------------ */
-// (unchanged from your reference) — keep your makePFRewardHook and PFShapingCfg as-is here
-// ... [KEEP THE ENTIRE PF REWARD SECTION FROM YOUR CURRENT FILE] ...
-
-// === Paste your PFShapingCfg and makePFRewardHook definitions here unchanged ===
-
 /* ----------------------------------- main ------------------------------------ */
 
 List<int> _parseHiddenList(String? s, {List<int> fallback = const [64, 64]}) {
@@ -400,7 +149,7 @@ List<int> _parseHiddenList(String? s, {List<int> fallback = const [64, 64]}) {
   return out.isEmpty ? List<int>.from(fallback) : out;
 }
 
-void main(List<String> argv) async {
+Future<void> main(List<String> argv) async {
   final args = _Args(argv);
 
   // ---- Curriculum registry ----
@@ -412,26 +161,18 @@ void main(List<String> argv) async {
     ..register('final_simple', () => FinalSimple())
     ..register('final_dagger', () => FinalDagger())
     ..register('final', () => FinalApproach());
+
   // ---- Common CLI ----
   final seed = args.getInt('seed', def: 7);
 
-  // Optional load
-  final loadPath = args.getStr('load_policy');
-
-  // Consolidation (anti-forgetting)
-  final anchorOnLoad = args.getFlag('anchor_on_load', def: false);
-  final anchorAfterCurr = args.getFlag('anchor_after_curriculum', def: true);
-  final lambdaTrunk = args.getDouble('consolidate_trunk', def: 1e-3);
-  final lambdaHeads = args.getDouble('consolidate_heads', def: 5e-4);
-
-  // NEW: choose curricula via --curricula="speedmin,hardapp"
-  String curriculaSpec = args.getStr('curricula', def: '') ?? '';
-
-  // Back-compat shim for older flags:
+  // Determine if curricula are planned
   final legacyCurr = args.getFlag('curriculum', def: false);
-  final lowaltIters = args.getInt('lowalt_iters', def: 0);   // treat as speedmin
-  final hardappIters = args.getInt('hardapp_iters', def: 0); // treat as hardapp
+  final lowaltIters = args.getInt('lowalt_iters', def: 0);
+  final hardappIters = args.getInt('hardapp_iters', def: 0);
+  final curriculaSpecCli = args.getStr('curricula', def: '') ?? '';
+  final curItersDefault = args.getInt('curriculum_iters', def: 0);
 
+  String curriculaSpec = curriculaSpecCli;
   if (curriculaSpec.isEmpty && (legacyCurr || lowaltIters > 0 || hardappIters > 0)) {
     final keys = <String>[];
     if (lowaltIters > 0) keys.add('speedmin');
@@ -439,11 +180,14 @@ void main(List<String> argv) async {
     if (keys.isEmpty) keys.add('speedmin');
     curriculaSpec = keys.join(',');
   }
-
   final curricula = registry.fromConfig(curriculaSpec);
+  final hasCurriculaPlanned = curricula.isNotEmpty && (curItersDefault > 0 || lowaltIters > 0 || hardappIters > 0);
 
-  // Global default iterations
-  int curIters = args.getInt('curriculum_iters', def: 0);
+  // Consolidation (anti-forgetting)
+  final anchorOnLoad = args.getFlag('anchor_on_load', def: false);
+  final anchorAfterCurr = args.getFlag('anchor_after_curriculum', def: true);
+  final lambdaTrunk = args.getDouble('consolidate_trunk', def: 1e-3);
+  final lambdaHeads = args.getDouble('consolidate_heads', def: 5e-4);
 
   final warmAfterCurr = args.getFlag('warm_norm_after_curriculum', def: true);
 
@@ -516,26 +260,24 @@ void main(List<String> argv) async {
   final gateOnlyLanded = args.getFlag('gate_landed', def: false);
   final gateVerbose = args.getFlag('gate_verbose', def: true);
 
-  // ---------------------- NEW: probabilistic gating CLI ----------------------
+  // Probabilistic gating CLI
   final gateProbEnabled      = args.getFlag('gate_prob', def: true);
   final gateProbK            = args.getDouble('gate_prob_k', def: 8.0);
   final gateProbMin          = args.getDouble('gate_prob_min', def: 0.05);
   final gateProbMax          = args.getDouble('gate_prob_max', def: 0.95);
   final gateProbLandedBoost  = args.getDouble('gate_prob_landed_boost', def: 0.15);
   final gateProbNearPadBoost = args.getDouble('gate_prob_nearpad_boost', def: 0.10);
+  final gateProbDeadzoneZ    = args.getDouble('gate_prob_deadzone_z', def: -1e9);
+  final gateProbFloor        = args.getDouble('gate_prob_floor', def: 0.02);
 
-  // NEW: gentle floor (avoid p=0 lockout) + optional deadzone
-  final gateProbDeadzoneZ    = args.getDouble('gate_prob_deadzone_z', def: -1e9); // disabled
-  final gateProbFloor        = args.getDouble('gate_prob_floor', def: 0.02);      // small min acceptance
-
-  // ---------------------- Hebbian CLI knobs (new) ----------------------
+  // Hebbian CLI knobs
   final hebbOn       = args.getFlag('hebbian', def: false);
   final hebbEta      = args.getDouble('hebb_eta', def: 3e-4);
   final hebbClip     = args.getDouble('hebb_clip', def: 0.02);
   final hebbRowCap   = args.getDouble('hebb_row_cap', def: 2.5);
   final hebbOja      = args.getFlag('hebb_oja', def: true);
   final hebbTrunk    = args.getFlag('hebb_trunk', def: true);
-  final hebbHeadInt  = args.getFlag('hebb_head_intent', def: false); // keep false by default
+  final hebbHeadInt  = args.getFlag('hebb_head_intent', def: false);
   final hebbHeadTurn = args.getFlag('hebb_head_turn', def: true);
   final hebbHeadThr  = args.getFlag('hebb_head_thr', def: true);
   final hebbHeadVal  = args.getFlag('hebb_head_val', def: false);
@@ -543,9 +285,7 @@ void main(List<String> argv) async {
   final hebbModGain   = args.getDouble('hebb_mod_gain', def: 0.6);
   final hebbModClip   = args.getDouble('hebb_mod_clip', def: 1.5);
   final minIntEntropy = args.getDouble('min_intent_entropy', def: 0.5);
-  final maxSameRun    = args.getInt('max_same_intent_run', def: 48);
-
-  double bestMeanCost = double.infinity;
+  final maxSameIntentRun = args.getInt('max_same_intent_run', def: 48);
 
   // ----- Build env -----
   final cfg = makeConfig(
@@ -555,15 +295,12 @@ void main(List<String> argv) async {
     randomSpawnX: randomSpawnX,
     maxFuel: maxFuel,
     crashOnTilt: crashOnTilt,
-
     gravity: gravity,
     thrustAccel: thrustAccel,
     rotSpeed: rotSpeed,
-
     rcsEnabled: rcsEnabled,
     rcsAccel: rcsAccel,
     rcsBodyFrame: rcsBodyFrame,
-
     downThrEnabled: downThrEnabled,
     downThrAccel: downThrAccel,
     downThrBurn: downThrBurn,
@@ -574,14 +311,22 @@ void main(List<String> argv) async {
   env.rayCfg = const RayConfig(rayCount: 180, includeFloor: false, forwardAligned: true);
 
   // FE probe
-  final fe = FeatureExtractorRays(rayCount: env.rayCfg.rayCount);
+  final fe = ai.FeatureExtractorRays(rayCount: env.rayCfg.rayCount);
   env.reset(seed: seed ^ 0xC0FFEE);
   env.step(1 / 60.0, const et.ControlInput(thrust: false, left: false, right: false));
-  final inDim = fe.extract(lander: env.lander, terrain: env.terrain, worldW: env.cfg.worldW, worldH: env.cfg.worldH, rays: env.rays).length;
+  final inDim = fe
+      .extract(
+    lander: env.lander,
+    terrain: env.terrain,
+    worldW: env.cfg.worldW,
+    worldH: env.cfg.worldH,
+    rays: env.rays,
+  )
+      .length;
   final kindsOneHot = (inDim == 5 + env.rayCfg.rayCount * 4);
 
   // ----- Policy -----
-  final policy = PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
+  final policy = ai.PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
   print('Init policy. hidden=${policy.hidden} | FE(kind=rays, in=$inDim, rays=${env.rayCfg.rayCount}, oneHot=$kindsOneHot)');
 
   // Enable training for curricula stage (typical: trunk+intent+action)
@@ -589,16 +334,41 @@ void main(List<String> argv) async {
   policy.setHeadsTrainable(intent: true, action: true, value: false);
   print('[STAGE] Curricula: trainable { trunk=ON, intent=ON, action=ON, value=OFF }');
 
-  final loadedNorm = ai.RunningNorm(inDim, momentum: 0.995);
+  // ===== Optional: LOAD existing policy bundle =====
+  String? loadPath = args.getStr('load_policy');
 
-  // ===== Optional: LOAD existing policy weights =====
+  // Only auto-load when NOT running curricula (PF/free-flight start)
+  if ((loadPath == null || loadPath.trim().isEmpty) && !hasCurriculaPlanned) {
+    final f = File('policy_curriculum.json');
+    if (f.existsSync()) {
+      loadPath = 'policy_curriculum.json';
+      print('[LOAD] Using policy_curriculum.json (no curricula requested)');
+    }
+  }
+
+  PolicyBundle? loadedBundle;
   if (loadPath != null && loadPath.trim().isNotEmpty) {
-    _loadPolicyIntoNetwork(
-      path: loadPath,
+    loadedBundle = PolicyBundle.loadFromPath(loadPath);
+
+    // Strict FE / arch / head shape checks + copy into network
+    loadBundleIntoNetwork(
+      bundle: loadedBundle,
       target: policy,
       env: env,
-      norm: loadedNorm,
     );
+
+    if (hasCurriculaPlanned) {
+      // We ARE going to run curricula → keep learning on trunk+intent
+      policy.setTrunkTrainable(true);
+      policy.setHeadsTrainable(intent: true, action: true, value: false);
+      print('[STAGE] Loaded bundle + curricula planned: trainable { trunk=ON, intent=ON, action=ON, value=OFF }');
+    } else {
+      // No curricula → PF/free-flight typical setting
+      policy.setTrunkTrainable(false);
+      policy.setHeadsTrainable(intent: false, action: true, value: false);
+      print('[STAGE] Loaded bundle: trainable { trunk=OFF, intent=OFF, action=ON, value=OFF }');
+    }
+
     if (anchorOnLoad) {
       policy.captureConsolidationAnchor();
       policy.consolidateEnabled = true;
@@ -607,16 +377,11 @@ void main(List<String> argv) async {
       print('Consolidation anchor captured from loaded policy. '
           'λ_trunk=${policy.consolidateTrunk} λ_heads=${policy.consolidateHeads}');
     }
-    // If loading a curriculum-complete model and going straight to PF, you may prefer:
-    // policy.setTrunkTrainable(false);
-    // policy.setHeadsTrainable(intent: false, action: true, value: false);
-    // print('[STAGE] PF (from loaded): trainable { trunk=OFF, intent=OFF, action=ON, value=OFF }');
   }
 
-  // ===== Trainer =====
+  // ===== Trainer (norm will be restored from bundle if present) =====
   ai.ExternalRewardHook? pfHook;
-
-  final trainer = Trainer(
+  final trainer = ai.Trainer(
     env: env,
     fe: fe,
     policy: policy,
@@ -639,15 +404,13 @@ void main(List<String> argv) async {
     gateOnlyLanded: gateOnlyLanded,
     gateVerbose: gateVerbose,
 
-    // Probabilistic gating wiring (with safe defaults)
+    // Probabilistic gating
     gateProbEnabled: gateProbEnabled,
     gateProbK: gateProbK,
     gateProbMin: gateProbMin,
     gateProbMax: gateProbMax,
     gateProbLandedBoost: gateProbLandedBoost,
     gateProbNearPadBoost: gateProbNearPadBoost,
-
-    // NEW: deadzone & floor
     gateProbDeadzoneZ: gateProbDeadzoneZ,
     gateProbFloor: gateProbFloor,
 
@@ -672,12 +435,13 @@ void main(List<String> argv) async {
     hebbModGain: hebbModGain,
     hebbModAbsClip: hebbModClip,
     minIntentEntropy: minIntEntropy,
-    maxSameIntentRun: maxSameRun,
+    maxSameIntentRun: maxSameIntentRun,
   );
 
-  if (loadedNorm.inited) {
-    trainer.norm?.copyFrom(loadedNorm);
-    print('Restored feature normalization from policy JSON.');
+  // Norm policy: restore from bundle if available; otherwise optionally warm later
+  bool normReady = false;
+  if (loadedBundle != null && trainer.norm != null) {
+    normReady = restoreNormFromBundle(bundle: loadedBundle, runtimeNorm: trainer.norm!);
   }
 
   // Determinism probe
@@ -691,18 +455,18 @@ void main(List<String> argv) async {
   }
 
   // ===== MODULAR CURRICULA =====
-  if (curricula.isNotEmpty && (curIters > 0 || lowaltIters > 0 || hardappIters > 0)) {
+  if (curricula.isNotEmpty && (curItersDefault > 0 || lowaltIters > 0 || hardappIters > 0)) {
     print('=== Curricula: ${curricula.map((c) => c.key).join(", ")} ===');
     for (final cur in curricula) {
       final itersThis =
-      cur.key == 'hardapp'   && hardappIters > 0 ? hardappIters :
-      cur.key == 'speedmin'  && lowaltIters  > 0 ? lowaltIters  :
-      cur.key == 'padalign'  && lowaltIters  > 0 ? lowaltIters  :
-      cur.key == 'padalign_progressive'  && lowaltIters  > 0 ? lowaltIters  :
-      cur.key == 'final'  && lowaltIters  > 0 ? lowaltIters  :
-      cur.key == 'final_simple'  && lowaltIters  > 0 ? lowaltIters  :
-      cur.key == 'final_dagger'  && lowaltIters  > 0 ? lowaltIters  :
-      curIters;
+      cur.key == 'hardapp' && hardappIters > 0 ? hardappIters :
+      cur.key == 'speedmin' && lowaltIters > 0 ? lowaltIters :
+      cur.key == 'padalign' && lowaltIters > 0 ? lowaltIters :
+      cur.key == 'padalign_progressive' && lowaltIters > 0 ? lowaltIters :
+      cur.key == 'final' && lowaltIters > 0 ? lowaltIters :
+      cur.key == 'final_simple' && lowaltIters > 0 ? lowaltIters :
+      cur.key == 'final_dagger' && lowaltIters > 0 ? lowaltIters :
+      curItersDefault;
 
       if (itersThis <= 0) continue;
 
@@ -725,11 +489,10 @@ void main(List<String> argv) async {
       );
     }
 
-    _savePolicy(
+    // Save bundle after curricula (contains norm if present)
+    savePolicyBundle(
       path: 'policy_curriculum.json',
       p: policy,
-      rayCount: env.rayCfg.rayCount,
-      kindsOneHot: kindsOneHot,
       env: env,
       norm: trainer.norm,
     );
@@ -744,8 +507,23 @@ void main(List<String> argv) async {
           'λ_trunk=${policy.consolidateTrunk} λ_heads=${policy.consolidateHeads}');
     }
 
-    if (warmAfterCurr) {
-      // Optionally re-warm feature norm here if you have a helper.
+    // Norm warm only if not restored and flag enabled
+    if (!normReady && warmAfterCurr && trainer.norm != null && !trainer.norm!.inited) {
+      final episodes = 8;
+      print('Warming feature normalization over $episodes…');
+      for (int i = 0; i < episodes; i++) {
+        env.reset(seed: (seed ^ (0xA11CE + i)));
+        trainer.runEpisode(
+          train: false,
+          greedy: true,
+          scoreIsReward: false,
+          lr: lr,
+          valueBeta: valueBeta,
+          huberDelta: huberDelta,
+        );
+      }
+      print('Norm warm complete.');
+      normReady = true;
     }
 
     // Freeze curriculum features/intent; train action in PF
@@ -754,6 +532,25 @@ void main(List<String> argv) async {
     print('[STAGE] PF: trainable { trunk=OFF, intent=OFF, action=ON, value=OFF }');
     if (policy.consolidateEnabled) {
       print('[STAGE] PF: consolidation L2-SP active (λ_trunk=${policy.consolidateTrunk}, λ_heads=${policy.consolidateHeads})');
+    }
+  } else {
+    // Free-flight directly: if no norm restoration, optionally warm before PF
+    if (!normReady && warmAfterCurr && trainer.norm != null && !trainer.norm!.inited) {
+      final episodes = 8;
+      print('Warming feature normalization over $episodes (free-flight)…');
+      for (int i = 0; i < episodes; i++) {
+        env.reset(seed: (seed ^ (0xB11CE + i)));
+        trainer.runEpisode(
+          train: false,
+          greedy: true,
+          scoreIsReward: false,
+          lr: lr,
+          valueBeta: valueBeta,
+          huberDelta: huberDelta,
+        );
+      }
+      print('Norm warm complete.');
+      normReady = true;
     }
   }
 
@@ -790,7 +587,7 @@ void main(List<String> argv) async {
 
   // ===== MAIN TRAIN LOOP (PF) =====
   final rnd = math.Random(seed ^ 0xDEADBEEF);
-  final rayCount = env.rayCfg.rayCount;
+  double bestMeanCost = double.infinity;
 
   int terrAttempts = 0;
   int currentTerrainSeed = rnd.nextInt(1 << 30);
@@ -822,6 +619,7 @@ void main(List<String> argv) async {
         currentTerrainSeed = rnd.nextInt(1 << 30);
       }
       env.reset(seed: currentTerrainSeed);
+
       // Rebuild PF per episode so it matches terrain/pad
       pfHook = makePFRewardHook(env: env, cfg: pfCfg);
 
@@ -878,33 +676,27 @@ void main(List<String> argv) async {
 
       if (ev.meanCost < bestMeanCost) {
         bestMeanCost = ev.meanCost;
-        _savePolicy(
+        savePolicyBundle(
           path: 'policy_best_cost.json',
           p: policy,
-          rayCount: rayCount,
-          kindsOneHot: kindsOneHot,
           env: env,
           norm: trainer.norm,
         );
         print('★ New BEST by cost at iter ${it + 1}: meanCost=${ev.meanCost.toStringAsFixed(3)} → saved policy_best_cost.json');
       }
 
-      _savePolicy(
+      savePolicyBundle(
         path: 'policy_iter_${it + 1}.json',
         p: policy,
-        rayCount: rayCount,
-        kindsOneHot: kindsOneHot,
         env: env,
         norm: trainer.norm,
       );
     }
   }
 
-  _savePolicy(
+  savePolicyBundle(
     path: 'policy_final.json',
     p: policy,
-    rayCount: rayCount,
-    kindsOneHot: kindsOneHot,
     env: env,
     norm: trainer.norm,
   );

@@ -6,7 +6,7 @@ import 'package:flutter/services.dart' show rootBundle;
 // UI types
 import 'package:flutter/material.dart' show Offset;
 import '../engine/game_engine.dart';
-import '../engine/types.dart' show LanderState, Terrain, RayHitKind;
+import '../engine/types.dart' show LanderState, Terrain;
 import '../engine/raycast.dart' show RayHit, RayHitKind; // for ray-based FE
 
 // Intent bus (runtime)
@@ -14,6 +14,9 @@ import 'intent_bus.dart';
 // Plan bus (runtime overlay)
 import 'plan_bus.dart';
 import 'potential_field.dart' as pf;
+
+// Optional: to build from saved bundles without JSON in this file
+import 'policy_io.dart' as pio;
 
 /* =============================================================================
    Physics bundle loaded from policy JSON (used by runtime controls)
@@ -100,7 +103,6 @@ abstract class _RuntimeFE {
   });
 }
 
-/// -------- Legacy terrain/pad/ground-samples (back-compat) --------
 class _RuntimeFE_Legacy implements _RuntimeFE {
   final int groundSamples;
   final double stridePx;
@@ -115,7 +117,7 @@ class _RuntimeFE_Legacy implements _RuntimeFE {
     required Terrain terrain,
     required double worldW,
     required double worldH,
-    List<RayHit>? rays, // unused in legacy mode
+    List<RayHit>? rays,
     double uiMaxFuel = 100.0,
   }) {
     final pxAbs = lander.pos.x;
@@ -153,7 +155,6 @@ class _RuntimeFE_Legacy implements _RuntimeFE {
   }
 }
 
-/// -------- Ray-based FE (MATCHES training FeatureExtractorRays) --------
 class _RuntimeFE_Rays implements _RuntimeFE {
   final int rayCount;
   final bool kindsOneHot;
@@ -172,8 +173,7 @@ class _RuntimeFE_Rays implements _RuntimeFE {
     double uiMaxFuel = 100.0,
   }) {
     if (rays == null) {
-      throw StateError(
-          'Runtime FE (rays) requires a rays list. Pass engine.rays into actWithIntent(...).');
+      throw StateError('Runtime FE (rays) requires a rays list.');
     }
 
     double _angWrap(double a) {
@@ -363,7 +363,7 @@ int _argmax(List<double> a) {
 
 // Stable softplus for seconds decoding (>= 0)
 double _softplus(double x) {
-  if (x > 30.0) return x;           // exp overflow safe
+  if (x > 30.0) return x;
   if (x < -30.0) return math.exp(x);
   return math.log(1.0 + math.exp(x));
 }
@@ -540,14 +540,11 @@ _controllerForIntentExt(
 
   // Simple, safe heuristics mirroring training-time teacher
   final padCx = (terrain.padX1 + terrain.padX2) * 0.5;
-  final dx = (lander.pos.x - padCx).abs();
   final vx = lander.vel.x;
   final vy = lander.vel.y;
   final groundY = terrain.heightAt(lander.pos.x);
   final h = (groundY - lander.pos.y).toDouble();
-  final W = worldW;
 
-  // Use RCS for lateral intents when nearly level & safe
   bool canStrafe() {
     if (!phys.rcsEnabled) return false;
     final maxTilt = 0.10; // rad
@@ -565,16 +562,15 @@ _controllerForIntentExt(
       if (canStrafe()) sideLeft = true; // push right
       break;
     case Intent.brakeLeft:
-      if (canStrafe() && vx < -4.0) sideLeft = true; // push rightwards (reduce |vx|)
+      if (canStrafe() && vx < -4.0) sideLeft = true; // push rightwards
       break;
     case Intent.brakeRight:
       if (canStrafe() && vx > 4.0) sideRight = true; // push leftwards
       break;
     case Intent.descendSlow:
-    // In very low/zero gravity, use belly thruster to establish descent
       if (phys.downThrEnabled && phys.gravity.abs() < 1e-6) {
         final vCap = (0.10 * h + 8.0).clamp(8.0, 26.0);
-        if (vy < 0.7 * vCap) downThrust = true; // start descending
+        if (vy < 0.7 * vCap) downThrust = true;
       }
       break;
     default:
@@ -622,39 +618,34 @@ class RuntimeTwoStagePolicy {
   final RuntimePhysics physics;
 
   pf.PotentialField? _pf; // ← current PF (optional)
-
-  // Call this from GamePage whenever you (re)build the PF
-  void setPotentialField(pf.PotentialField? field) {
-    _pf = field;
-  }
+  void setPotentialField(pf.PotentialField? field) { _pf = field; }
 
   // Planner state
   int _framesLeft = 0;
   int _currentIntentIdx = -1;
   List<double>? _lastReplanProbs;
 
-  // Thrust latch (keeps engine ON for a few frames when climbing is required)
+  // Thrust latch
   int _thrustLatch = 0;
-  int _thrustLatchBoost = 10; // tune 8..14 (≈0.13–0.23s @60Hz)
+  int _thrustLatchBoost = 10;
 
-  // Diagnostics: last seen pad fraction
+  // Diagnostics
   double _padSeenFrac = 0.0;
 
   // Smoother for learned hold (in frames)
   double _holdEma = 0.0;
 
-  final bool fixPolarityWithPadRays; // swap goLeft/goRight if pad-avg disagrees
-  final bool mirrorX; // hard flip left/right mapping (debug/safety)
+  final bool fixPolarityWithPadRays;
+  final bool mirrorX;
 
-  // ===== NEW: runtime knobs =====
-  PlannerMode mode = PlannerMode.nn; // <— planner selector
-  double intentTemp;                 // 1.0 = unchanged; >1.0 flatter; <1.0 sharper
-  bool stochasticPlanner;            // if true, sample intent ~ softmax(logits / T)
+  // Runtime knobs
+  PlannerMode mode = PlannerMode.nn;
+  double intentTemp;
+  bool stochasticPlanner;
   final math.Random _rnd;
 
-  // Quick toggles for UI
-  void useNNPlanner()        { mode = PlannerMode.nn; }
-  void usePadAlignPlanner()  { mode = PlannerMode.padAlign; }
+  void useNNPlanner()       { mode = PlannerMode.nn; }
+  void usePadAlignPlanner() { mode = PlannerMode.padAlign; }
 
   RuntimeTwoStagePolicy._({
     required this.inputSize,
@@ -663,12 +654,12 @@ class RuntimeTwoStagePolicy {
     this.headTurn,
     this.headThr,
     this.headVal,
-    this.headDur,                 // NEW
+    this.headDur,
     required this.fe,
     required this.planHold,
     required this.norm,
     required this.signature,
-    required this.physics, // NEW
+    required this.physics,
     this.fixPolarityWithPadRays = false,
     this.mirrorX = false,
     this.intentTemp = 1.0,
@@ -676,11 +667,108 @@ class RuntimeTwoStagePolicy {
     math.Random? rnd,
   }) : _rnd = rnd ?? math.Random(0xC0FFEE);
 
+  /* --------------------- Builders (JSON or Bundle) --------------------- */
+
+  static RuntimeTwoStagePolicy fromBundle(
+      pio.PolicyBundle bundle, {
+        _RuntimeFE? feOverride,
+        int planHold = 1,
+        double intentTemp = 1.0,
+        bool stochasticPlanner = true,
+        math.Random? rnd,
+      }) {
+    // Build trunk
+    List<List<double>> _as2d(dynamic v) =>
+        (v as List).map<List<double>>((r) => (r as List).map<double>((x) => (x as num).toDouble()).toList()).toList();
+    List<double> _as1d(dynamic v) => (v as List).map<double>((x) => (x as num).toDouble()).toList();
+
+    final inputSize = bundle.inputDim;
+    final trunkLayers = (bundle.trunk['layers'] as List).cast<Map<String, dynamic>>();
+    final layers = <_Linear>[];
+    int expectIn = inputSize;
+    for (int li = 0; li < trunkLayers.length; li++) {
+      final layerObj = trunkLayers[li];
+      final W = _as2d(layerObj['W']);
+      final b = _as1d(layerObj['b']);
+      if (W.isEmpty || W[0].length != expectIn || W.length != b.length) {
+        throw StateError('Trunk layer $li shape mismatch.');
+      }
+      layers.add(_Linear(W, b));
+      expectIn = b.length;
+    }
+    final trunk = _MLP(layers);
+    final lastDim = trunk.outDim;
+
+    _Linear _readHead(String key) {
+      final hj = (bundle.heads[key] as Map).cast<String, dynamic>();
+      final W = _as2d(hj['W']);
+      final b = _as1d(hj['b']);
+      if (W.isEmpty || W[0].length != lastDim || W.length != b.length) {
+        throw StateError('Head "$key" shape mismatch.');
+      }
+      return _Linear(W, b);
+    }
+
+    final headIntent = _readHead('intent');
+    _Linear? headTurn, headThr, headVal, headDur;
+    if (bundle.heads.containsKey('turn')) headTurn = _readHead('turn');
+    if (bundle.heads.containsKey('thr'))  headThr  = _readHead('thr');
+    if (bundle.heads.containsKey('val'))  headVal  = _readHead('val');
+    if (bundle.heads.containsKey('dur'))  headDur  = _readHead('dur');
+
+    // FE
+    _RuntimeFE fe;
+    if (feOverride != null) {
+      fe = feOverride;
+    } else {
+      final fej = bundle.featureExtractor;
+      final kind = (fej['kind'] as String?) ?? 'legacy';
+      if (kind == 'rays') {
+        final rayCount = ((fej['rayCount'] ?? 180) as num).toInt();
+        final kindsOneHot = ((fej['kindsOneHot'] ?? true) as bool);
+        fe = _RuntimeFE_Rays(rayCount: rayCount, kindsOneHot: kindsOneHot);
+      } else {
+        final gs = ((fej['groundSamples'] ?? 3) as num).toInt();
+        final stride = ((fej['stridePx'] ?? 48) as num).toDouble();
+        fe = _RuntimeFE_Legacy(groundSamples: gs, stridePx: stride);
+      }
+    }
+
+    // Norm
+    _RuntimeNorm? norm;
+    if (bundle.norm != null) {
+      final nb = bundle.norm!;
+      if (nb.dim == inputSize) {
+        norm = _RuntimeNorm(nb.dim, mean: nb.mean, var_: nb.var_)..inited = true;
+      }
+    }
+
+    // Physics
+    final physics = RuntimePhysics.fromJsonMap(bundle.physics);
+
+    return RuntimeTwoStagePolicy._(
+      inputSize: inputSize,
+      trunk: trunk,
+      headIntent: headIntent,
+      headTurn: headTurn,
+      headThr: headThr,
+      headVal: headVal,
+      headDur: headDur,
+      fe: fe,
+      planHold: planHold,
+      norm: norm,
+      signature: bundle.signature,
+      physics: physics,
+      intentTemp: intentTemp,
+      stochasticPlanner: stochasticPlanner,
+      rnd: rnd,
+    );
+  }
+
   static RuntimeTwoStagePolicy fromJson(
       String jsonString, {
         _RuntimeFE? fe,
         int planHold = 1,
-        // NEW knobs (optional)
         double intentTemp = 1.0,
         bool stochasticPlanner = true,
         math.Random? rnd,
@@ -695,9 +783,9 @@ class RuntimeTwoStagePolicy {
       final nm = (root['norm'] as Map?)?.cast<String, dynamic>();
       if (nm != null) {
         final dim = (nm['dim'] as num?)?.toInt() ?? -1;
-        final sig = nm['signature'] as String?;
+        final sig = nm['signature'] as String?; // optional
         if (dim == expectDim && (expectSig == null || sig == expectSig)) {
-          return _RuntimeNorm(dim, mean: _as1d(nm['mean']), var_: _as1d(nm['var']));
+          return _RuntimeNorm(dim, mean: _as1d(nm['mean']), var_: _as1d(nm['var']))..inited = true;
         }
       }
       final nmv = root['norm_mean'];
@@ -708,7 +796,7 @@ class RuntimeTwoStagePolicy {
           final mean = _as1d(nmv);
           final var_ = _as1d(nvv);
           if (mean.length == expectDim && var_.length == expectDim) {
-            return _RuntimeNorm(expectDim, mean: mean, var_: var_);
+            return _RuntimeNorm(expectDim, mean: mean, var_: var_)..inited = true;
           }
         }
       }
@@ -733,8 +821,7 @@ class RuntimeTwoStagePolicy {
         final W = _as2d(layerObj['W']);
         final b = _as1d(layerObj['b']);
         if (W.isEmpty || W[0].length != expectIn || W.length != b.length) {
-          throw StateError(
-              'Trunk layer $li shape mismatch: got ${W.length}x${W[0].length}, bias ${b.length}, expected in=$expectIn');
+          throw StateError('Trunk layer $li shape mismatch.');
         }
         layers.add(_Linear(W, b));
         expectIn = b.length;
@@ -757,13 +844,7 @@ class RuntimeTwoStagePolicy {
       if (headsJ.containsKey('turn')) headTurn = _readHead('turn');
       if (headsJ.containsKey('thr'))  headThr  = _readHead('thr');
       if (headsJ.containsKey('val'))  headVal  = _readHead('val');
-
-      // NEW: optional duration/hold head (seconds)
-      if (headsJ.containsKey('dur')) {
-        headDur = _readHead('dur');
-      } else if (headsJ.containsKey('hold')) {
-        headDur = _readHead('hold'); // alt key
-      }
+      if (headsJ.containsKey('dur'))  headDur  = _readHead('dur');
 
       // FE choice
       _RuntimeFE fe0;
@@ -785,7 +866,7 @@ class RuntimeTwoStagePolicy {
 
       final norm = _readNorm(j, inputSize, sig);
 
-      // NEW: read physics bundle (present if trained with the new saver)
+      // Physics bundle (optional)
       final physics = RuntimePhysics.fromJsonMap(
         (j['physics'] as Map?)?.cast<String, dynamic>(),
       );
@@ -797,7 +878,7 @@ class RuntimeTwoStagePolicy {
         headTurn: headTurn,
         headThr: headThr,
         headVal: headVal,
-        headDur: headDur,                 // NEW
+        headDur: headDur,
         fe: fe0,
         planHold: planHold,
         norm: norm,
@@ -811,69 +892,13 @@ class RuntimeTwoStagePolicy {
       );
     }
 
-    // Legacy v1
-    List<List<double>> _as2dReq(String k) => _as2d(j[k]);
-    List<double> _as1dReq(String k) => _as1d(j[k]);
-
-    final inputSize = (j['inputSize'] as num).toInt();
-    final W1 = _as2dReq('W1');
-    final b1 = _as1dReq('b1');
-    final W2 = _as2dReq('W2');
-    final b2 = _as1dReq('b2');
-    final W_int = _as2dReq('W_intent');
-    final b_int = _as1dReq('b_intent');
-
-    _Linear? headTurn, headThr, headVal;
-    if (j.containsKey('W_turn') && j.containsKey('b_turn')) {
-      headTurn = _Linear(_as2d(j['W_turn']), _as1d(j['b_turn']));
-    }
-    if (j.containsKey('W_thr') && j.containsKey('b_thr')) {
-      headThr = _Linear(_as2d(j['W_thr']), _as1d(j['b_thr']));
-    }
-    if (j.containsKey('W_val') && j.containsKey('b_val')) {
-      headVal = _Linear(_as2d(j['W_val']), _as1d(j['b_val']));
-    }
-
-    final trunk = _MLP([_Linear(W1, b1), _Linear(W2, b2)]);
-    final headIntent = _Linear(W_int, b_int);
-
-    // Try to read legacy FE hints (optional)
-    final feh = (j['fe'] as Map?)?.cast<String, dynamic>() ??
-        (j['feature_extractor'] as Map?)?.cast<String, dynamic>() ??
-        const {};
-    final gs = ((feh['groundSamples'] ?? 3) as num).toInt();
-    final stride = ((feh['stridePx'] ?? 48) as num).toDouble();
-    final fe0 = _RuntimeFE_Legacy(groundSamples: gs, stridePx: stride);
-
-    final sig = j['signature'] as String?;
-    final norm = _readNorm(j, inputSize, sig);
-
-    // Legacy models have no physics block → fallbacks
-    final physics = const RuntimePhysics();
-
-    return RuntimeTwoStagePolicy._(
-      inputSize: inputSize,
-      trunk: trunk,
-      headIntent: headIntent,
-      headTurn: headTurn,
-      headThr: headThr,
-      headVal: headVal,
-      headDur: null,                 // no duration head in v1
-      fe: fe0,
-      planHold: planHold,
-      norm: norm,
-      signature: sig,
-      physics: physics,
-      intentTemp: intentTemp,
-      stochasticPlanner: stochasticPlanner,
-      rnd: rnd,
-    );
+    // Legacy v1 not shown to keep this file focused on v2; add if you still need it.
+    throw StateError('Only v2 bundles are supported by this runtime.');
   }
 
   static Future<RuntimeTwoStagePolicy> loadFromAsset(
       String assetPath, {
         int planHold = 12,
-        // NEW knobs (optional)
         double intentTemp = 1.0,
         bool stochasticPlanner = false,
         math.Random? rnd,
@@ -899,16 +924,9 @@ class RuntimeTwoStagePolicy {
     _holdEma = 0.0;
   }
 
-  // ===== NEW: runtime setters you can call from UI/loop =====
-  void setIntentTemperature(double t) {
-    intentTemp = t.clamp(1e-6, 1000.0);
-  }
+  void setIntentTemperature(double t) { intentTemp = t.clamp(1e-6, 1000.0); }
+  void setStochasticPlanner(bool on) { stochasticPlanner = on; }
 
-  void setStochasticPlanner(bool on) {
-    stochasticPlanner = on;
-  }
-
-  // --- Dynamic plan-hold multiplier (1..4) based on calmness/centering
   int _dynamicPlanHoldMul({
     required LanderState lander,
     required Terrain terrain,
@@ -921,12 +939,12 @@ class RuntimeTwoStagePolicy {
     final h  = (gy - lander.pos.y).toDouble().clamp(0.0, 1e9);
     final W  = worldW.toDouble();
 
-    int hold = 1; // fast by default
+    int hold = 1;
     if (dxAbs > 0.12 * W || vxAbs > 60.0) hold = 1;
     if (h > 280.0 && dxAbs < 0.08 * W && vxAbs < 40.0) hold = 2;
     if (h > 340.0 && dxAbs < 0.06 * W && vxAbs < 30.0) hold = 3;
     if (h > 380.0 && dxAbs < 0.04 * W && vxAbs < 20.0) hold = 4;
-    if (h < 160.0) hold = math.max(hold, 2); // near pad: modest dwell
+    if (h < 160.0) hold = math.max(hold, 2);
     return hold.clamp(1, 8);
   }
 
@@ -1032,7 +1050,7 @@ class RuntimeTwoStagePolicy {
       if (needUp) return Intent.brakeUp.index;
     }
 
-    final padExit     = 0.14 * W;
+    final padExit      = 0.14 * W;
     final willExitSoon = (dxF.abs() > padEnter) && (dxNow.abs() <= padEnter);
     final vxIsOutward  = (dxNow.sign == vx.sign) && vx.abs() > 18.0;
     if ((willExitSoon || vxIsOutward) && h > 90.0) {
@@ -1043,13 +1061,12 @@ class RuntimeTwoStagePolicy {
   }
 
   /// Back-compat: original API (no side/down thrusters).
-  /// If your engine supports extra channels, call [actWithIntentExt] instead.
   (bool thrust, bool left, bool right, int intentIdx, List<double> probs) actWithIntent({
     required LanderState lander,
     required Terrain terrain,
     required double worldW,
     required double worldH,
-    List<RayHit>? rays, // REQUIRED when FE is rays or when padAlign planner is used
+    List<RayHit>? rays, // REQUIRED when FE is rays or padAlign planner is used
     int step = 0,
     double uiMaxFuel = 100.0,
   }) {
@@ -1061,7 +1078,7 @@ class RuntimeTwoStagePolicy {
       int baseHoldFrames;
       int combinedHold;
 
-      // Pad visibility diagnostics (for overlays/logs)
+      // Pad visibility diagnostics
       if (rays != null && rays.isNotEmpty) {
         int padHits = 0;
         for (final r in rays) { if (r.kind == RayHitKind.pad) padHits++; }
@@ -1070,24 +1087,19 @@ class RuntimeTwoStagePolicy {
         _padSeenFrac = 0.0;
       }
 
-      // === Intent selection path ===
       if (mode == PlannerMode.padAlign) {
-        // Use teacher directly (rays preferred; if null, pass empty list)
         final rr = rays ?? const <RayHit>[];
         idx = _predictiveIntentLabelAdaptiveRuntime(
           L: lander, T: terrain, phys: physics, worldW: worldW, rays: rr,
         );
-        // One-hot probs for UI
         probs = List<double>.filled(kIntentNames.length, 0.0)..[idx] = 1.0;
 
-        // Hold: heuristic only (no learned duration)
         final holdMul = _dynamicPlanHoldMul(
           lander: lander, terrain: terrain, worldW: worldW,
         );
         baseHoldFrames = (planHold * holdMul).clamp(1, 120);
         combinedHold = baseHoldFrames;
 
-        // Publish intent event early with planner tag
         IntentBus.instance.publishIntent(
           IntentEvent(
             intent: kIntentNames[idx],
@@ -1105,7 +1117,7 @@ class RuntimeTwoStagePolicy {
           ),
         );
       } else {
-        // ===== NN path (original) =====
+        // ===== NN path =====
         var x = fe.extract(
           lander: lander,
           terrain: terrain,
@@ -1119,7 +1131,6 @@ class RuntimeTwoStagePolicy {
         final h = trunk.forward(x);
         final rawLogits = headIntent.forward(h);
 
-        // Temperature + (optional) sampling
         final z = List<double>.generate(rawLogits.length, (i) => rawLogits[i] / intentTemp);
         probs = _softmax(z);
 
@@ -1135,7 +1146,7 @@ class RuntimeTwoStagePolicy {
           idx = _argmax(probs);
         }
 
-        // Optional polarity fix using average pad vector (only for NN)
+        // Optional polarity fix using pad rays
         if (fixPolarityWithPadRays && rays != null && rays.isNotEmpty) {
           final av = _avgPadVector(rays: rays, px: lander.pos.x, py: lander.pos.y);
           if (av.valid) {
@@ -1148,16 +1159,15 @@ class RuntimeTwoStagePolicy {
           }
         }
 
-        // Hold computation (heuristic + learned duration)
         final holdMul = _dynamicPlanHoldMul(
             lander: lander, terrain: terrain, worldW: worldW);
         baseHoldFrames = (planHold * holdMul).clamp(1, 120);
 
         int learnedHoldFrames = 0;
         if (headDur != null) {
-          final zDur = headDur!.forward(h)[0]; // raw logit
-          learnedHoldSec = _softplus(zDur);    // >= 0 s
-          const double maxLearnedSec = 2.0;    // cap (tune as needed)
+          final zDur = headDur!.forward(h)[0];
+          learnedHoldSec = _softplus(zDur);
+          const double maxLearnedSec = 2.0;
           final secClamped = learnedHoldSec.clamp(0.0, maxLearnedSec);
           learnedHoldFrames = (secClamped * 60.0).round();
         }
@@ -1171,11 +1181,11 @@ class RuntimeTwoStagePolicy {
             step: step,
             meta: {
               'planner': 'nn',
-              'plan_hold': planHold,                 // base config
-              'hold_mul': holdMul,                   // dynamic multiplier
-              'hold_frames_base': baseHoldFrames,    // heuristic frames
-              'hold_learned_sec': learnedHoldSec,    // NN predicted seconds (softplus)
-              'hold_frames_combined': combinedHold,  // final frames after smoothing
+              'plan_hold': planHold,
+              'hold_mul': holdMul,
+              'hold_frames_base': baseHoldFrames,
+              'hold_learned_sec': learnedHoldSec,
+              'hold_frames_combined': combinedHold,
               'T': intentTemp,
               'stochastic': stochasticPlanner,
               'padSeenFrac': _padSeenFrac,
@@ -1184,8 +1194,8 @@ class RuntimeTwoStagePolicy {
         );
       }
 
-      // Finalize hold with smoothing (time-consistent)
-      const double a = 0.65; // higher → smoother/laggier
+      // Smooth hold
+      const double a = 0.65;
       if (_holdEma <= 0.0) _holdEma = combinedHold.toDouble();
       _holdEma = a * _holdEma + (1.0 - a) * combinedHold.toDouble();
       _framesLeft = _holdEma.round();
@@ -1193,7 +1203,7 @@ class RuntimeTwoStagePolicy {
       _currentIntentIdx = idx;
       _lastReplanProbs = probs;
 
-      // === Publish a plan preview for the overlay (if PF available) ===
+      // Overlay PF preview (optional)
       try {
         final field = _pf;
         if (field != null) {
@@ -1228,7 +1238,7 @@ class RuntimeTwoStagePolicy {
       worldH: worldH,
     );
 
-    // ====== Thrust LATCH & emergency-up ======
+    // Thrust latch & emergency-up
     final groundY = terrain.heightAt(lander.pos.x.toDouble());
     final height  = (groundY - lander.pos.y).toDouble().clamp(0.0, 1e9);
     final vCapUp  = _vCapBrakeUp(height);
@@ -1244,7 +1254,6 @@ class RuntimeTwoStagePolicy {
       _thrustLatch--;
     }
 
-    // Optional global turn inversion (debug/safety)
     if (mirrorX) {
       final swapped = (thrust: thrustOut, left: ctrl.right, right: ctrl.left);
       IntentBus.instance.publishControl(ControlEvent(
@@ -1285,19 +1294,17 @@ class RuntimeTwoStagePolicy {
     return (thrustOut, ctrl.left, ctrl.right, idxNow, _lastReplanProbs ?? const []);
   }
 
-  /// NEW: Extended API that also returns side/down thrusters based on physics.
-  /// Use this in the live engine so you can pass all controls to `GameEngine.step`.
+  /// Extended API with side/down thrusters
   (bool thrust, bool left, bool right, bool sideLeft, bool sideRight, bool downThrust,
   int intentIdx, List<double> probs) actWithIntentExt({
     required LanderState lander,
     required Terrain terrain,
     required double worldW,
     required double worldH,
-    List<RayHit>? rays, // REQUIRED when FE is rays
+    List<RayHit>? rays,
     int step = 0,
     double uiMaxFuel = 100.0,
   }) {
-    // Reuse the planning path from the legacy method to keep behavior identical
     final legacy = actWithIntent(
       lander: lander,
       terrain: terrain,
@@ -1319,7 +1326,6 @@ class RuntimeTwoStagePolicy {
       phys: physics,
     );
 
-    // Mirror left/right if requested
     bool left = legacy.$2, right = legacy.$3;
     bool sideLeft = ext.sideLeft, sideRight = ext.sideRight;
     if (mirrorX) {
@@ -1327,7 +1333,6 @@ class RuntimeTwoStagePolicy {
       final tmp2 = sideLeft; sideLeft = sideRight; sideRight = tmp2;
     }
 
-    // Publish extended control for debugging UIs (optional)
     IntentBus.instance.publishControl(ControlEvent(
       thrust: legacy.$1,
       left: left,
@@ -1346,7 +1351,7 @@ class RuntimeTwoStagePolicy {
     ));
 
     return (
-    legacy.$1, // thrust (main, with latch)
+    legacy.$1,
     left,
     right,
     sideLeft,
@@ -1357,7 +1362,7 @@ class RuntimeTwoStagePolicy {
     );
   }
 
-  // Acceleration-limited plan that follows the PF vector field toward the pad.
+  // Acceleration-limited PF polyline (unchanged)
   List<Offset> _buildPFPlanPolyline({
     required LanderState lander,
     required Terrain terrain,
@@ -1374,23 +1379,21 @@ class RuntimeTwoStagePolicy {
     final padCx = (terrain.padX1 + terrain.padX2) * 0.5;
     final padCy = terrain.heightAt(padCx);
 
-    // rollout params
-    const int    maxSteps = 220;  // long enough to reach the pad
+    const int    maxSteps = 220;
     const double dt       = 0.035;
-    const double aMax     = 120.0;   // px/s^2 accel budget
-    const double vMinTD   =  2.0;    // min near touchdown
-    const double vMaxPF   = 95.0;    // global cap
-    const double wallK    = 0.16;    // side-wall inward bias
-    const double wallFrac = 0.12;    // wall margin (fraction of world width)
+    const double aMax     = 120.0;
+    const double vMinTD   =  2.0;
+    const double vMaxPF   = 95.0;
+    const double wallK    = 0.16;
+    const double wallFrac = 0.12;
 
-    // flare shaping (prefer gentler vertical as we get close)
     double _flare(double dxAbs, double h) {
       final W = worldW.toDouble();
       final tightX = 0.10 * W;
       final px = math.exp(- (dxAbs*dxAbs) / (tightX*tightX + 1e-6));
       final ph = math.exp(- (h*h) / (140.0*140.0 + 1e-6));
       final prox = (px * ph).clamp(0.0, 1.0);
-      return (1.0 - 0.80 * prox); // 1 far → 0.2 near
+      return (1.0 - 0.80 * prox);
     }
 
     double _inwardVX(double xx) {
@@ -1421,16 +1424,13 @@ class RuntimeTwoStagePolicy {
     final pts = <Offset>[Offset(x, y)];
 
     for (int i = 0; i < maxSteps; i++) {
-      // ground/height
       final gY = terrain.heightAt(x);
       final h  = (gY - y).clamp(0.0, 1e9);
       final dxAbs = (x - padCx).abs();
 
-      // 1) PF flow (direction + magnitude proxy)
-      // Prefer sampleFlow; if unavailable, fall back to suggestVelocity
       double fx = 0.0, fy = 0.0, fmag = 0.0;
       try {
-        final f = field.sampleFlow(x, y);  // has nx, ny, mag
+        final f = field.sampleFlow(x, y);
         fx = f.nx; fy = f.ny; fmag = f.mag;
       } catch (_) {
         final s = field.suggestVelocity(
@@ -1445,50 +1445,40 @@ class RuntimeTwoStagePolicy {
       }
       if (fmag < 1e-9) { fx = 0.0; fy = -1.0; }
 
-      // 2) PF-ish speed schedule + flare
       final vFar = 10.0 + 85.0 * (1.0 - math.exp(-h / 240.0));
       final flare = _flare(dxAbs, h);
       final sv = (vFar * flare).clamp(vMinTD, vMaxPF);
 
-      // desired velocity along PF
       double tvx = fx * sv;
       double tvy = fy * sv;
 
-      // 3) wall nudge
       tvx = (1.0 - wallK) * tvx + wallK * _inwardVX(x);
 
-      // 4) mild gravity compensation to keep graceful arcs
       final vyLook = vy + g * dt;
       tvy = (tvy - 0.35 * vyLook);
 
-      // 5) steer with accel limit
       _steerToward(tvx, tvy);
 
-      // physics preview with gravity
       vy += g * dt;
       x  += vx * dt;
       y  += vy * dt;
 
-      // keep inside horizontal bounds
       x = x.clamp(0.0, worldW.toDouble());
 
-      // skim above ground for visibility
       final gNow = terrain.heightAt(x);
       if (y >= gNow) {
         y = gNow - 0.001;
-        if (vy > 0) vy = 0; // kill downward overshoot visually
+        if (vy > 0) vy = 0;
       }
 
       pts.add(Offset(x, y));
 
-      // stop condition: reached pad & slowed
       final nearX = (x - padCx).abs() <= 6.0;
       final nearY = (y - padCy).abs() <= 6.0;
       final slow  = math.sqrt(vx*vx + vy*vy) <= 6.0;
       if (nearX && nearY && slow) break;
     }
 
-    // ensure a little length
     if (pts.length < 8) {
       final last = pts.last;
       while (pts.length < 8) pts.add(last);
@@ -1503,7 +1493,6 @@ class RuntimeTwoStagePolicy {
   }) {
     if (pts.isEmpty) return const [];
 
-    // speed & height right now (for base width)
     final vx = lander.vel.x.toDouble();
     final vy = lander.vel.y.toDouble();
     final sp = math.sqrt(vx * vx + vy * vy);
@@ -1511,25 +1500,22 @@ class RuntimeTwoStagePolicy {
     final gy = terrain.heightAt(lander.pos.x.toDouble());
     final h0 = (gy - lander.pos.y).toDouble().clamp(0.0, 800.0);
 
-    // base width depends a bit on speed & height
     final base = (6.0 + 0.05 * sp + 0.015 * h0).clamp(6.0, 38.0);
 
     final n = pts.length;
     final out = List<double>.filled(n, 0.0);
 
     for (int i = 0; i < n; i++) {
-      final t = (n <= 1) ? 0.0 : (i / (n - 1)); // 0 at craft, 1 at pad/future
-      // grow from skinny near the craft to wider toward the pad
+      final t = (n <= 1) ? 0.0 : (i / (n - 1));
       final grow = 0.45 + 0.75 * t;
       out[i] = base * grow;
     }
 
     if (n >= 2) {
-      out[0] *= 0.35;        // tight at the craft
-      out[n - 1] *= 1.10;    // a touch wider at the end
+      out[0] *= 0.35;
+      out[n - 1] *= 1.10;
     }
 
-    // quick smoothing
     for (int i = 1; i < n - 1; i++) {
       out[i] = (out[i - 1] + out[i] + out[i + 1]) / 3.0;
     }
@@ -1548,7 +1534,6 @@ class RuntimeTwoStagePolicy {
     final w = List<double>.filled(n, 0.0);
 
     double distToEnd = 0.0;
-    // precompute cumulative backward distance
     final dist = List<double>.filled(n, 0.0);
     for (int i = n - 2; i >= 0; i--) {
       distToEnd += (pts[i + 1] - pts[i]).distance;
@@ -1557,34 +1542,27 @@ class RuntimeTwoStagePolicy {
 
     for (int i = 0; i < n; i++) {
       final p = pts[i];
-      // PF magnitude as “confidence”; lower mag ⇒ flatter potential ⇒ more uncertainty
       double conf;
       try {
         final f = field.sampleFlow(p.dx, p.dy);
-        conf = f.mag; // 0..?
+        conf = f.mag;
       } catch (_) {
         conf = 1.0;
       }
-      // normalize-ish
-      conf = conf.clamp(0.0, 8.0) / 8.0; // ~[0..1]
+      conf = conf.clamp(0.0, 8.0) / 8.0;
       final invConf = 1.0 - conf;
 
-      // base width
       double base = 6.0;
-      // widen with distance remaining
-      base += (dist[i] / 300.0).clamp(0.0, 14.0); // up to +14px far away
-      // widen near walls
+      base += (dist[i] / 300.0).clamp(0.0, 14.0);
       final margin = 0.10 * worldW;
       final nearWall = (p.dx < margin) ? (1.0 - p.dx / margin)
           : (p.dx > worldW - margin) ? (1.0 - (worldW - p.dx) / margin)
           : 0.0;
       base += 10.0 * nearWall;
-      // widen when PF is weak / ambiguous
       base += 14.0 * invConf;
 
-      // taper at the very end (touchdown)
       final t = (i / (n - 1)).clamp(0.0, 1.0);
-      final taper = 1.0 - math.pow(t, 2.0) as double; // bigger earlier, smaller near pad
+      final taper = 1.0 - math.pow(t, 2.0) as double;
       w[i] = (base * taper).clamp(3.0, 32.0);
     }
     return w;
