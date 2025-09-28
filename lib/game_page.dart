@@ -1,10 +1,14 @@
 // lib/game_page.dart
 import 'dart:async';
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:path_provider/path_provider.dart';
 
 // Engine
 import 'engine/types.dart' as et;
@@ -92,7 +96,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   bool _terrainDirty = false;
 
   // ===== AI runtime policy =====
-  RuntimeTwoStagePolicy? _policy;   // loaded async from disk/asset
+  RuntimeTwoStagePolicy? _policy;   // loaded async from assets or live file
   bool get _aiReady => _policy != null;
 
   // HUD: last AI intent/probs (optional)
@@ -116,14 +120,21 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   Isolate? _trainerIso;
   SendPort? _trainerSend;
   ReceivePort? _trainerRecv;
-  String _livePath = 'policy_live.json'; // writable path; change to path_provider if you wish
   final _progress = _ProgressModel();
+
+  // Writable path for live policy + seeding flag
+  String? _livePath;
+  bool _liveSeeded = false;
+
+  // Live trainer config (simple knob for iterations)
+  int _liveIters = 120000; // adjust as desired
 
   @override
   void initState() {
     super.initState();
     _ticker = createTicker(_onTick)..start();
-    _loadPolicy(); // load runtime policy from assets (or live later)
+    _loadPolicy();           // load baseline runtime policy (from assets)
+    _initLivePathAndSeed();  // prepare a writable live policy file
 
     // Subscribe to plan bus for PF/fallback plans
     _planSub = PlanBus.instance.stream.listen((e) {
@@ -133,6 +144,32 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         _planVersion = e.version;
       });
     });
+  }
+
+  Future<void> _initLivePathAndSeed() async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final path = '${dir.path}/policy_live.json';
+      _livePath = path;
+
+      final f = File(path);
+      if (!await f.exists()) {
+        try {
+          // Seed a first file from bundled asset so hot-reload works immediately.
+          final txt = await rootBundle.loadString('assets/ai/policy.json');
+          await f.writeAsString(txt);
+          _liveSeeded = true;
+          debugPrint('Seeded live policy at $path');
+        } catch (e) {
+          debugPrint('Failed to seed live policy: $e');
+        }
+      } else {
+        _liveSeeded = true;
+      }
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('initLivePath failed: $e');
+    }
   }
 
   Future<void> _loadPolicy() async {
@@ -229,7 +266,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       e,
       nx: 160,
       ny: 120,
-      iters: 300000,
+      iters: 1200,
       omega: 1.7,
       tol: 1e-4,
     );
@@ -572,9 +609,13 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   // ---------- Live training isolate control ----------
   Future<void> _startLiveTraining() async {
     if (_trainerIso != null) return;
-
-    // 0) Make sure _livePath is a WRITABLE FILE (use path_provider)
-    //    e.g., _livePath = '${(await getApplicationDocumentsDirectory()).path}/policy_live.json';
+    if (_livePath == null) {
+      await _initLivePathAndSeed();
+      if (_livePath == null) {
+        _toast('No writable path for live policy');
+        return;
+      }
+    }
 
     _progress.phase = ProgressPhase.starting;
     setState(() {});
@@ -583,19 +624,14 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final errPort  = ReceivePort();
     final exitPort = ReceivePort();
 
-    // 1) LISTEN FIRST, with tolerant parsing (no hard casts)
     _trainerRecv!.listen((msg) async {
-      // debugPrint('trainer→ui: $msg'); // enable while debugging
-
       if (msg is SendPort) {
         _trainerSend = msg;
-
-        // 2) Send a plain MAP (not LiveTrainStart)
         _trainerSend!.send({
           'cmd': 'start',
           'outPath': _livePath,
-          'warmStart': null,  // or a real FILE path you copied from assets
-          'iters': 300000,
+          'warmStart': null,            // or a real file path if you copy assets
+          'iters': _liveIters,          // configurable
           'seed': 7,
         });
         return;
@@ -618,7 +654,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
           case 'progress': {
             final p = (msg['phase'] as String?) ?? '';
             final isEval = p.contains('evaluating');
-            final isCurric = p.contains('curriculum'); // NEW
+            final isCurric = p.contains('curriculum');
 
             _progress.phase = isEval ? ProgressPhase.evaluating : ProgressPhase.training;
 
@@ -626,35 +662,26 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
             _progress.total = (msg['total'] ?? 0) as int;
 
             if (isEval) {
-              // real evaluation metrics (unchanged)
-              _progress.landPct  = ((msg['landPct']  ?? 0.0) as num).toDouble();
-              _progress.meanCost = ((msg['meanCost'] ?? 0.0) as num).toDouble();
-              _progress.meanSteps= ((msg['meanSteps']?? 0.0) as num).toDouble();
-            } else if (isCurric) { // NEW: proxy during curriculum ticks
+              _progress.landPct   = ((msg['landPct']   ?? 0.0) as num).toDouble();
+              _progress.meanCost  = ((msg['meanCost']  ?? 0.0) as num).toDouble();
+              _progress.meanSteps = ((msg['meanSteps'] ?? 0.0) as num).toDouble();
+            } else if (isCurric) {
               final acc = ((msg['accWindow'] ?? 0.0) as num).toDouble(); // 0..1
               final dx  = ((msg['dxPerSec']  ?? 0.0) as num).toDouble(); // + is good
-
-              // Show curriculum “confidence” as Land% proxy
               _progress.landPct = (acc * 100.0).clamp(0.0, 100.0);
-
-              // Optional: put something meaningful in the other slots so the HUD moves
-              _progress.meanCost = -dx;         // “lower is better” feel
-              _progress.meanSteps = dx.abs();   // or any small stat you like
-
-              // (You could also add a tiny “Stage” chip in the HUD using msg['stage'] if desired.)
+              _progress.meanCost = -dx;
+              _progress.meanSteps = dx.abs();
             } else {
-              // Fallback for any other training progress
-              _progress.landPct  = ((msg['landPct']  ?? _progress.landPct) as num).toDouble();
-              _progress.meanCost = ((msg['meanCost'] ?? _progress.meanCost) as num).toDouble();
-              _progress.meanSteps= ((msg['meanSteps']?? _progress.meanSteps) as num).toDouble();
+              _progress.landPct   = ((msg['landPct']   ?? _progress.landPct) as num).toDouble();
+              _progress.meanCost  = ((msg['meanCost']  ?? _progress.meanCost) as num).toDouble();
+              _progress.meanSteps = ((msg['meanSteps'] ?? _progress.meanSteps) as num).toDouble();
             }
-
             setState(() {});
             break;
           }
           case 'saved': {
-            final path = (msg['path'] as String?) ?? _livePath;
-            await _hotReloadPolicy(path); // must try loadFromFile first
+            final path = (msg['path'] as String?) ?? _livePath!;
+            await _hotReloadPolicy(path);
             _toast('Live policy updated');
             break;
           }
@@ -668,7 +695,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     errPort.listen((e) => debugPrint('trainer isolate error: $e'));
     exitPort.listen((_) => debugPrint('trainer isolate exit'));
 
-    // 3) Spawn AFTER listener is ready
     _trainerIso = await Isolate.spawn(
       liveTrainerMain,
       _trainerRecv!.sendPort,
@@ -690,24 +716,35 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     setState(() {});
   }
 
+  void _requestTrainerSave() {
+    final sp = _trainerSend;
+    if (sp == null) return;
+    sp.send({'cmd': 'save'}); // trainer should write to outPath and post {'type':'saved', 'path': outPath}
+  }
+
   Future<void> _hotReloadPolicy(String path) async {
     try {
-      RuntimeTwoStagePolicy p;
-      try {
-        p = await RuntimeTwoStagePolicy.loadFromAsset(path, planHold: 2);
-      } catch (_) {
-        p = await RuntimeTwoStagePolicy.loadFromAsset(path, planHold: 2);
-      }
-      p.setStochasticPlanner(true);
-      p.setIntentTemperature(1.8);
-      p.usePadAlignPlanner();
-      _applyPolicyPhysicsToEngine(p);
-      if (mounted) setState(() => _policy = p);
+      final txt = await File(path).readAsString();
+      // You need a factory like this in your runtime class.
+      final newP = RuntimeTwoStagePolicy.fromJson(txt, planHold: 2);
+
+      newP.setStochasticPlanner(true);
+      newP.setIntentTemperature(1.8);
+      newP.usePadAlignPlanner();
+      _applyPolicyPhysicsToEngine(newP);
+
+      setState(() {
+        _policy = newP;
+        _policy!.resetPlanner(); // instant behavior switch
+      });
+      _toast('Live policy reloaded');
     } catch (e) {
       debugPrint('Hot reload failed: $e');
       _toast('Hot reload failed');
     }
   }
+
+  bool get _canReload => _livePath != null && File(_livePath!).existsSync();
 
   @override
   Widget build(BuildContext context) {
@@ -722,7 +759,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
             children: [
               // Game canvas + tap/drag carving
               Positioned.fill(
-                child:GestureDetector(
+                child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onTapDown: (d) => _carveAt(d.localPosition),
                   onTapUp: (_) {
@@ -786,7 +823,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                           const SizedBox(width: 8),
                           _aiToggleIcon(),
                           const SizedBox(width: 8),
-
                           Tooltip(
                             message: 'Tap to cycle view • Long-press to rebuild field',
                             child: FilterChip(
@@ -796,7 +832,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             ),
                           ),
                           const SizedBox(width: 8),
-
                           ElevatedButton.icon(
                             onPressed: _reset,
                             icon: const Icon(Icons.refresh),
@@ -804,9 +839,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                           ),
                         ],
                       ),
+
                       const SizedBox(height: 10),
 
-                      // Live training quick controls + status
+                      // Stats row
                       Row(
                         children: [
                           _hudBox(title: 'Fuel', value: engine.lander.fuel.toStringAsFixed(0)),
@@ -837,38 +873,33 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                               ),
                             ),
                           const Spacer(),
-                          // Live train buttons
-                          ElevatedButton(
-                            onPressed: (_trainerIso == null) ? _startLiveTraining : _stopLiveTraining,
-                            child: Text(_trainerIso == null ? 'Train Live' : 'Stop Train'),
-                          ),
-                          const SizedBox(width: 8),
-                          ElevatedButton(
-                            onPressed: () => _hotReloadPolicy(_livePath),
-                            child: const Text('Reload'),
-                          ),
-                          const SizedBox(width: 8),
 
-                          // Brush button
+                          // Iterations quick knob (optional)
                           Tooltip(
-                            message: _carveMode
-                                ? 'Brush ON — tap to disable; long-press to resize'
-                                : 'Brush OFF — tap to enable; long-press to resize',
-                            child: GestureDetector(
-                              onTap: () => setState(() => _carveMode = !_carveMode),
-                              onLongPress: _showBrushDialog,
-                              child: Container(
-                                width: 36,
-                                height: 36,
-                                decoration: BoxDecoration(
-                                  color: _carveMode ? Colors.green.withOpacity(0.20) : Colors.white10,
-                                  borderRadius: BorderRadius.circular(10),
-                                  border: Border.all(
-                                    color: _carveMode ? Colors.greenAccent : Colors.white30,
+                            message: 'Live training iterations',
+                            child: SizedBox(
+                              width: 110,
+                              child: Row(
+                                children: [
+                                  const Text('iters:', style: TextStyle(color: Colors.white70)),
+                                  const SizedBox(width: 6),
+                                  Expanded(
+                                    child: TextFormField(
+                                      initialValue: _liveIters.toString(),
+                                      style: const TextStyle(color: Colors.white),
+                                      decoration: const InputDecoration(
+                                        isDense: true,
+                                        contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                                        border: OutlineInputBorder(),
+                                      ),
+                                      keyboardType: TextInputType.number,
+                                      onFieldSubmitted: (v) {
+                                        final n = int.tryParse(v);
+                                        if (n != null && n > 0) setState(() => _liveIters = n);
+                                      },
+                                    ),
                                   ),
-                                ),
-                                alignment: Alignment.center,
-                                child: const Icon(Icons.brush, size: 18, color: Colors.white),
+                                ],
                               ),
                             ),
                           ),
@@ -876,10 +907,35 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       ),
 
                       const SizedBox(height: 8),
+
                       // Live training HUD panel
                       _ProgressPanel(model: _progress),
 
                       const SizedBox(height: 8),
+
+                      // NEW: Trainer buttons row (below the training data)
+                      Row(
+                        children: [
+                          ElevatedButton(
+                            onPressed: (_trainerIso == null) ? _startLiveTraining : _stopLiveTraining,
+                            child: Text(_trainerIso == null ? 'Train Live' : 'Stop Train'),
+                          ),
+                          const SizedBox(width: 8),
+                          // Save + Reload on SAME ROW
+                          ElevatedButton(
+                            onPressed: (_trainerIso != null) ? _requestTrainerSave : null,
+                            child: const Text('Save'),
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton(
+                            onPressed: _canReload ? () => _hotReloadPolicy(_livePath!) : null,
+                            child: const Text('Reload'),
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 8),
+
                       if (status != et.GameStatus.playing)
                         Center(
                           child: Container(

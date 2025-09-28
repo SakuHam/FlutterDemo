@@ -97,23 +97,54 @@ void liveTrainerMain(SendPort hostPort) async {
 
   bool running = false;
 
-  // Local state
+  // Local state (valid while running)
   late eng.GameEngine env;
   ai.FeatureExtractorRays? fe;
   ai.PolicyNetwork? policy;
   ai.Trainer? trainer;
+
+  // Remember the last target save path so UI can force a save at any time
+  String _outPath = 'policy_live.json';
 
   // Best checkpoint tracking
   double bestMeanCost = double.infinity;
   double bestLandPct = 0.0;
 
   await for (final msg in recv) {
+    // --------- Stop ---------
     if (msg is LiveTrainStop || (msg is Map && msg['cmd'] == 'stop')) {
       running = false;
       _send(hostPort, {'type': 'status', 'phase': 'stopped', 'iters': 0});
       continue;
     }
 
+    // --------- Manual Save (from UI "Save" button) ---------
+    if (msg is Map && msg['cmd'] == 'save') {
+      if (!running || policy == null || trainer == null) {
+        _send(hostPort, {
+          'type': 'warn',
+          'message': 'Save requested but trainer is not running yet.'
+        });
+      } else {
+        try {
+          savePolicyBundle(
+            path: _outPath,
+            p: policy!,
+            env: env,
+            norm: trainer!.norm,
+          );
+          _send(hostPort, {
+            'type': 'saved',
+            'path': _outPath,
+          });
+        } catch (e) {
+          _send(hostPort, {'type': 'error', 'message': 'Save failed: $e'});
+        }
+      }
+      continue;
+    }
+
+    // --------- Start ---------
     if (msg is LiveTrainStart || (msg is Map && msg['cmd'] == 'start')) {
       // Parse Start
       final conf = (msg is LiveTrainStart)
@@ -128,6 +159,9 @@ void liveTrainerMain(SendPort hostPort) async {
 
       if (running) continue;
       running = true;
+
+      // Remember where to save so explicit "save" can reuse it
+      _outPath = conf.outPath;
 
       // Immediately tell UI we’re starting (so HUD leaves Idle)
       _send(hostPort, {'type': 'status', 'phase': 'starting', 'iters': 0});
@@ -233,23 +267,11 @@ void liveTrainerMain(SendPort hostPort) async {
         // === Live training ===
         final cur = padprog.PadAlignProgressiveCurriculum();
 
-        // Wire curriculum heartbeat → UI (optional, but helps HUD tick)
-        // Will emit: {'type':'progress','phase':'curriculum', ...}
-        // (The UI treats non-'evaluating' progress as training.)
-        // NOTE: This property exists in our fork; harmless if no-op in yours.
-        // ignore: invalid_use_of_visible_for_testing_member
-        // ignore: invalid_use_of_protected_member
-        // If your class doesn't expose a sink, comment this line.
-        // (We keep it guarded to avoid breaking older code.)
+        // Optional: wire curriculum heartbeat → UI (try-catch to avoid hard dep)
         try {
-          // If your class has a 'progressSink' field as suggested:
-          // (m) => _send(hostPort, m);
-          // We use dynamic to avoid hard dependency.
-          // ignore: avoid_dynamic_calls
-          // ignore: cast_nullable_to_non_nullable
           (cur as dynamic).progressSink = (Map<String, Object?> m) => _send(hostPort, m);
         } catch (_) {
-          // no-op if curriculum has no sink
+          // ignore if your curriculum doesn’t expose a sink
         }
 
         final rng = math.Random(conf.seed);
@@ -340,14 +362,14 @@ void liveTrainerMain(SendPort hostPort) async {
           if (improved) {
             try {
               savePolicyBundle(
-                path: conf.outPath,
+                path: _outPath,
                 p: policy!,
                 env: env,
                 norm: trainer!.norm,
               );
               _send(hostPort, {
                 'type': 'saved',
-                'path': conf.outPath,
+                'path': _outPath,
                 'landPct': ev.landPct,
                 'meanCost': ev.meanCost,
               });

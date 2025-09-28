@@ -1,5 +1,6 @@
 // lib/ai/runtime_policy.dart
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/services.dart' show rootBundle;
 
@@ -1566,5 +1567,36 @@ class RuntimeTwoStagePolicy {
       w[i] = (base * taper).clamp(3.0, 32.0);
     }
     return w;
+  }
+
+  /// Build a policy from a JSON **string** (not an asset path).
+  static Future<RuntimeTwoStagePolicy> loadFromJsonString(
+      String jsonText, {
+        int planHold = 2,
+      }) async {
+    final Map<String, dynamic> map = json.decode(jsonText) as Map<String, dynamic>;
+    return fromMap(map, planHold: planHold);
+  }
+
+  /// Build a policy from a JSON **file path** (writable location).
+  static Future<RuntimeTwoStagePolicy> loadFromFilePath(
+      String path, {
+        int planHold = 2,
+      }) async {
+    final jsonText = await File(path).readAsString();
+    return loadFromJsonString(jsonText, planHold: planHold);
+  }
+
+  /// If you don't already have this, add a simple adapter from a parsed map.
+  /// Reuse whatever your current loadFromAsset() uses under the hood.
+  static Future<RuntimeTwoStagePolicy> fromMap(
+      Map<String, dynamic> map, {
+        int planHold = 2,
+      }) async {
+    // Example skeleton — wire into your existing model classes:
+    // final model = RuntimeModel.fromJson(map);  // or whatever your type is
+    // return RuntimeTwoStagePolicy(model, planHold: planHold);
+
+    throw UnimplementedError('fromMap needs to construct RuntimeTwoStagePolicy from parsed JSON.');
   }
 }
