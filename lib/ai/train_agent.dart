@@ -3,14 +3,14 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter_application_1/ai/curriculum/pad_align.dart';
+import 'package:flutter_application_1/ai/curriculum/planner_bc.dart';
 import 'package:flutter_application_1/ai/pf_reward.dart';
 
 import '../engine/types.dart' as et;
 import '../engine/game_engine.dart' as eng;
 import '../engine/raycast.dart'; // RayConfig
 
-import 'agent.dart' as ai; // FeatureExtractorRays, PolicyNetwork, Trainer, RunningNorm, kIntentNames
-import 'agent.dart';
+import 'agent.dart' as ai; // FeatureExtractorRays, PolicyNetwork, Trainer, RunningNorm
 import 'curriculum/final_approach.dart';
 import 'curriculum/final_dagger.dart';
 import 'curriculum/final_simple.dart';
@@ -48,8 +48,8 @@ class _Args {
   int getInt(String k, {int def = 0}) => int.tryParse(_kv[k] ?? '') ?? def;
   double getDouble(String k, {double def = 0.0}) => double.tryParse(_kv[k] ?? '') ?? def;
   bool getFlag(String k, {bool def = false}) {
-    if (_flags.contains(k)) return true;            // --flag
-    final v = _kv[k];                                // --flag=true / --flag=false
+    if (_flags.contains(k)) return true;
+    final v = _kv[k];
     if (v == null) return def;
     final s = v.toLowerCase();
     return s == '1' || s == 'true' || s == 'yes' || s == 'on';
@@ -160,24 +160,25 @@ Future<void> main(List<String> argv) async {
     ..register('hardapp', () => HardApproach())
     ..register('final_simple', () => FinalSimple())
     ..register('final_dagger', () => FinalDagger())
+    ..register('planner_bc', () => PlannerBC())
     ..register('final', () => FinalApproach());
 
   // ---- Common CLI ----
   final seed = args.getInt('seed', def: 7);
 
+  // Loader behavior flags
+  final forceScratch = args.getFlag('force_scratch', def: false);
+  final inheritArch  = args.getFlag('inherit_arch',  def: true);
+  final strictLoad   = args.getFlag('strict_load',   def: false);
+
   // Optional load (explicit), else default to curriculum snapshot if present
   String? loadPath = args.getStr('load_policy');
-  if ((loadPath == null || loadPath.trim().isEmpty) &&
+  if (!forceScratch &&
+      (loadPath == null || loadPath.trim().isEmpty) &&
       File('policy_curriculum.json').existsSync()) {
     loadPath = 'policy_curriculum.json';
-    print('No --load_policy provided; found and will load "$loadPath".');
+    print('No --load_policy provided; found and will try to load "$loadPath".');
   }
-
-  // Consolidation (anti-forgetting)
-  final anchorOnLoad = args.getFlag('anchor_on_load', def: false);
-  final anchorAfterCurr = args.getFlag('anchor_after_curriculum', def: true);
-  final lambdaTrunk = args.getDouble('consolidate_trunk', def: 1e-3);
-  final lambdaHeads = args.getDouble('consolidate_heads', def: 5e-4);
 
   // Curricula selection
   String curriculaSpec = args.getStr('curricula', def: '') ?? '';
@@ -196,8 +197,11 @@ Future<void> main(List<String> argv) async {
   // Global default iterations
   int curIters = args.getInt('curriculum_iters', def: 0);
 
-  // Only warm if we did NOT restore a norm
-  bool warmAfterCurr = args.getFlag('warm_norm_after_curriculum', def: true);
+  // Curriculum-chunked eval cadence (0 = disabled, run once per curriculum)
+  final curEvalEvery = _iclamp(args.getInt('cur_eval_every', def: 0), 0, 1 << 30);
+  final curEvalEpisodes = _iclamp(args.getInt('cur_eval_episodes', def: 120), 1, 1000000);
+  final curEvalParallel = args.getFlag('cur_eval_parallel', def: false);
+  final curEvalWorkers = _iclamp(args.getInt('cur_eval_workers', def: math.max(1, Platform.numberOfProcessors ~/ 2)), 1, 512);
 
   // Stage 2 (PF)
   final iters = args.getInt('train_iters', def: args.getInt('iters', def: 200));
@@ -215,13 +219,13 @@ Future<void> main(List<String> argv) async {
   final intentPgWeight = args.getDouble('intent_pg', def: 0.6);
   final actionAlignWeight = args.getDouble('action_align', def: 0.0);
 
+  // Environment flags
   final lockTerrain = args.getFlag('lock_terrain', def: false);
   final lockSpawn = args.getFlag('lock_spawn', def: false);
   final randomSpawnX = !args.getFlag('fixed_spawn_x', def: false);
   final maxFuel = args.getDouble('max_fuel', def: 1000.0);
   final crashOnTilt = args.getFlag('crash_on_tilt', def: false);
 
-  // physics flags for CLI
   final gravity = args.getDouble('gravity', def: 0.18);
   final thrustAccel = args.getDouble('thrust_accel', def: 0.42);
   final rotSpeed = args.getDouble('rot_speed', def: 1.6);
@@ -247,11 +251,11 @@ Future<void> main(List<String> argv) async {
   final pfAccEma   = args.getDouble('pf_acc_ema',   def: 0.2);
   final pfDebug    = args.getFlag('pf_debug',       def: false);
 
-  // extra shaping CLI
+  // extra shaping
   final pfVyCapW = args.getDouble('pf_vy_cap_w', def: 0.02);
   final pfPadTowW = args.getDouble('pf_pad_tow_w', def: 0.12);
 
-  // attempts per terrain + eval cadence/size + parallel + debug
+  // attempts per terrain + eval cadence
   final attemptsPerTerrain = _iclamp(args.getInt('attempts_per_terrain', def: 1), 1, 1000000);
   final evalEvery = _iclamp(args.getInt('eval_every', def: 10), 1, 1000000);
   final evalEpisodes = _iclamp(args.getInt('eval_episodes', def: 80), 1, 1000000);
@@ -261,44 +265,11 @@ Future<void> main(List<String> argv) async {
   final evalDebugFailN = _iclamp(args.getInt('eval_debug_fail', def: 3), 0, 1000);
 
   final determinism = args.getFlag('determinism_probe', def: true);
-  final hidden = _parseHiddenList(args.getStr('hidden'), fallback: const [64, 64]);
 
-  // Trainer-internal gating (PF mean reward gating)
-  final gateScoreMin = args.getDouble('gate_min', def: -1e9);
-  final gateOnlyLanded = args.getFlag('gate_landed', def: false);
-  final gateVerbose = args.getFlag('gate_verbose', def: true);
-
-  // Probabilistic gating
-  final gateProbEnabled      = args.getFlag('gate_prob', def: true);
-  final gateProbK            = args.getDouble('gate_prob_k', def: 8.0);
-  final gateProbMin          = args.getDouble('gate_prob_min', def: 0.05);
-  final gateProbMax          = args.getDouble('gate_prob_max', def: 0.95);
-  final gateProbLandedBoost  = args.getDouble('gate_prob_landed_boost', def: 0.15);
-  final gateProbNearPadBoost = args.getDouble('gate_prob_nearpad_boost', def: 0.10);
-  final gateProbDeadzoneZ    = args.getDouble('gate_prob_deadzone_z', def: -1e9);
-  final gateProbFloor        = args.getDouble('gate_prob_floor', def: 0.02);
-
-  // Hebbian CLI knobs
-  final hebbOn       = args.getFlag('hebbian', def: false);
-  final hebbEta      = args.getDouble('hebb_eta', def: 3e-4);
-  final hebbClip     = args.getDouble('hebb_clip', def: 0.02);
-  final hebbRowCap   = args.getDouble('hebb_row_cap', def: 2.5);
-  final hebbOja      = args.getFlag('hebb_oja', def: true);
-  final hebbTrunk    = args.getFlag('hebb_trunk', def: true);
-  final hebbHeadInt  = args.getFlag('hebb_head_intent', def: false);
-  final hebbHeadTurn = args.getFlag('hebb_head_turn', def: true);
-  final hebbHeadThr  = args.getFlag('hebb_head_thr', def: true);
-  final hebbHeadVal  = args.getFlag('hebb_head_val', def: false);
-
-  final hebbModGain   = args.getDouble('hebb_mod_gain', def: 0.6);
-  final hebbModClip   = args.getDouble('hebb_mod_clip', def: 1.5);
-  final minIntentEntropy = args.getDouble('min_intent_entropy', def: 0.5);
-  final maxSameIntentRun = args.getInt('max_same_intent_run', def: 48);
-
-  // ----- DAgger controls (teacher-assisted pre-PF stage) -----
-  final daggerOn      = args.getFlag('dagger_on', def: false);
-  final daggerIters   = args.getInt('dagger_iters', def: 0); // if >0 & dagger_on → run FinalDagger before PF
-  // You can pass additional flags to FinalDagger via CLI; it reads args.kv/flags in its configure()
+  // Hidden sizes: CLI > bundle (if inherit_arch) > default
+  final cliHiddenRaw = args.getStr('hidden');
+  final cliProvidedHidden = (cliHiddenRaw != null && cliHiddenRaw.trim().isNotEmpty);
+  final hiddenDefault = _parseHiddenList(cliHiddenRaw, fallback: const [64, 64]);
 
   // ----- Build env -----
   final cfg = makeConfig(
@@ -339,8 +310,37 @@ Future<void> main(List<String> argv) async {
   ).length;
   final kindsOneHot = (inDim == 5 + env.rayCfg.rayCount * 4);
 
+  // ===== Try to parse bundle early (for arch adoption) =====
+  PolicyBundle? loadedBundle;
+  if (!forceScratch &&
+      loadPath != null &&
+      loadPath.trim().isNotEmpty &&
+      File(loadPath).existsSync()) {
+    try {
+      loadedBundle = PolicyBundle.loadFromPath(loadPath);
+    } catch (e) {
+      final msg = 'WARN: Failed to parse "$loadPath": $e';
+      if (strictLoad) {
+        print('$msg\n(strict_load=true → exiting)');
+        rethrow;
+      } else {
+        print('$msg\nProceeding from scratch.');
+        loadedBundle = null;
+      }
+    }
+  } else if (loadPath != null && loadPath.trim().isNotEmpty) {
+    print('WARNING: --load_policy="$loadPath" not found on disk. Proceeding from scratch.');
+  }
+
+  // Decide hidden sizes now
+  List<int> chosenHidden = List<int>.from(hiddenDefault);
+  if (!cliProvidedHidden && inheritArch && loadedBundle != null && loadedBundle.hidden.isNotEmpty) {
+    chosenHidden = List<int>.from(loadedBundle.hidden);
+    print('Adopting hidden sizes from bundle: $chosenHidden (override with --hidden=...).');
+  }
+
   // ----- Policy -----
-  final policy = ai.PolicyNetwork(inputSize: inDim, hidden: hidden, seed: seed);
+  final policy = ai.PolicyNetwork(inputSize: inDim, hidden: chosenHidden, seed: seed);
   print('Init policy. hidden=${policy.hidden} | FE(kind=rays, in=$inDim, rays=${env.rayCfg.rayCount}, oneHot=$kindsOneHot)');
 
   // Enable training for curricula stage (typical: trunk+intent+action)
@@ -348,29 +348,30 @@ Future<void> main(List<String> argv) async {
   policy.setHeadsTrainable(intent: true, action: true, value: false);
   print('[STAGE] Curricula: trainable { trunk=ON, intent=ON, action=ON, value=OFF }');
 
-  // ===== Optional: LOAD existing policy bundle =====
-  PolicyBundle? loadedBundle;
-  if (loadPath != null && loadPath.trim().isNotEmpty && File(loadPath).existsSync()) {
-    loadedBundle = PolicyBundle.loadFromPath(loadPath);
+  // ===== If bundle parsed, try to copy weights with shape checks =====
+  if (loadedBundle != null) {
+    try {
+      if (loadedBundle.inputDim != inDim) {
+        throw StateError('Input dim mismatch: loaded=${loadedBundle.inputDim} runtime=$inDim '
+            '(check rayCount/kindsOneHot/world size).');
+      }
+      if (loadedBundle.hidden.length != policy.hidden.length ||
+          !List.generate(loadedBundle.hidden.length, (i) => loadedBundle?.hidden[i] == policy.hidden[i])
+              .every((x) => x)) {
+        throw StateError('Hidden sizes mismatch. Loaded=${loadedBundle.hidden} Runtime=${policy.hidden}');
+      }
 
-    // Strict FE / arch / head shape checks + copy into network
-    loadBundleIntoNetwork(
-      bundle: loadedBundle,
-      target: policy,
-      env: env,
-    );
-
-    // Consolidation anchor (optional)
-    if (anchorOnLoad) {
-      policy.captureConsolidationAnchor();
-      policy.consolidateEnabled = true;
-      policy.consolidateTrunk = lambdaTrunk;
-      policy.consolidateHeads = lambdaHeads;
-      print('Consolidation anchor captured from loaded policy. '
-          'λ_trunk=${policy.consolidateTrunk} λ_heads=${policy.consolidateHeads}');
+      loadBundleIntoNetwork(bundle: loadedBundle, target: policy, env: env);
+      print('Loaded weights from "$loadPath".');
+    } catch (e) {
+      final msg = 'WARN: Failed to load weights from "$loadPath": $e';
+      if (strictLoad) {
+        print('$msg\n(strict_load=true → exiting)');
+        rethrow;
+      } else {
+        print('$msg\nContinuing from randomly initialized weights.');
+      }
     }
-  } else if (loadPath != null && loadPath.trim().isNotEmpty) {
-    print('WARNING: --load_policy="$loadPath" not found on disk. Proceeding from scratch.');
   }
 
   // ===== Trainer (norm will be restored from bundle if present) =====
@@ -393,52 +394,25 @@ Future<void> main(List<String> argv) async {
     actionAlignWeight: actionAlignWeight,
     normalizeFeatures: true,
 
-    // Gate core
-    gateScoreMin: gateScoreMin,
-    gateOnlyLanded: gateOnlyLanded,
-    gateVerbose: gateVerbose,
-
-    // Probabilistic gating
-    gateProbEnabled: gateProbEnabled,
-    gateProbK: gateProbK,
-    gateProbMin: gateProbMin,
-    gateProbMax: gateProbMax,
-    gateProbLandedBoost: gateProbLandedBoost,
-    gateProbNearPadBoost: gateProbNearPadBoost,
-    gateProbDeadzoneZ: gateProbDeadzoneZ,
-    gateProbFloor: gateProbFloor,
+    // simple gating flags available in current Trainer
+    gateScoreMin: -double.infinity,
+    gateOnlyLanded: false,
+    gateVerbose: true,
 
     // external dense reward hook (PF)
     externalRewardHook: (({required eng.GameEngine env, required double dt, required int tStep}) {
       return pfHook != null ? pfHook!(env: env, dt: dt, tStep: tStep) : 0.0;
     }),
-
-    // Hebbian + guards
-    hebbian: HebbianConfig(
-      enabled: hebbOn,
-      useOja: hebbOja,
-      eta: hebbEta,
-      clip: hebbClip,
-      rowL2Cap: hebbRowCap,
-      trunk: hebbTrunk,
-      headIntent: hebbHeadInt,
-      headTurn: hebbHeadTurn,
-      headThr: hebbHeadThr,
-      headVal: hebbHeadVal,
-    ),
-    hebbModGain: hebbModGain,
-    hebbModAbsClip: hebbModClip,
-    minIntentEntropy: minIntentEntropy,
-    maxSameIntentRun: maxSameIntentRun,
   );
 
-  // Norm policy: restore from bundle if available; otherwise optionally warm later
+  // Try to restore feature norm from bundle if available
   bool normReady = false;
   if (loadedBundle != null && trainer.norm != null) {
-    normReady = restoreNormFromBundle(bundle: loadedBundle, runtimeNorm: trainer.norm!);
-    if (normReady) {
-      // If we restored a norm from JSON, don't warm over it.
-      warmAfterCurr = false;
+    try {
+      normReady = restoreNormFromBundle(bundle: loadedBundle, runtimeNorm: trainer.norm!);
+    } catch (e) {
+      print('WARN: failed to restore feature norm from bundle: $e (continuing).');
+      normReady = false;
     }
   }
 
@@ -452,11 +426,12 @@ Future<void> main(List<String> argv) async {
     print('Determinism probe: steps ${a.steps} vs ${b.steps} | cost ${a.cost.toStringAsFixed(6)} vs ${b.cost.toStringAsFixed(6)} => ${ok ? "OK" : "MISMATCH"}');
   }
 
-  // ===== MODULAR CURRICULA =====
+  // ===== MODULAR CURRICULA (with optional chunked eval) =====
+  int globalCurrSteps = 0;
   if (curricula.isNotEmpty && (curIters > 0 || lowaltIters > 0 || hardappIters > 0)) {
     print('=== Curricula: ${curricula.map((c) => c.key).join(", ")} ===');
     for (final cur in curricula) {
-      final itersThis =
+      final totalForCur =
       cur.key == 'hardapp' && hardappIters > 0 ? hardappIters :
       cur.key == 'speedmin' && lowaltIters  > 0 ? lowaltIters  :
       cur.key == 'padalign' && lowaltIters  > 0 ? lowaltIters  :
@@ -464,30 +439,134 @@ Future<void> main(List<String> argv) async {
       cur.key == 'final' && lowaltIters > 0 ? lowaltIters :
       cur.key == 'final_simple' && lowaltIters > 0 ? lowaltIters :
       cur.key == 'final_dagger' && lowaltIters > 0 ? lowaltIters :
+      cur.key == 'planner_bc' && lowaltIters > 0 ? lowaltIters :
       curIters;
 
-      if (itersThis <= 0) continue;
+      if (totalForCur <= 0) continue;
 
       cur.configure(args.kv, args.flags);
-      await cur.run(
-        iters: itersThis,
-        env: env,
-        fe: fe,
-        policy: policy,
-        norm: trainer.norm,
-        planHold: planHold,
-        tempIntent: tempIntent,
-        gamma: 0.99,
-        lr: lr,
-        intentAlignWeight: intentAlignWeight,
-        intentPgWeight: intentPgWeight,
-        actionAlignWeight: actionAlignWeight,
-        gateVerbose: gateVerbose,
-        seed: seed,
-      );
+
+      if (curEvalEvery > 0 && curEvalEvery < totalForCur) {
+        int done = 0;
+        int chunkIdx = 0;
+        while (done < totalForCur) {
+          final itThis = math.min(curEvalEvery, totalForCur - done);
+          chunkIdx++;
+          print('[CUR] ${cur.key} • chunk=$chunkIdx iters=$itThis (accum ${done + itThis}/$totalForCur)');
+
+          await cur.run(
+            iters: itThis,
+            env: env,
+            fe: fe,
+            policy: policy,
+            norm: trainer.norm,
+            planHold: planHold,
+            tempIntent: tempIntent,
+            gamma: 0.99,
+            lr: lr,
+            intentAlignWeight: intentAlignWeight,
+            intentPgWeight: intentPgWeight,
+            actionAlignWeight: actionAlignWeight,
+            gateVerbose: true,
+            seed: seed ^ (0xC11C + chunkIdx),
+          );
+
+          done += itThis;
+          globalCurrSteps += itThis;
+
+          // Save a curriculum step snapshot
+          final snapPath = 'policy_curriculum_step_$globalCurrSteps.json';
+          savePolicyBundle(
+            path: snapPath,
+            p: policy,
+            env: env,
+            norm: trainer.norm,
+          );
+
+          // Eval pulse after each chunk
+          if (curEvalParallel) {
+            await eval.evaluateParallel(
+              cfg: cfg,
+              policy: policy,
+              hidden: policy.hidden,
+              episodes: curEvalEpisodes,
+              attemptsPerTerrain: attemptsPerTerrain,
+              seed: seed ^ (0xE001 ^ globalCurrSteps),
+              workers: curEvalWorkers,
+              planHold: planHold,
+              blendPolicy: blendPolicy,
+              tempIntent: tempIntent,
+              intentEntropy: 0.0,
+              evalDebug: false,
+              evalDebugFailN: 3,
+            );
+          } else {
+            eval.evaluateSequential(
+              env: env,
+              trainer: trainer..useLearnedController = true,
+              episodes: curEvalEpisodes,
+              seed: seed ^ (0xE001 ^ globalCurrSteps),
+              attemptsPerTerrain: attemptsPerTerrain,
+              evalDebug: false,
+              evalDebugFailN: 3,
+            );
+          }
+        }
+      } else {
+        // Single-shot
+        print('[CUR] ${cur.key} • iters=$totalForCur');
+        await cur.run(
+          iters: totalForCur,
+          env: env,
+          fe: fe,
+          policy: policy,
+          norm: trainer.norm,
+          planHold: planHold,
+          tempIntent: tempIntent,
+          gamma: 0.99,
+          lr: lr,
+          intentAlignWeight: intentAlignWeight,
+          intentPgWeight: intentPgWeight,
+          actionAlignWeight: actionAlignWeight,
+          gateVerbose: true,
+          seed: seed,
+        );
+        globalCurrSteps += totalForCur;
+
+        // Optional eval at the end of this curriculum
+        if (curEvalEvery > 0) {
+          if (curEvalParallel) {
+            await eval.evaluateParallel(
+              cfg: cfg,
+              policy: policy,
+              hidden: policy.hidden,
+              episodes: curEvalEpisodes,
+              attemptsPerTerrain: attemptsPerTerrain,
+              seed: seed ^ (0xE001 ^ globalCurrSteps),
+              workers: curEvalWorkers,
+              planHold: planHold,
+              blendPolicy: blendPolicy,
+              tempIntent: tempIntent,
+              intentEntropy: 0.0,
+              evalDebug: false,
+              evalDebugFailN: 3,
+            );
+          } else {
+            eval.evaluateSequential(
+              env: env,
+              trainer: trainer..useLearnedController = true,
+              episodes: curEvalEpisodes,
+              seed: seed ^ (0xE001 ^ globalCurrSteps),
+              attemptsPerTerrain: attemptsPerTerrain,
+              evalDebug: false,
+              evalDebugFailN: 3,
+            );
+          }
+        }
+      }
     }
 
-    // Save bundle after curricula (contains norm if present)
+    // Save bundle after curricula
     savePolicyBundle(
       path: 'policy_curriculum.json',
       p: policy,
@@ -496,17 +575,8 @@ Future<void> main(List<String> argv) async {
     );
     print('★ Curricula complete → saved policy_curriculum.json');
 
-    if (anchorAfterCurr) {
-      policy.captureConsolidationAnchor();
-      policy.consolidateEnabled = true;
-      policy.consolidateTrunk = lambdaTrunk;
-      policy.consolidateHeads = lambdaHeads;
-      print('Consolidation anchor captured after curricula. '
-          'λ_trunk=${policy.consolidateTrunk} λ_heads=${policy.consolidateHeads}');
-    }
-
-    // Norm warm only if not restored and flag enabled
-    if (!normReady && warmAfterCurr && trainer.norm != null && !trainer.norm!.inited) {
+    // If we did not restore norm and it's still uninitialized, warm it up briefly
+    if (!normReady && trainer.norm != null && !trainer.norm!.inited) {
       final episodes = 8;
       print('Warming feature normalization over $episodes…');
       for (int i = 0; i < episodes; i++) {
@@ -524,57 +594,13 @@ Future<void> main(List<String> argv) async {
       normReady = true;
     }
 
-    // Freeze curriculum features/intent; train action in PF
+    // Freeze features/intent; train action in PF
     policy.setTrunkTrainable(false);
     policy.setHeadsTrainable(intent: false, action: true, value: false);
     print('[STAGE] PF: trainable { trunk=OFF, intent=OFF, action=ON, value=OFF }');
-    if (policy.consolidateEnabled) {
-      print('[STAGE] PF: consolidation L2-SP active (λ_trunk=${policy.consolidateTrunk}, λ_heads=${policy.consolidateHeads})');
-    }
   } else {
-    // Optional DAgger pre-phase even without other curricula
-    if (daggerOn && daggerIters > 0) {
-      print('=== DAgger pre-phase: FinalDagger ($daggerIters iters) ===');
-      final cur = FinalDagger();
-      cur.configure(args.kv, args.flags);
-      await cur.run(
-        iters: daggerIters,
-        env: env,
-        fe: fe,
-        policy: policy,
-        norm: trainer.norm,
-        planHold: planHold,
-        tempIntent: tempIntent,
-        gamma: 0.99,
-        lr: lr,
-        intentAlignWeight: intentAlignWeight,
-        intentPgWeight: intentPgWeight,
-        actionAlignWeight: actionAlignWeight,
-        gateVerbose: gateVerbose,
-        seed: seed,
-      );
-
-      savePolicyBundle(
-        path: 'policy_after_dagger.json',
-        p: policy,
-        env: env,
-        norm: trainer.norm,
-      );
-      print('★ DAgger complete → saved policy_after_dagger.json');
-
-      // Small consolidation after DAgger (optional)
-      if (anchorAfterCurr) {
-        policy.captureConsolidationAnchor();
-        policy.consolidateEnabled = true;
-        policy.consolidateTrunk = lambdaTrunk;
-        policy.consolidateHeads = lambdaHeads;
-        print('Consolidation anchor captured after DAgger. '
-            'λ_trunk=${policy.consolidateTrunk} λ_heads=${policy.consolidateHeads}');
-      }
-    }
-
-    // Free-flight directly: if no norm restoration, optionally warm before PF
-    if (!normReady && warmAfterCurr && trainer.norm != null && !trainer.norm!.inited) {
+    // No curricula → optional quick norm warm
+    if (!normReady && trainer.norm != null && !trainer.norm!.inited) {
       final episodes = 8;
       print('Warming feature normalization over $episodes (free-flight)…');
       for (int i = 0; i < episodes; i++) {
@@ -592,7 +618,7 @@ Future<void> main(List<String> argv) async {
       normReady = true;
     }
 
-    // Freeze curriculum features/intent; train action in PF
+    // Freeze features/intent; train action in PF
     policy.setTrunkTrainable(false);
     policy.setHeadsTrainable(intent: false, action: true, value: false);
     print('[STAGE] PF: trainable { trunk=OFF, intent=OFF, action=ON, value=OFF }');
@@ -604,7 +630,7 @@ Future<void> main(List<String> argv) async {
       await eval.evaluateParallel(
         cfg: cfg,
         policy: policy,
-        hidden: hidden,
+        hidden: policy.hidden,
         episodes: evalEpisodes,
         attemptsPerTerrain: attemptsPerTerrain,
         seed: seed ^ 0x999,
@@ -631,7 +657,6 @@ Future<void> main(List<String> argv) async {
 
   // ===== MAIN TRAIN LOOP (PF) =====
   final rnd = math.Random(seed ^ 0xDEADBEEF);
-  final rayCount = env.rayCfg.rayCount;
 
   int terrAttempts = 0;
   int currentTerrainSeed = rnd.nextInt(1 << 30);
@@ -685,7 +710,7 @@ Future<void> main(List<String> argv) async {
       lastSegMean = res.segMean;
     }
 
-    if (gateVerbose && ((it + 1) % 10 == 0)) {
+    if (((it + 1) % 10) == 0) {
       final tag = lastLanded ? 'L' : 'NL';
       print('[TRAIN] iter=${it + 1} | segMean=${lastSegMean.toStringAsFixed(3)} | steps=$lastSteps | landed=$tag');
     }
@@ -697,7 +722,7 @@ Future<void> main(List<String> argv) async {
         ev = await eval.evaluateParallel(
           cfg: cfg,
           policy: policy,
-          hidden: hidden,
+          hidden: policy.hidden,
           episodes: evalEpisodes,
           attemptsPerTerrain: attemptsPerTerrain,
           seed: seed ^ (0x1111 * (it + 1)),
@@ -750,7 +775,7 @@ Future<void> main(List<String> argv) async {
   if (curricula.isEmpty) {
     print('Tip: you can run modular curricula with --curricula="speedmin,hardapp" '
         'or legacy flags --curriculum --lowalt_iters=... --hardapp_iters=... '
-        '(padalign_progressive and final_dagger are also available).');
+        '(padalign_progressive, planner_bc and final_dagger are also available).');
   } else {
     print('Curricula used: ${curricula.map((c) => c.key).join(", ")}');
   }

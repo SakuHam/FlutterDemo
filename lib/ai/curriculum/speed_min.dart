@@ -5,6 +5,7 @@ import 'dart:math' as math;
 import '../../engine/types.dart' as et;
 import '../../engine/game_engine.dart' as eng;
 import '../agent.dart';
+import '../teacher.dart' hide predictiveIntentLabelAdaptive;
 import 'core.dart';
 
 class SpeedMinCurriculum extends Curriculum {

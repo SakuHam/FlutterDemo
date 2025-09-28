@@ -8,6 +8,7 @@ import '../../engine/types.dart' as et;
 import '../../engine/game_engine.dart' as eng;
 import '../agent.dart';
 import '../nn_helper.dart' as nn;
+import '../teacher.dart' hide predictiveIntentLabelAdaptive;
 import 'core.dart';
 
 /* -------------------------------------------------------------------------- */

@@ -214,15 +214,6 @@ void liveTrainerMain(SendPort hostPort) async {
           gateOnlyLanded: false,
           gateVerbose: false,
 
-          gateProbEnabled: true,
-          gateProbK: 8.0,
-          gateProbMin: 0.05,
-          gateProbMax: 0.95,
-          gateProbLandedBoost: 0.15,
-          gateProbNearPadBoost: 0.10,
-          gateProbDeadzoneZ: -1e9,
-          gateProbFloor: 0.02,
-
           externalRewardHook: null, // curriculum supplies its own reward/targets
         );
 

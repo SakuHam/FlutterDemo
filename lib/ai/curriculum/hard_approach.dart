@@ -17,6 +17,7 @@ import '../../engine/game_engine.dart' as eng;
 import '../../engine/raycast.dart' as rc; // for RayHitKind.pad
 import '../agent.dart';
 import '../nn_helper.dart' as nn;
+import '../teacher.dart' hide predictiveIntentLabelAdaptive;
 import 'core.dart';
 
 /// ===== Utility records (top-level; Dart doesn't support nested classes) =====

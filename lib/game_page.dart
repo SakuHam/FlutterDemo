@@ -182,7 +182,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       p.setIntentTemperature(1.8);
       if (!mounted) return;
 
-      p.usePadAlignPlanner();
+//      p.usePadAlignPlanner();
       _applyPolicyPhysicsToEngine(p);
 
       setState(() => _policy = p);
@@ -730,7 +730,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
       newP.setStochasticPlanner(true);
       newP.setIntentTemperature(1.8);
-      newP.usePadAlignPlanner();
+//      newP.usePadAlignPlanner();
       _applyPolicyPhysicsToEngine(newP);
 
       setState(() {
