@@ -1447,13 +1447,10 @@ class GamePainter extends CustomPainter {
     if (rays.isEmpty) return;
 
     // Draw in ship-local frame: origin at the nose, forward = up (-y in screen).
-    const halfH = 18.0;
-    final pos = Offset(lander.pos.x, lander.pos.y);
-    final nose = pos + _rot(const Offset(0, -halfH), lander.angle);
-
+    final center = Offset(lander.pos.x, lander.pos.y);
     canvas.save();
-    canvas.translate(nose.dx, nose.dy);
-    canvas.rotate(-lander.angle); // stabilize to ship heading
+    canvas.translate(center.dx, center.dy);
+    canvas.rotate(-lander.angle);
 
     // Dark backdrop for readability
     canvas.drawRect(
