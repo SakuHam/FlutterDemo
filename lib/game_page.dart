@@ -37,7 +37,8 @@ class Particle {
   Particle({required this.pos, required this.vel, required this.life});
 }
 
-enum DebugVisMode { rays, potential, velocity, none }
+// Added: aiVision mode
+enum DebugVisMode { rays, potential, velocity, aiVision, none }
 
 /// Progress phases and simple model for the live trainer HUD
 enum ProgressPhase { idle, starting, training, evaluating, stopped }
@@ -155,7 +156,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       final f = File(path);
       if (!await f.exists()) {
         try {
-          // Seed a first file from bundled asset so hot-reload works immediately.
           final txt = await rootBundle.loadString('assets/ai/policy.json');
           await f.writeAsString(txt);
           _liveSeeded = true;
@@ -182,7 +182,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       p.setIntentTemperature(1.8);
       if (!mounted) return;
 
-//      p.usePadAlignPlanner();
+      p.usePadAlignPlanner();
       _applyPolicyPhysicsToEngine(p);
 
       setState(() => _policy = p);
@@ -193,7 +193,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     }
   }
 
-  // Apply the physics bundle from the policy JSON to the engine tunables (if supported).
   void _applyPolicyPhysicsToEngine(RuntimeTwoStagePolicy p) {
     final e = _engine;
     if (e == null) return;
@@ -222,7 +221,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   void dispose() {
     _ticker.dispose();
     _planSub?.cancel();
-    _stopLiveTraining(); // ensure isolate is killed
+    _stopLiveTraining();
     super.dispose();
   }
 
@@ -248,7 +247,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       final p = _policy;
       if (p != null) _applyPolicyPhysicsToEngine(p);
 
-      _rebuildPF(); // build once on init/resize
+      _rebuildPF();
       setState(() {});
     }
   }
@@ -317,6 +316,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       case DebugVisMode.rays: return 'Rays';
       case DebugVisMode.potential: return 'Potential';
       case DebugVisMode.velocity: return 'Velocity';
+      case DebugVisMode.aiVision: return 'AI Vision';
       case DebugVisMode.none: return 'None';
     }
   }
@@ -334,7 +334,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     );
   }
 
-  // --- Compute policy & PF velocity targets (mirrors training reward shaping) ---
   void _computeBestVelVectors(GameEngine e, PotentialField pf) {
     final L = e.lander;
     final x = L.pos.x.toDouble();
@@ -343,7 +342,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final vy = L.vel.y.toDouble();
     final W = e.cfg.worldW.toDouble();
 
-    // PF base suggestion
     final base = pf.suggestVelocity(
       x, y,
       vMinClose: 8.0,
@@ -353,7 +351,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     );
     _vecPF = Offset(base.vx, base.vy);
 
-    // --- Proximity to pad (for flare) ---
     final padCx = e.terrain.padCenter.toDouble();
     final dxAbs = (x - padCx).abs();
     final gy = e.terrain.heightAt(x);
@@ -364,7 +361,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final px = math.exp(- (dxAbs * dxAbs) / (tightX * tightX + 1e-6));
     final prox = (px * ph).clamp(0.0, 1.0);
 
-    // --- Final-approach flare (prefer killing lateral more) ---
     final vMinTouchdown = 2.0;
     final flareLat = (1.0 - 0.90 * prox);
     final flareVer = (1.0 - 0.70 * prox);
@@ -377,7 +373,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final kMag = (magTarget / magNow).clamp(0.0, 1.0);
     svx *= kMag; svy *= kMag;
 
-    // --- Feasibility clamp ---
     final aMax = e.cfg.t.thrustAccel * 0.05 * e.cfg.stepScale;
     final dt = 1 / e.cfg.stepScale;
     final feasiness = 0.75;
@@ -391,7 +386,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       svy = vy + dvyNeed * s;
     }
 
-    // --- Wall avoidance (velocity-only blend inward) ---
     final margin = 0.12 * W;
     final distL = (x).clamp(0.0, margin);
     final distR = (W - x).clamp(0.0, margin);
@@ -425,7 +419,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     if (engine == null) return;
     if (engine.status != et.GameStatus.playing) return;
 
-    // Compute per-frame velocity vectors for debug view
     final pf = _pf;
     if (pf != null && _visMode == DebugVisMode.velocity) {
       _computeBestVelVectors(engine, pf);
@@ -433,10 +426,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _vecPF = _vecPolicy = null;
     }
 
-    // If AI is on, compute controls (override manual)
     if (_aiPlay && _aiReady) {
-      final lander = engine.lander;     // et.LanderState
-      final terr = engine.terrain;      // et.Terrain
+      final lander = engine.lander;
+      final terr = engine.terrain;
 
       final (th, lf, rt, sL, sR, dT, idx, probs) = _policy!.actWithIntentExt(
         lander: lander,
@@ -471,9 +463,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       ),
     );
 
-    // Exhaust particles
     final lander = engine.lander;
-
     _maybeEmitMainFlame(lander);
     _maybeEmitSideRCS(lander);
     _maybeEmitDownwardFlame(lander);
@@ -520,8 +510,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     const halfH = 12.0;
     const halfW = 14.0;
 
-    final upBody = Offset(s, -c);     // ship “up”
-    final rightBody = Offset(c, s);   // ship “right”
+    final upBody = Offset(s, -c);
+    final rightBody = Offset(c, s);
     final leftPort = Offset(lander.pos.x, lander.pos.y) + upBody * 0 + rightBody * (-halfW) + upBody * halfH;
     final rightPort = Offset(lander.pos.x, lander.pos.y) + rightBody * (halfW) + upBody * halfH;
 
@@ -551,7 +541,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final rnd = math.Random();
     for (int i = 0; i < 3; i++) {
       final spread = (rnd.nextDouble() - 0.5) * 0.4;
-      final dir = Offset(spread, 1.0); // straight down in screen space
+      final dir = Offset(spread, 1.0);
       final speed = 60 + rnd.nextDouble() * 50;
       _particles.add(Particle(pos: port, vel: dir * speed, life: 0.9));
     }
@@ -569,7 +559,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       r: _brushRadius,
     );
     e.terrain = carved;
-    _terrainDirty = true;    // mark dirty
+    _terrainDirty = true;
     setState(() {});
   }
 
@@ -630,8 +620,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         _trainerSend!.send({
           'cmd': 'start',
           'outPath': _livePath,
-          'warmStart': null,            // or a real file path if you copy assets
-          'iters': _liveIters,          // configurable
+          'warmStart': null,
+          'iters': _liveIters,
           'seed': 7,
         });
         return;
@@ -666,8 +656,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
               _progress.meanCost  = ((msg['meanCost']  ?? 0.0) as num).toDouble();
               _progress.meanSteps = ((msg['meanSteps'] ?? 0.0) as num).toDouble();
             } else if (isCurric) {
-              final acc = ((msg['accWindow'] ?? 0.0) as num).toDouble(); // 0..1
-              final dx  = ((msg['dxPerSec']  ?? 0.0) as num).toDouble(); // + is good
+              final acc = ((msg['accWindow'] ?? 0.0) as num).toDouble();
+              final dx  = ((msg['dxPerSec']  ?? 0.0) as num).toDouble();
               _progress.landPct = (acc * 100.0).clamp(0.0, 100.0);
               _progress.meanCost = -dx;
               _progress.meanSteps = dx.abs();
@@ -719,23 +709,22 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   void _requestTrainerSave() {
     final sp = _trainerSend;
     if (sp == null) return;
-    sp.send({'cmd': 'save'}); // trainer should write to outPath and post {'type':'saved', 'path': outPath}
+    sp.send({'cmd': 'save'});
   }
 
   Future<void> _hotReloadPolicy(String path) async {
     try {
       final txt = await File(path).readAsString();
-      // You need a factory like this in your runtime class.
       final newP = RuntimeTwoStagePolicy.fromJson(txt, planHold: 2);
 
       newP.setStochasticPlanner(true);
       newP.setIntentTemperature(1.8);
-//      newP.usePadAlignPlanner();
+      newP.usePadAlignPlanner();
       _applyPolicyPhysicsToEngine(newP);
 
       setState(() {
         _policy = newP;
-        _policy!.resetPlanner(); // instant behavior switch
+        _policy!.resetPlanner();
       });
       _toast('Live policy reloaded');
     } catch (e) {
@@ -757,7 +746,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
           return Stack(
             children: [
-              // Game canvas + tap/drag carving
               Positioned.fill(
                 child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
@@ -780,17 +768,14 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       thrusting: _thrust && engine.lander.fuel > 0 && status == et.GameStatus.playing,
                       status: status,
                       particles: _particles,
-                      // Only feed rays to painter when mode == rays
-                      rays: _visMode == DebugVisMode.rays ? engine.rays : const [],
-                      // Potential field & vis mode
+                      rays: (_visMode == DebugVisMode.rays || _visMode == DebugVisMode.aiVision)
+                          ? engine.rays
+                          : const [],
                       pf: _pf,
                       visMode: _visMode,
-                      // NEW: pass vectors to draw
                       vecPF: _vecPF,
                       vecPolicy: _vecPolicy,
-                      // NEW: pass a hint for painter (to draw forward axis only when useful)
-                      showForwardAxis: _visMode == DebugVisMode.rays,
-                      // Plan overlay
+                      showForwardAxis: _visMode == DebugVisMode.rays || _visMode == DebugVisMode.aiVision,
                       planPts: _planPts,
                       planWidths: _planWidths,
                     ),
@@ -823,6 +808,24 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                           const SizedBox(width: 8),
                           _aiToggleIcon(),
                           const SizedBox(width: 8),
+
+                          /*
+                          // NEW: FWD/WORLD alignment chip
+                          Tooltip(
+                            message: 'Ray alignment (ship-forward vs world)',
+                            child: FilterChip(
+                              label: Text(_forwardAligned ? 'FWD' : 'WORLD'),
+                              selected: _forwardAligned,
+                              onSelected: (_) {
+                                setState(() => _forwardAligned = !_forwardAligned);
+                                _syncRayAlignmentToEngine();
+                              },
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+
+                           */
+
                           Tooltip(
                             message: 'Tap to cycle view • Long-press to rebuild field',
                             child: FilterChip(
@@ -874,7 +877,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             ),
                           const Spacer(),
 
-                          // Iterations quick knob (optional)
                           Tooltip(
                             message: 'Live training iterations',
                             child: SizedBox(
@@ -913,7 +915,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
                       const SizedBox(height: 8),
 
-                      // NEW: Trainer buttons row (below the training data)
+                      // Trainer buttons
                       Row(
                         children: [
                           ElevatedButton(
@@ -921,7 +923,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                             child: Text(_trainerIso == null ? 'Train Live' : 'Stop Train'),
                           ),
                           const SizedBox(width: 8),
-                          // Save + Reload on SAME ROW
                           ElevatedButton(
                             onPressed: (_trainerIso != null) ? _requestTrainerSave : null,
                             child: const Text('Save'),
@@ -1087,7 +1088,6 @@ class _ProgressPanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Title row
           Row(
             children: [
               const Icon(Icons.school, size: 16, color: Colors.white70),
@@ -1100,14 +1100,11 @@ class _ProgressPanel extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 8),
-          // Iter progress bar
           _bar(context, pct, labelLeft: 'Iter', labelRight: '${(pct * 100).toStringAsFixed(0)}%'),
           const SizedBox(height: 8),
-          // Land% bar (eval or pulse)
           _bar(context, (model.landPct / 100).clamp(0.0, 1.0),
               labelLeft: 'Land%', labelRight: '${model.landPct.toStringAsFixed(1)}%'),
           const SizedBox(height: 8),
-          // Stats
           Row(
             children: [
               _stat('Mean Cost', model.meanCost.toStringAsFixed(2)),
@@ -1179,7 +1176,7 @@ class GamePainter extends CustomPainter {
   final Offset? vecPF;
   final Offset? vecPolicy;
 
-  // NEW: painter hint to draw forward axis when looking at rays
+  // NEW: painter hint to draw forward axis when looking at rays/vision
   final bool showForwardAxis;
 
   // Plan overlay (centerline + band)
@@ -1204,20 +1201,28 @@ class GamePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    _paintStars(canvas, size);
-    _paintTerrainPoly(canvas, size);
-    _paintEdgesOverlay(canvas);
+    if (visMode != DebugVisMode.aiVision) {
+      _paintStars(canvas, size);
+    }
 
-    // Potential/Velocity overlays
+    // Hide ground polygon in AI Vision mode
+    if (visMode != DebugVisMode.aiVision) {
+      _paintTerrainPoly(canvas, size);
+      _paintEdgesOverlay(canvas);
+    }
+
+    // Overlays
     if (visMode == DebugVisMode.potential && pf != null) {
       _paintPotentialHeat(canvas, pf!, heatDownsample: 3, alpha: 130);
     } else if (visMode == DebugVisMode.velocity && pf != null) {
       _paintPotentialVectors(canvas, pf!, stride: 8);
     } else if (visMode == DebugVisMode.rays) {
       _paintRays(canvas);
+    } else if (visMode == DebugVisMode.aiVision) {
+      _paintAIVision(canvas, size);
     }
 
-    // Plan band + centerline (drawn above overlays, below particles/ship)
+    // Plan band + centerline
     _paintPlan(canvas);
 
     _paintParticles(canvas);
@@ -1262,7 +1267,7 @@ class GamePainter extends CustomPainter {
       path.close();
     }
 
-    final ground = Paint()..color = const Color(0xFFD8D8D8); // light gray
+    final ground = Paint()..color = const Color(0xFFD8D8D8);
     canvas.drawPath(path, ground);
   }
 
@@ -1330,6 +1335,104 @@ class GamePainter extends CustomPainter {
     }
   }
 
+  // ---------- AI Vision (forward-aligned point cloud) ----------
+  void _paintAIVision(Canvas canvas, Size size) {
+    if (rays.isEmpty) return;
+
+    // Draw in ship-local frame: origin at the nose, forward = up (-y in screen).
+    const halfH = 18.0;
+    final pos = Offset(lander.pos.x, lander.pos.y);
+    final nose = pos + _rot(const Offset(0, -halfH), lander.angle);
+
+    canvas.save();
+    canvas.translate(nose.dx, nose.dy);
+    canvas.rotate(-lander.angle); // stabilize to ship heading
+
+    // Subtle local grid (helps scale perception)
+    _drawLocalGrid(canvas);
+
+    // FOV wedge (just a hint)
+    final fov = _estimateFovRadians();
+    final wedge = Path()
+      ..moveTo(0, 0)
+      ..lineTo(500 * math.sin(-fov / 2), -500 * math.cos(-fov / 2))
+      ..lineTo(500 * math.sin(fov / 2), -500 * math.cos(fov / 2))
+      ..close();
+    canvas.drawPath(
+      wedge,
+      Paint()
+        ..style = PaintingStyle.fill
+        ..color = const Color(0x2239C5FF),
+    );
+
+    // Point cloud at ray hit positions relative to origin (lander.pos)
+    final terrPaint = Paint()..color = Colors.redAccent..strokeWidth = 2.0;
+    final padPaint  = Paint()..color = Colors.greenAccent..strokeWidth = 2.0;
+    final wallPaint = Paint()..color = Colors.blueAccent..strokeWidth = 2.0;
+
+    // In _paintAIVision(...)
+    for (final h in rays) {
+      final dx = h.p.x - lander.pos.x;
+      final dy = h.p.y - lander.pos.y;
+
+      final r2 = dx*dx + dy*dy;
+      final r = math.sqrt(r2);
+      final radius = 5.0; //(3.0 + 8.0 * (1.0 - (r / 800).clamp(0.0, 1.0)));
+
+      final paint = switch (h.kind) {
+        RayHitKind.pad     => padPaint,
+        RayHitKind.wall    => wallPaint,     // ceiling/walls will now show
+        RayHitKind.terrain => terrPaint,
+      };
+
+      canvas.drawCircle(Offset(dx, dy), radius, paint);
+    }
+
+    // Draw a short forward axis line
+    final axis = Paint()..color = Colors.amberAccent..strokeWidth = 2;
+    canvas.drawLine(const Offset(0, 0), const Offset(0, -36), axis);
+
+    canvas.restore();
+  }
+
+  double _estimateFovRadians() {
+    // Match your ray fan: if RayConfig.rayCount covers ~180° in forward frame, use PI.
+    // You can refine this if your raycaster exposes FOV.
+    return math.pi; // 180°
+  }
+
+  void _drawLocalGrid(Canvas canvas) {
+    final grid = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = const Color(0x33FFFFFF);
+    const step = 50.0;
+    const maxR = 600.0;
+
+    // Vertical lines
+    for (double x = -maxR; x <= maxR; x += step) {
+      canvas.drawLine(Offset(x, -maxR), Offset(x, 0), grid);
+    }
+    // Horizontal lines (forward only)
+    for (double y = -maxR; y <= 0; y += step) {
+      canvas.drawLine(Offset(-maxR, y), Offset(maxR, y), grid);
+    }
+
+    // Range rings
+    final ringPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = const Color(0x22FFFFFF);
+    for (double r = 100; r <= maxR; r += 100) {
+      canvas.drawCircle(const Offset(0, 0), r, ringPaint);
+    }
+  }
+
+  Offset _rot(Offset v, double a) {
+    final c = math.cos(a), s = math.sin(a);
+    return Offset(c * v.dx - s * v.dy, s * v.dx + c * v.dy);
+  }
+
   void _paintPotentialHeat(Canvas canvas, PotentialField pf, {int heatDownsample = 3, int alpha = 160}) {
     final paint = Paint()..style = PaintingStyle.fill;
     final nx = pf.gridNx, ny = pf.gridNy;
@@ -1381,7 +1484,7 @@ class GamePainter extends CustomPainter {
     double maxMag = 1e-9;
     for (int j = 1; j < ny - 1; j += stride) {
       for (int i = 1; i < nx - 1; i += stride) {
-        if (pf.maskAtIndex(i, j) == 2) continue; // obstacle
+        if (pf.maskAtIndex(i, j) == 2) continue;
         final flow = pf.sampleFlow(i * dx, j * dy);
         if (flow.mag > maxMag) maxMag = flow.mag;
       }
@@ -1423,14 +1526,10 @@ class GamePainter extends CustomPainter {
     }
   }
 
-  // === NEW: draw actual v, PF suggestion, and policy target at the ship ===
   void _paintBestVelTriplet(Canvas canvas) {
     final pos = Offset(lander.pos.x, lander.pos.y);
-
-    // Arrow scale just for on-screen visibility (px/s → px of arrow)
     const double k = 3.0;
 
-    // Actual velocity (white)
     final vNow = Offset(lander.vel.x, lander.vel.y);
     if (vNow.distance > 1e-3) {
       _drawArrow(canvas, pos, pos + vNow * k * 10.0,
@@ -1438,21 +1537,18 @@ class GamePainter extends CustomPainter {
           head: Paint()..color = Colors.white);
     }
 
-    // PF suggestion (cyan)
     if (vecPF != null && vecPF!.distance > 1e-3) {
       _drawArrow(canvas, pos, pos + vecPF! * k,
           line: Paint()..color = Colors.cyanAccent..strokeWidth = 2.0,
           head: Paint()..color = Colors.cyanAccent);
     }
 
-    // Policy-preferred (magenta)
     if (vecPolicy != null && vecPolicy!.distance > 1e-3) {
       _drawArrow(canvas, pos, pos + vecPolicy! * k * 10.0,
           line: Paint()..color = Colors.pinkAccent..strokeWidth = 2.4,
           head: Paint()..color = Colors.pinkAccent);
     }
 
-    // Tiny legend
     final tp = TextPainter(
       text: const TextSpan(
         text: 'v (white), PF (cyan), policy (magenta)',
@@ -1519,7 +1615,6 @@ class GamePainter extends CustomPainter {
         final tvec = next - prev;
         final len = tvec.distance;
 
-        // safe normal
         final nx = (len > 1e-6) ? (-tvec.dy / len) : 0.0;
         final ny = (len > 1e-6) ? ( tvec.dx / len) : 0.0;
 
@@ -1529,7 +1624,6 @@ class GamePainter extends CustomPainter {
         right.add(Offset(p.dx - nx * w, p.dy - ny * w));
       }
 
-      // ONE closed ribbon
       final ribbon = Path()
         ..moveTo(left.first.dx, left.first.dy);
       for (int i = 1; i < left.length; i++) {
@@ -1554,7 +1648,6 @@ class GamePainter extends CustomPainter {
       canvas.drawPath(ribbon, edge);
     }
 
-    // centerline on top
     final p = Path()..moveTo(planPts.first.dx, planPts.first.dy);
     for (int i = 1; i < planPts.length; i++) {
       p.lineTo(planPts[i].dx, planPts[i].dy);
@@ -1631,7 +1724,6 @@ class GamePainter extends CustomPainter {
       legs,
     );
 
-    // NEW: draw a short forward-axis line (from the nose) to visualize ship heading
     if (showForwardAxis) {
       final nose = pos + rot(const Offset(0, -halfH));
       final forward = Offset(-math.sin(lander.angle), math.cos(lander.angle));
