@@ -11,6 +11,7 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 
 // Engine
+import 'ai/cavern_detector.dart';
 import 'engine/types.dart' as et;
 import 'engine/game_engine.dart';
 import 'engine/raycast.dart';
@@ -129,6 +130,18 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
   // Live trainer config (simple knob for iterations)
   int _liveIters = 120000; // adjust as desired
+
+  // ===== Cavern detection (for HUD + painter) =====
+  final CavernDetector _detector = CavernDetector(
+    jumpThresh: 220.0,            // baseline; we adapt from this at runtime
+    voidBoost: 1.20,
+    minVoidSpanRad: math.pi / 48, // ~3.75°
+    minSpanSamples: 3,
+  );
+  int _cavernCount = 0;
+  int _rayCount = 0;       // rays in AI Vision (all directions)
+  double _maxEdgeDrDth = 0.0;
+  List<CavernHypothesis> _caverns = const []; // computed once per frame
 
   @override
   void initState() {
@@ -476,6 +489,88 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       if (p.life <= 0) _particles.removeAt(i);
     }
 
+    // ---- HUD & cavern detection (AI Vision only) ----
+    if (_visMode == DebugVisMode.aiVision) {
+      final rays = engine.rays;
+      final L = engine.lander;
+
+      // Body-frame transform for crude edge metric (use ALL rays; draw both hemispheres)
+      final cs = math.cos(-L.angle), sn = math.sin(-L.angle);
+      final bodyPts = <Offset>[];
+      for (final h in rays) {
+        final dx = h.p.x - L.pos.x, dy = h.p.y - L.pos.y;
+        final lx = cs * dx - sn * dy, ly = sn * dx + cs * dy;
+        bodyPts.add(Offset(lx, ly));
+      }
+      _rayCount = bodyPts.length;
+
+      // crude |dr/dθ| peak over sorted angles (all rays)
+      double maxEdge = 0.0;
+      if (bodyPts.length >= 5) {
+        bodyPts.sort((a, b) =>
+            math.atan2(a.dx, -a.dy).compareTo(math.atan2(b.dx, -b.dy)));
+        for (int i = 1; i < bodyPts.length - 1; i++) {
+          final r0 = bodyPts[i - 1].distance;
+          final r2 = bodyPts[i + 1].distance;
+          final th0 = math.atan2(bodyPts[i - 1].dx, -bodyPts[i - 1].dy);
+          final th2 = math.atan2(bodyPts[i + 1].dx, -bodyPts[i + 1].dy);
+          final dth = (th2 - th0).abs();
+          if (dth < 1e-4) continue;
+          final dr = (r2 - r0).abs() / dth;
+          if (dr > maxEdge) maxEdge = dr;
+        }
+      }
+      _maxEdgeDrDth = maxEdge;
+
+      // --- Build forward/back subsets (for robust detection) ---
+      final fwd = <RayHit>[];
+      final back = <RayHit>[];
+      for (final h in rays) {
+        final dx = h.p.x - L.pos.x, dy = h.p.y - L.pos.y;
+        final lx = cs * dx - sn * dy, ly = sn * dx + cs * dy;
+        if (ly < 0) {
+          fwd.add(h);
+        } else {
+          back.add(h);
+        }
+      }
+
+      // --- Adaptive jump threshold based on observed contrast ---
+      final base = _detector;
+      final effJump = (_maxEdgeDrDth.isFinite && _maxEdgeDrDth > 0)
+          ? math.min(base.jumpThresh, math.max(100.0, 0.35 * _maxEdgeDrDth))
+          : base.jumpThresh;
+
+      // Use a detector instance with the adapted jump (no other changes)
+      final adaptive = CavernDetector(
+        jumpThresh: effJump,
+        voidBoost: base.voidBoost,
+        minVoidSpanRad: base.minVoidSpanRad,
+        minSpanSamples: base.minSpanSamples,
+      );
+
+      // Try forward, then back, then soft fallback
+      List<CavernHypothesis> hyps = adaptive.detect(rays: fwd, lander: L);
+      if (hyps.isEmpty) hyps = adaptive.detect(rays: back, lander: L);
+      if (hyps.isEmpty) {
+        final soft = CavernDetector(
+          jumpThresh: 150.0,
+          voidBoost: 1.05,
+          minVoidSpanRad: math.pi / 64,
+          minSpanSamples: 2,
+        );
+        hyps = soft.detect(rays: rays, lander: L);
+      }
+
+      _caverns = hyps;
+      _cavernCount = hyps.length;
+    } else {
+      _caverns = const [];
+      _cavernCount = 0;
+      _rayCount = 0;
+      _maxEdgeDrDth = 0.0;
+    }
+
     if (info.terminal) {
       // engine already set status
     }
@@ -778,6 +873,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       showForwardAxis: _visMode == DebugVisMode.rays || _visMode == DebugVisMode.aiVision,
                       planPts: _planPts,
                       planWidths: _planWidths,
+                      caverns: _caverns, // NEW: pass computed caverns to painter
                     ),
                   ),
                 ),
@@ -808,24 +904,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                           const SizedBox(width: 8),
                           _aiToggleIcon(),
                           const SizedBox(width: 8),
-
-                          /*
-                          // NEW: FWD/WORLD alignment chip
-                          Tooltip(
-                            message: 'Ray alignment (ship-forward vs world)',
-                            child: FilterChip(
-                              label: Text(_forwardAligned ? 'FWD' : 'WORLD'),
-                              selected: _forwardAligned,
-                              onSelected: (_) {
-                                setState(() => _forwardAligned = !_forwardAligned);
-                                _syncRayAlignmentToEngine();
-                              },
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-
-                           */
-
                           Tooltip(
                             message: 'Tap to cycle view • Long-press to rebuild field',
                             child: FilterChip(
@@ -849,34 +927,48 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       Row(
                         children: [
                           _hudBox(title: 'Fuel', value: engine.lander.fuel.toStringAsFixed(0)),
+                          const SizedBox(width: 8),
+                          if (_visMode == DebugVisMode.aiVision)
+                            _hudBox(title: 'Caverns', value: '$_cavernCount'),
+                          if (_visMode == DebugVisMode.aiVision) ...[
+                            const SizedBox(width: 8),
+                            _hudBox(title: 'Rays', value: '$_rayCount'),
+                            const SizedBox(width: 8),
+                            _hudBox(title: 'Max|dr/dθ|', value: _maxEdgeDrDth.toStringAsFixed(0)),
+                          ],
                           if (_aiReady)
-                            Tooltip(
-                              message: _lastIntentIdx == null
-                                  ? 'AI idle'
-                                  : 'AI intent: ${kIntentNames[_lastIntentIdx!.clamp(0, kIntentNames.length - 1)]}',
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                decoration: BoxDecoration(
-                                  color: Colors.black.withOpacity(0.45),
-                                  borderRadius: BorderRadius.circular(10),
-                                  border: Border.all(color: Colors.white24),
-                                ),
-                                child: Row(
-                                  children: [
-                                    const Icon(Icons.bolt, size: 16, color: Colors.white70),
-                                    const SizedBox(width: 6),
-                                    Text(
-                                      _lastIntentIdx == null
-                                          ? 'AI ready'
-                                          : kIntentNames[_lastIntentIdx!.clamp(0, kIntentNames.length - 1)],
-                                      style: const TextStyle(color: Colors.white),
+                            Expanded(
+                              child: Align(
+                                alignment: Alignment.centerRight,
+                                child: Tooltip(
+                                  message: _lastIntentIdx == null
+                                      ? 'AI idle'
+                                      : 'AI intent: ${kIntentNames[_lastIntentIdx!.clamp(0, kIntentNames.length - 1)]}',
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: Colors.black.withOpacity(0.45),
+                                      borderRadius: BorderRadius.circular(10),
+                                      border: Border.all(color: Colors.white24),
                                     ),
-                                  ],
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const Icon(Icons.bolt, size: 16, color: Colors.white70),
+                                        const SizedBox(width: 6),
+                                        Text(
+                                          _lastIntentIdx == null
+                                              ? 'AI ready'
+                                              : kIntentNames[_lastIntentIdx!.clamp(0, kIntentNames.length - 1)],
+                                          style: const TextStyle(color: Colors.white),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
                                 ),
                               ),
                             ),
-                          const Spacer(),
-
+                          const SizedBox(width: 8),
                           Tooltip(
                             message: 'Live training iterations',
                             child: SizedBox(
@@ -1160,6 +1252,14 @@ class _ProgressPanel extends StatelessWidget {
   }
 }
 
+// Helper for AI Vision drawing (body-frame hit)
+class _BFHit {
+  _BFHit(this.lx, this.ly, this.kind, this.isForward);
+  final double lx, ly;
+  final RayHitKind kind;
+  final bool isForward;
+}
+
 class GamePainter extends CustomPainter {
   final et.LanderState lander;
   final et.Terrain terrain;
@@ -1183,6 +1283,9 @@ class GamePainter extends CustomPainter {
   final List<Offset> planPts;
   final List<double>? planWidths;
 
+  // Caverns to draw (computed in state)
+  final List<CavernHypothesis> caverns;
+
   GamePainter({
     required this.lander,
     required this.terrain,
@@ -1197,6 +1300,7 @@ class GamePainter extends CustomPainter {
     required this.showForwardAxis,
     required this.planPts,
     required this.planWidths,
+    required this.caverns,
   });
 
   @override
@@ -1335,7 +1439,10 @@ class GamePainter extends CustomPainter {
     }
   }
 
-  // ---------- AI Vision (forward-aligned point cloud) ----------
+  List<_BFHit> _subsetHemisphere(List<_BFHit> all, {required bool forward}) =>
+      all.where((h) => h.isForward == forward).toList(growable: false);
+
+  // ---------- AI Vision (body-aligned point cloud + caverns) ----------
   void _paintAIVision(Canvas canvas, Size size) {
     if (rays.isEmpty) return;
 
@@ -1348,10 +1455,16 @@ class GamePainter extends CustomPainter {
     canvas.translate(nose.dx, nose.dy);
     canvas.rotate(-lander.angle); // stabilize to ship heading
 
+    // Dark backdrop for readability
+    canvas.drawRect(
+      const Rect.fromLTWH(-650, -650, 1300, 700),
+      Paint()..color = const Color(0xEE0C0C0C),
+    );
+
     // Subtle local grid (helps scale perception)
     _drawLocalGrid(canvas);
 
-    // FOV wedge (just a hint)
+    // FOV wedge (just a hint; not a mask)
     final fov = _estimateFovRadians();
     final wedge = Path()
       ..moveTo(0, 0)
@@ -1365,27 +1478,68 @@ class GamePainter extends CustomPainter {
         ..color = const Color(0x2239C5FF),
     );
 
-    // Point cloud at ray hit positions relative to origin (lander.pos)
-    final terrPaint = Paint()..color = Colors.redAccent..strokeWidth = 2.0;
-    final padPaint  = Paint()..color = Colors.greenAccent..strokeWidth = 2.0;
-    final wallPaint = Paint()..color = Colors.blueAccent..strokeWidth = 2.0;
-
-    // In _paintAIVision(...)
+    // Build 360° body-frame hits (draw ALL points)
+    final c = math.cos(-lander.angle), s = math.sin(-lander.angle);
+    final hitsBF = <_BFHit>[];
     for (final h in rays) {
       final dx = h.p.x - lander.pos.x;
       final dy = h.p.y - lander.pos.y;
+      final lx = c * dx - s * dy;
+      final ly = s * dx + c * dy;
+      final isFwd = (ly < 0); // forward points have -Y in this rotated canvas
+      hitsBF.add(_BFHit(lx, ly, h.kind, isFwd));
+    }
 
-      final r2 = dx*dx + dy*dy;
-      final r = math.sqrt(r2);
-      final radius = 5.0; //(3.0 + 8.0 * (1.0 - (r / 800).clamp(0.0, 1.0)));
+    // --- Draw cavern hypotheses (computed in state) ---
+    for (final h in caverns) {
+      final r = h.depth.clamp(60.0, 800.0);
+      final rect = Rect.fromCircle(center: const Offset(0, 0), radius: r);
+      final startAng = -h.thetaEnd;   // canvas Y up is negative
+      final sweepAng = (h.thetaEnd - h.thetaStart);
+      final arc = Path()..addArc(rect, startAng, sweepAng);
 
-      final paint = switch (h.kind) {
-        RayHitKind.pad     => padPaint,
-        RayHitKind.wall    => wallPaint,     // ceiling/walls will now show
-        RayHitKind.terrain => terrPaint,
+      final col = Color.lerp(const Color(0xFF00E5FF), const Color(0xFFFF4081), (1.0 - h.score))!;
+      final alpha = (100 + (155 * h.score)).toInt().clamp(80, 255);
+      final edge = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0
+        ..color = col.withAlpha(alpha);
+
+      canvas.drawPath(arc, edge);
+      canvas.drawCircle(Offset(h.centroidLocal.x, h.centroidLocal.y), 3.5, Paint()..color = edge.color);
+
+      final tp = TextPainter(
+        text: TextSpan(
+          text: 'cavern  ${(h.widthAng * 180 / math.pi).toStringAsFixed(1)}°  d=${h.depth.toStringAsFixed(0)}  s=${(100 * h.score).round()}',
+          style: const TextStyle(color: Color(0xFFE0F7FA), fontSize: 11),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout(maxWidth: 240);
+      tp.paint(canvas, Offset(h.centroidLocal.x, h.centroidLocal.y) + const Offset(8, -12));
+    }
+
+    // Draw all points: forward bright, back dim; plus small grey guide dot
+    final guide = Paint()..color = const Color(0x44FFFFFF);
+
+    final terrPtF = Paint()..color = const Color(0xFFFF5050);
+    final terrPtB = Paint()..color = const Color(0x66FF5050);
+    final padPtF  = Paint()..color = const Color(0xFF52E57D);
+    final padPtB  = Paint()..color = const Color(0x6652E57D);
+    final wallPtF = Paint()..color = const Color(0xFF58A8FF);
+    final wallPtB = Paint()..color = const Color(0x6658A8FF);
+
+    for (final p in hitsBF) {
+      final pos = Offset(p.lx, p.ly);
+      canvas.drawCircle(pos, 2.0, guide);
+      final paint = switch ((p.kind, p.isForward)) {
+        (RayHitKind.terrain, true) => terrPtF,
+        (RayHitKind.terrain, false)=> terrPtB,
+        (RayHitKind.pad, true)     => padPtF,
+        (RayHitKind.pad, false)    => padPtB,
+        (RayHitKind.wall, true)    => wallPtF,
+        (RayHitKind.wall, false)   => wallPtB,
       };
-
-      canvas.drawCircle(Offset(dx, dy), radius, paint);
+      canvas.drawCircle(pos, 4.0, paint);
     }
 
     // Draw a short forward axis line
@@ -1397,7 +1551,6 @@ class GamePainter extends CustomPainter {
 
   double _estimateFovRadians() {
     // Match your ray fan: if RayConfig.rayCount covers ~180° in forward frame, use PI.
-    // You can refine this if your raycaster exposes FOV.
     return math.pi; // 180°
   }
 
@@ -1748,7 +1901,8 @@ class GamePainter extends CustomPainter {
         old.vecPolicy != vecPolicy ||
         old.showForwardAxis != showForwardAxis ||
         !listEquals(old.planPts, planPts) ||
-        !_listEqD(old.planWidths, planWidths);
+        !_listEqD(old.planWidths, planWidths) ||
+        !listEquals(old.caverns, caverns);
   }
 
   bool _listEqD(List<double>? a, List<double>? b) {
