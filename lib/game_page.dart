@@ -59,6 +59,14 @@ class _ProgressModel {
   }
 }
 
+/// Snapshot of a raycast frame for fading trails
+class RayFrame {
+  final Offset origin; // lander position at capture time
+  final double angle;  // lander angle at capture time (for AI Vision)
+  final List<RayHit> hits; // absolute world-space hit points
+  RayFrame({required this.origin, required this.angle, required this.hits});
+}
+
 class GamePage extends StatefulWidget {
   const GamePage({super.key});
   @override
@@ -142,6 +150,37 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   int _rayCount = 0;       // rays in AI Vision (all directions)
   double _maxEdgeDrDth = 0.0;
   List<CavernHypothesis> _caverns = const []; // computed once per frame
+
+  // ===== NEW: ray history (fading trail) =====
+  static const int _rayHistLen = 10;
+  final List<RayFrame?> _rayHistory = List<RayFrame?>.filled(_rayHistLen, null, growable: false);
+  int _rayHistHead = 0; // index to overwrite next
+
+  void _pushRayHistorySnapshot(GameEngine e) {
+    // Only snapshot when the ray-based views are active
+    if (!(_visMode == DebugVisMode.rays || _visMode == DebugVisMode.aiVision)) return;
+    final hits = e.rays;
+    if (hits.isEmpty) return;
+    final frame = RayFrame(
+      origin: Offset(e.lander.pos.x, e.lander.pos.y),
+      angle: e.lander.angle,
+      hits: List<RayHit>.from(hits, growable: false),
+    );
+    _rayHistory[_rayHistHead] = frame;
+    _rayHistHead = (_rayHistHead + 1) % _rayHistLen;
+  }
+
+  List<RayFrame> _orderedRayHistoryNewestFirst() {
+    // Return newest->oldest, skipping nulls
+    final out = <RayFrame>[];
+    for (int k = 1; k <= _rayHistLen; k++) {
+      final idx = (_rayHistHead - k) % _rayHistLen;
+      final i = idx < 0 ? idx + _rayHistLen : idx;
+      final f = _rayHistory[i];
+      if (f != null) out.add(f);
+    }
+    return out;
+  }
 
   @override
   void initState() {
@@ -296,6 +335,13 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     _vecPF = _vecPolicy = null;
     _planPts = const [];
     _planWidths = null;
+
+    // Clear ray history too
+    for (var i = 0; i < _rayHistory.length; i++) {
+      _rayHistory[i] = null;
+    }
+    _rayHistHead = 0;
+
     _rebuildPF();
     setState(() {});
   }
@@ -571,6 +617,9 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _maxEdgeDrDth = 0.0;
     }
 
+    // ---- Capture ray history AFTER rays are updated this step ----
+    _pushRayHistorySnapshot(engine);
+
     if (info.terminal) {
       // engine already set status
     }
@@ -839,6 +888,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
           final engine = _engine!;
           final status = engine.status;
 
+          final rayHistory = _orderedRayHistoryNewestFirst();
+
           return Stack(
             children: [
               Positioned.fill(
@@ -874,6 +925,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       planPts: _planPts,
                       planWidths: _planWidths,
                       caverns: _caverns, // NEW: pass computed caverns to painter
+                      rayHistory: rayHistory, // NEW: fading trail data
                     ),
                   ),
                 ),
@@ -1117,7 +1169,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     final size = big ? 96.0 : 72.0;
     return Listener(
       onPointerDown: (_) => onChanged(true),
-      onPointerUp: (_) => onChanged(false),
+      onPointerUp:   (_) => onChanged(false),
       onPointerCancel: (_) => onChanged(false),
       child: Container(
         width: size,
@@ -1286,6 +1338,9 @@ class GamePainter extends CustomPainter {
   // Caverns to draw (computed in state)
   final List<CavernHypothesis> caverns;
 
+  // NEW: ray history (newest->oldest, up to 10)
+  final List<RayFrame> rayHistory;
+
   GamePainter({
     required this.lander,
     required this.terrain,
@@ -1301,6 +1356,7 @@ class GamePainter extends CustomPainter {
     required this.planPts,
     required this.planWidths,
     required this.caverns,
+    required this.rayHistory,
   });
 
   @override
@@ -1321,9 +1377,9 @@ class GamePainter extends CustomPainter {
     } else if (visMode == DebugVisMode.velocity && pf != null) {
       _paintPotentialVectors(canvas, pf!, stride: 8);
     } else if (visMode == DebugVisMode.rays) {
-      _paintRays(canvas);
+      _paintRaysWithHistory(canvas);
     } else if (visMode == DebugVisMode.aiVision) {
-      _paintAIVision(canvas, size);
+      _paintAIVisionWithHistory(canvas, size);
     }
 
     // Plan band + centerline
@@ -1399,26 +1455,67 @@ class GamePainter extends CustomPainter {
     }
   }
 
-  void _paintRays(Canvas canvas) {
-    if (rays.isEmpty) return;
-    final origin = Offset(lander.pos.x, lander.pos.y);
+  // ---------- Rays (world frame) with fading history ----------
+  void _paintRaysWithHistory(Canvas canvas) {
+    // Draw history first (oldest faintest), then current rays on top
+    if (rayHistory.isNotEmpty) {
+      // Iterate from oldest to newest so later ones overlay earlier
+      for (int idx = rayHistory.length - 1; idx >= 0; idx--) {
+        final rf = rayHistory[idx];
+        final t = (idx + 1) / (rayHistory.length + 1); // 0..1
+        final alphaScale = 0.08 + 0.42 * (1.0 - t);    // older ~0.08, newer ~0.50
+        _paintRays(canvas,
+          origin: rf.origin,
+          hits: rf.hits,
+          opacityScale: alphaScale,
+          hitDotRadius: 1.2,
+          lineWidthPad: 1.2,
+          lineWidthTerr: 0.9,
+          lineWidthWall: 0.8,
+        );
+      }
+    }
+
+    // Now draw the current frame bold
+    _paintRays(canvas,
+      origin: Offset(lander.pos.x, lander.pos.y),
+      hits: rays,
+      opacityScale: 1.0,
+      hitDotRadius: 1.7,
+      lineWidthPad: 1.6,
+      lineWidthTerr: 1.2,
+      lineWidthWall: 1.0,
+    );
+  }
+
+  void _paintRays(
+      Canvas canvas, {
+        required Offset origin,
+        required List<RayHit> hits,
+        required double opacityScale,
+        required double hitDotRadius,
+        required double lineWidthPad,
+        required double lineWidthTerr,
+        required double lineWidthWall,
+      }) {
+    if (hits.isEmpty) return;
 
     final wallPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1
-      ..color = Colors.blueAccent.withOpacity(0.55);
+      ..strokeWidth = lineWidthWall
+      ..color = Colors.blueAccent.withOpacity(0.55 * opacityScale);
 
     final terrPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.2
-      ..color = Colors.red.withOpacity(0.8);
+      ..strokeWidth = lineWidthTerr
+      ..color = Colors.red.withOpacity(0.80 * opacityScale);
 
     final padPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.6
-      ..color = Colors.greenAccent.withOpacity(0.95);
+      ..strokeWidth = lineWidthPad
+      ..color = Colors.greenAccent.withOpacity(0.95 * opacityScale);
 
-    for (final h in rays) {
+    for (final h in hits) {
       final end = Offset(h.p.x, h.p.y);
       switch (h.kind) {
         case RayHitKind.wall:
@@ -1433,20 +1530,77 @@ class GamePainter extends CustomPainter {
       }
       final dotPaint = Paint()
         ..color = (h.kind == RayHitKind.pad)
-            ? Colors.greenAccent
-            : (h.kind == RayHitKind.wall ? Colors.blueAccent : Colors.red);
-      canvas.drawCircle(end, 1.7, dotPaint);
+            ? Colors.greenAccent.withOpacity(0.95 * opacityScale)
+            : (h.kind == RayHitKind.wall
+            ? Colors.blueAccent.withOpacity(0.85 * opacityScale)
+            : Colors.red.withOpacity(0.85 * opacityScale));
+      canvas.drawCircle(end, hitDotRadius, dotPaint);
     }
   }
 
   List<_BFHit> _subsetHemisphere(List<_BFHit> all, {required bool forward}) =>
       all.where((h) => h.isForward == forward).toList(growable: false);
 
-  // ---------- AI Vision (body-aligned point cloud + caverns) ----------
+// ---------- AI Vision (ship-local) with world-aligned history ----------
+  void _paintAIVisionWithHistory(Canvas canvas, Size size) {
+    // Draw the current panel as before (uses current origin+angle)
+    _paintAIVision(canvas, size);
+
+    if (rayHistory.isEmpty) return;
+
+    // Draw history points reprojected from WORLD -> CURRENT ship-local
+    // (so they are world-aligned, not fwd-aligned per-capture).
+    for (int idx = rayHistory.length - 1; idx >= 0; idx--) {
+      final rf = rayHistory[idx];
+      final alpha = (0.08 + 0.42 * (1.0 - (idx + 1) / (rayHistory.length + 1))).clamp(0.05, 0.55);
+      _paintAIVisionGhostWorldAligned(canvas, rf, alpha: alpha);
+    }
+  }
+
+// Ghost overlay for a historical frame, but WORLD-aligned:
+// project historical world hits into the CURRENT ship-local panel.
+  void _paintAIVisionGhostWorldAligned(Canvas canvas, RayFrame rf, {required double alpha}) {
+    if (rf.hits.isEmpty) return;
+
+    // Panel is already translated+rotated in _paintAIVision, so here we
+    // use the SAME transform: translate to CURRENT origin and rotate by -CURRENT angle.
+    // Easiest way: just draw in that space directly by converting world -> current-local.
+    final currPos = Offset(lander.pos.x, lander.pos.y);
+    final c = math.cos(-lander.angle), s = math.sin(-lander.angle);
+
+    // Faint guides and colored dots
+    final guide = Paint()..color = Colors.white.withOpacity(0.25 * alpha);
+    final terrPt = Paint()..color = const Color(0xFFFF5050).withOpacity(0.70 * alpha);
+    final padPt  = Paint()..color = const Color(0xFF52E57D).withOpacity(0.80 * alpha);
+    final wallPt = Paint()..color = const Color(0xFF58A8FF).withOpacity(0.75 * alpha);
+
+    // We must mirror the panel transform here:
+    canvas.save();
+    canvas.translate(currPos.dx, currPos.dy);
+    canvas.rotate(-lander.angle);
+
+    for (final h in rf.hits) {
+      final dx = h.p.x - currPos.dx;
+      final dy = h.p.y - currPos.dy;
+      final lx = c * dx - s * dy;
+      final ly = s * dx + c * dy;
+      final pos = Offset(lx, ly);
+      canvas.drawCircle(pos, 1.5, guide);
+      final paint = switch (h.kind) {
+        RayHitKind.terrain => terrPt,
+        RayHitKind.pad     => padPt,
+        RayHitKind.wall    => wallPt,
+      };
+      canvas.drawCircle(pos, 2.8, paint);
+    }
+
+    canvas.restore();
+  }
+
+  // The original AI Vision panel for the CURRENT frame
   void _paintAIVision(Canvas canvas, Size size) {
     if (rays.isEmpty) return;
 
-    // Draw in ship-local frame: origin at the nose, forward = up (-y in screen).
     final center = Offset(lander.pos.x, lander.pos.y);
     canvas.save();
     canvas.translate(center.dx, center.dy);
@@ -1546,8 +1700,42 @@ class GamePainter extends CustomPainter {
     canvas.restore();
   }
 
+  // Ghost overlay for a historical AI Vision frame
+  void _paintAIVisionGhost(Canvas canvas, RayFrame rf, {required double alpha}) {
+    if (rf.hits.isEmpty) return;
+
+    canvas.save();
+    canvas.translate(rf.origin.dx, rf.origin.dy);
+    canvas.rotate(-rf.angle);
+
+    // No backdrop/grid for ghosts, just faint points/guide
+    final guide = Paint()..color = Colors.white.withOpacity(0.25 * alpha);
+
+    final terrPt = Paint()..color = const Color(0xFFFF5050).withOpacity(0.70 * alpha);
+    final padPt  = Paint()..color = const Color(0xFF52E57D).withOpacity(0.80 * alpha);
+    final wallPt = Paint()..color = const Color(0xFF58A8FF).withOpacity(0.75 * alpha);
+
+    final c = math.cos(-rf.angle), s = math.sin(-rf.angle);
+
+    for (final h in rf.hits) {
+      final dx = h.p.x - rf.origin.dx;
+      final dy = h.p.y - rf.origin.dy;
+      final lx = c * dx - s * dy;
+      final ly = s * dx + c * dy;
+      final pos = Offset(lx, ly);
+      canvas.drawCircle(pos, 1.5, guide);
+      final paint = switch (h.kind) {
+        RayHitKind.terrain => terrPt,
+        RayHitKind.pad     => padPt,
+        RayHitKind.wall    => wallPt,
+      };
+      canvas.drawCircle(pos, 2.8, paint);
+    }
+
+    canvas.restore();
+  }
+
   double _estimateFovRadians() {
-    // Match your ray fan: if RayConfig.rayCount covers ~180° in forward frame, use PI.
     return math.pi; // 180°
   }
 
@@ -1899,7 +2087,26 @@ class GamePainter extends CustomPainter {
         old.showForwardAxis != showForwardAxis ||
         !listEquals(old.planPts, planPts) ||
         !_listEqD(old.planWidths, planWidths) ||
-        !listEquals(old.caverns, caverns);
+        !listEquals(old.caverns, caverns) ||
+        !_rayHistEq(old.rayHistory, rayHistory);
+  }
+
+  bool _rayHistEq(List<RayFrame> a, List<RayFrame> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      final A = a[i], B = b[i];
+      if (A.origin != B.origin) return false;
+      if ((A.angle - B.angle).abs() > 1e-9) return false;
+      if (A.hits.length != B.hits.length) return false;
+      // Shallow compare endpoints; RayHit lacks == so compare coordinates/kind
+      for (int k = 0; k < A.hits.length; k++) {
+        final h1 = A.hits[k], h2 = B.hits[k];
+        if (h1.kind != h2.kind) return false;
+        if ((h1.p.x - h2.p.x).abs() > 1e-6 || (h1.p.y - h2.p.y).abs() > 1e-6) return false;
+      }
+    }
+    return true;
   }
 
   bool _listEqD(List<double>? a, List<double>? b) {
