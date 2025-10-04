@@ -584,7 +584,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       // --- Adaptive jump threshold based on observed contrast ---
       final base = _detector;
       final effJump = (_maxEdgeDrDth.isFinite && _maxEdgeDrDth > 0)
-          ? math.min(base.jumpThresh, math.max(100.0, 0.35 * _maxEdgeDrDth))
+          ? math.min(base.jumpThresh, math.max(60.0, 0.20 * _maxEdgeDrDth)) // was 0.35 & 100
           : base.jumpThresh;
 
       // Use a detector instance with the adapted jump (no other changes)
@@ -1643,30 +1643,25 @@ class GamePainter extends CustomPainter {
 
     // --- Draw cavern hypotheses (computed in state) ---
     for (final h in caverns) {
-      final r = h.depth.clamp(60.0, 800.0);
-      final rect = Rect.fromCircle(center: const Offset(0, 0), radius: r);
-      final startAng = -h.thetaEnd;   // canvas Y up is negative
-      final sweepAng = (h.thetaEnd - h.thetaStart);
-      final arc = Path()..addArc(rect, startAng, sweepAng);
+      // Heuristic radius from depth & angular width
+      final rDepth = h.depth * 0.30;
+      final rAng   = (h.widthAng * 0.5) * (h.depth);
+      final radius = (0.5 * rDepth + 0.5 * rAng).clamp(20.0, 320.0);
 
-      final col = Color.lerp(const Color(0xFF00E5FF), const Color(0xFFFF4081), (1.0 - h.score))!;
-      final alpha = (100 + (155 * h.score)).toInt().clamp(80, 255);
-      final edge = Paint()
+      final center = Offset(h.centroidLocal.x, h.centroidLocal.y);
+
+      final base = Color.lerp(const Color(0xFF00E5FF), const Color(0xFFFF4081), (1.0 - h.score))!;
+      final fill = Paint()
+        ..style = PaintingStyle.fill
+        ..color = base.withOpacity(0.18 + 0.35 * h.score); // better = more visible
+      final stroke = Paint()
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2.0
-        ..color = col.withAlpha(alpha);
+        ..color = base.withOpacity(0.55 + 0.35 * h.score);
 
-      canvas.drawPath(arc, edge);
-      canvas.drawCircle(Offset(h.centroidLocal.x, h.centroidLocal.y), 3.5, Paint()..color = edge.color);
-
-      final tp = TextPainter(
-        text: TextSpan(
-          text: 'cavern  ${(h.widthAng * 180 / math.pi).toStringAsFixed(1)}°  d=${h.depth.toStringAsFixed(0)}  s=${(100 * h.score).round()}',
-          style: const TextStyle(color: Color(0xFFE0F7FA), fontSize: 11),
-        ),
-        textDirection: TextDirection.ltr,
-      )..layout(maxWidth: 240);
-      tp.paint(canvas, Offset(h.centroidLocal.x, h.centroidLocal.y) + const Offset(8, -12));
+      canvas.drawCircle(center, radius, fill);
+      canvas.drawCircle(center, radius, stroke);
+      canvas.drawCircle(center, 3.5, Paint()..color = stroke.color); // centroid dot
     }
 
     // Draw all points: forward bright, back dim; plus small grey guide dot
