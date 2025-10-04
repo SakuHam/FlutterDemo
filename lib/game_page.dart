@@ -1635,11 +1635,8 @@ class GamePainter extends CustomPainter {
 
     // --- Draw cavern hypotheses (computed in state) ---
     for (final h in caverns) {
-      // Heuristic radius from depth & angular width
-      final rDepth = h.depth * 0.30;
-      final rAng   = (h.widthAng * 0.5) * (h.depth);
-      final radius = (0.5 * rDepth + 0.5 * rAng).clamp(20.0, 320.0);
-
+      final radius = h.depth * 0.30;
+      
       final center = Offset(h.centroidLocal.x, h.centroidLocal.y);
 
       final base = Color.lerp(const Color(0xFF00E5FF), const Color(0xFFFF4081), (1.0 - h.score))!;

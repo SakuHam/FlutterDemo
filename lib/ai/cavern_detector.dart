@@ -109,7 +109,7 @@ class CavernDetector {
           thetaStart: th0,
           thetaEnd: th1,
           widthAng: dth,
-          depth: depth,
+          depth: deltar,
           score: score,
           centroidLocal: et.Vector2(cx, cy),
         ));
