@@ -12,6 +12,7 @@ import 'package:path_provider/path_provider.dart';
 
 // Engine
 import 'ai/cavern_detector.dart';
+import 'ai/cavern_tracker.dart';
 import 'engine/types.dart' as et;
 import 'engine/game_engine.dart';
 import 'engine/raycast.dart';
@@ -150,6 +151,15 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   int _rayCount = 0;       // rays in AI Vision (all directions)
   double _maxEdgeDrDth = 0.0;
   List<CavernHypothesis> _caverns = const []; // computed once per frame
+
+  final CavernTracker _cavernTracker = CavernTracker(
+    // (optional) tweak defaults here
+    // matchRadius: 42,
+    // staleFramesToDrop: 180,
+    // minRayCrossingsPerFrame: 4,
+    // exploreCreditPerFrame: 3.0,
+    // exploreCreditNeeded: 45.0,
+  );
 
   // ===== NEW: ray history (fading trail) =====
   static const int _rayHistLen = 10;
@@ -341,6 +351,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _rayHistory[i] = null;
     }
     _rayHistHead = 0;
+    _cavernTracker.reset();
 
     _rebuildPF();
     setState(() {});
@@ -600,7 +611,14 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
       List<CavernHypothesis> hyps = adaptive.detect(rays: rays, lander: L);
 
-      _caverns = hyps;
+      _cavernTracker.update(
+        lander: engine.lander,
+        rays: engine.rays,
+        newHyps: hyps,
+      );
+
+      final cavernsToDraw = _cavernTracker.visibleForPainter(engine.lander);
+      _caverns = cavernsToDraw; //hyps;
       _cavernCount = hyps.length;
     } else {
       _caverns = const [];
@@ -1636,7 +1654,7 @@ class GamePainter extends CustomPainter {
     // --- Draw cavern hypotheses (computed in state) ---
     for (final h in caverns) {
       final radius = h.depth * 0.30;
-      
+
       final center = Offset(h.centroidLocal.x, h.centroidLocal.y);
 
       final base = Color.lerp(const Color(0xFF00E5FF), const Color(0xFFFF4081), (1.0 - h.score))!;
