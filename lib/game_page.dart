@@ -569,6 +569,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _maxEdgeDrDth = maxEdge;
 
       // --- Build forward/back subsets (for robust detection) ---
+      /*
       final fwd = <RayHit>[];
       final back = <RayHit>[];
       for (final h in rays) {
@@ -580,6 +581,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
           back.add(h);
         }
       }
+
+       */
 
       // --- Adaptive jump threshold based on observed contrast ---
       final base = _detector;
@@ -595,18 +598,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         minSpanSamples: base.minSpanSamples,
       );
 
-      // Try forward, then back, then soft fallback
-      List<CavernHypothesis> hyps = adaptive.detect(rays: fwd, lander: L);
-      if (hyps.isEmpty) hyps = adaptive.detect(rays: back, lander: L);
-      if (hyps.isEmpty) {
-        final soft = CavernDetector(
-          jumpThresh: 150.0,
-          voidBoost: 1.05,
-          minVoidSpanRad: math.pi / 64,
-          minSpanSamples: 2,
-        );
-        hyps = soft.detect(rays: rays, lander: L);
-      }
+      List<CavernHypothesis> hyps = adaptive.detect(rays: rays, lander: L);
 
       _caverns = hyps;
       _cavernCount = hyps.length;
