@@ -152,14 +152,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
   double _maxEdgeDrDth = 0.0;
   List<CavernHypothesis> _caverns = const []; // computed once per frame
 
-  final CavernTracker _cavernTracker = CavernTracker(
-    // (optional) tweak defaults here
-    // matchRadius: 42,
-    // staleFramesToDrop: 180,
-    // minRayCrossingsPerFrame: 4,
-    // exploreCreditPerFrame: 3.0,
-    // exploreCreditNeeded: 45.0,
-  );
+  late final CavernTracker _cavernTracker;
 
   // ===== NEW: ray history (fading trail) =====
   static const int _rayHistLen = 10;
@@ -299,6 +292,18 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         t: et.Tunables(),
       );
 
+      _cavernTracker = CavernTracker(
+        worldW: size.width,
+        worldH: size.height,
+        cellSize: 4.0, // tweak as you like
+        // (optional) tweak defaults here
+        // matchRadius: 42,
+        // staleFramesToDrop: 180,
+        // minRayCrossingsPerFrame: 4,
+        // exploreCreditPerFrame: 3.0,
+        // exploreCreditNeeded: 45.0,
+      );
+
       _engine = GameEngine(cfg);
       _engine!.rayCfg = RayConfig(
         rayCount: 180,
@@ -332,6 +337,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       tol: 1e-4,
     );
     _policy?.setPotentialField(_pf);
+
+    _cavernTracker.reset();
   }
 
   void _reset() {
@@ -351,7 +358,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _rayHistory[i] = null;
     }
     _rayHistHead = 0;
-    _cavernTracker.reset();
 
     _rebuildPF();
     setState(() {});
@@ -546,6 +552,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       if (p.life <= 0) _particles.removeAt(i);
     }
 
+    List<CavernHypothesis> hyps = const [];
     // ---- HUD & cavern detection (AI Vision only) ----
     if (_visMode == DebugVisMode.aiVision) {
       final rays = engine.rays;
@@ -609,13 +616,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
         minSpanSamples: base.minSpanSamples,
       );
 
-      List<CavernHypothesis> hyps = adaptive.detect(rays: rays, lander: L);
-
-      _cavernTracker.update(
-        lander: engine.lander,
-        rays: engine.rays,
-        newHyps: hyps,
-      );
+      hyps = adaptive.detect(rays: rays, lander: L);
 
       final cavernsToDraw = _cavernTracker.visibleForPainter(engine.lander);
       _caverns = cavernsToDraw; //hyps;
@@ -626,6 +627,12 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _rayCount = 0;
       _maxEdgeDrDth = 0.0;
     }
+
+    _cavernTracker.update(
+      lander: engine.lander,
+      rays: engine.rays,
+      newHyps: hyps,
+    );
 
     // ---- Capture ray history AFTER rays are updated this step ----
     _pushRayHistorySnapshot(engine);
@@ -936,6 +943,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                       planWidths: _planWidths,
                       caverns: _caverns, // NEW: pass computed caverns to painter
                       rayHistory: rayHistory, // NEW: fading trail data
+                      cavernTracker: _cavernTracker,
                     ),
                   ),
                 ),
@@ -1351,6 +1359,8 @@ class GamePainter extends CustomPainter {
   // NEW: ray history (newest->oldest, up to 10)
   final List<RayFrame> rayHistory;
 
+  final CavernTracker? cavernTracker;
+
   GamePainter({
     required this.lander,
     required this.terrain,
@@ -1367,12 +1377,14 @@ class GamePainter extends CustomPainter {
     required this.planWidths,
     required this.caverns,
     required this.rayHistory,
+    this.cavernTracker,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
     if (visMode != DebugVisMode.aiVision) {
       _paintStars(canvas, size);
+      cavernTracker?.paintSeenMask(canvas, seenColor: const Color(0x5539C5FF));
     }
 
     // Hide ground polygon in AI Vision mode
