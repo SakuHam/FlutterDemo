@@ -111,7 +111,11 @@ class PotentialField {
   /// - obstacle where (cell center) ∈ outer AND ∉ any hole
   /// - outer boundary → far-field Dirichlet (φ=1)
   /// - hard walls -> mark as obstacle (no-flux)
-  void rasterizeFromEnv(eng.GameEngine env, {double padInflateX = 0.0}) {
+  void rasterizeFromEnv(eng.GameEngine env, {double padInflateX = 0.0,
+    double? padX1Override,
+    double? padX2Override,
+    double? padYOverride,
+  }) {
     // Clear
     for (int k = 0; k < _mask.length; k++) {
       _mask[k] = 0;
@@ -143,9 +147,9 @@ class PotentialField {
     }
 
     // --- Pad as Dirichlet (φ=0) on the closest grid row(s) to padY ---
-    final padX1 = env.terrain.padX1.toDouble() - padInflateX;
-    final padX2 = env.terrain.padX2.toDouble() + padInflateX;
-    final padY_ = env.terrain.padY.toDouble();
+    final padX1 = (padX1Override ?? env.terrain.padX1.toDouble()) - padInflateX;
+    final padX2 = (padX2Override ?? env.terrain.padX2.toDouble()) + padInflateX;
+    final padY_ =  (padYOverride  ?? env.terrain.padY .toDouble());
 
     final jPad  = (padY_ / dy).round().clamp(0, ny - 1);
     final jPad2 = ((padY_ + 0.45 * dy) / dy).round().clamp(0, ny - 1);
@@ -365,16 +369,40 @@ PotentialField buildPotentialField(
       int iters = 1200,
       double omega = 1.7,
       double tol = 1e-4,
-
-      // NEW knobs
-      double sinkLiftPx = 40.0,  // how far above pad to put the sink
-      double sinkBandH  = 12.0,  // thickness of Dirichlet band (keep small)
-      double padInflateX = 0.0,  // still supported for pad widening if needed
+      double sinkLiftPx = 40.0,
+      double sinkBandH  = 12.0,
+      double padInflateX = 0.0,
     }) {
   final worldW = env.cfg.worldW.toDouble();
   final worldH = env.cfg.worldH.toDouble();
-  final padCx  = env.terrain.padCenter.toDouble();
-  final padY   = env.terrain.padY.toDouble();
+
+  // --- NEW: prefer pad extents from polygon edge tags
+  double padX1 = env.terrain.padX1.toDouble();
+  double padX2 = env.terrain.padX2.toDouble();
+  double padY  = env.terrain.padY.toDouble();
+
+  try {
+    final edges = env.terrain.poly.edges;
+    // Find the longest pad edge (or first if you only ever have one)
+    double bestLen = -1;
+    for (final e in edges) {
+      if (e.kind.name == 'pad' || e.kind == et.PolyEdgeKind.pad) {
+        final x1 = e.a.x.toDouble(), y1 = e.a.y.toDouble();
+        final x2 = e.b.x.toDouble(), y2 = e.b.y.toDouble();
+        final len = ((x2 - x1)*(x2 - x1) + (y2 - y1)*(y2 - y1)).abs();
+        if (len > bestLen) {
+          bestLen = len;
+          padX1 = math.min(x1, x2);
+          padX2 = math.max(x1, x2);
+          padY  = 0.5 * (y1 + y2);
+        }
+      }
+    }
+  } catch (_) {
+    // fall back silently to terrain.pad* if edges are unavailable
+  }
+
+  final padCx = 0.5 * (padX1 + padX2);
 
   final pf = PotentialField(
     nx: nx,
@@ -385,18 +413,21 @@ PotentialField buildPotentialField(
     tol: tol,
     omega: omega,
 
-    // refs
     padCx: padCx,
     padY: padY,
     worldDiag: math.sqrt(worldW * worldW + worldH * worldH),
 
-    // lifted sink params
     sinkLiftPx: sinkLiftPx,
     sinkBandH : sinkBandH,
     sinkY     : (padY - sinkLiftPx).clamp(0.0, worldH - 1.0),
   );
 
-  pf.rasterizeFromEnv(env, padInflateX: padInflateX);
+  // tiny inflation helps cover rounding gaps after retagging
+  pf.rasterizeFromEnv(env, padInflateX: padInflateX > 0 ? padInflateX : 1.0,
+    padX1Override: padX1,
+    padX2Override: padX2,
+    padYOverride:  padY,
+  );
   pf.solve();
   return pf;
 }

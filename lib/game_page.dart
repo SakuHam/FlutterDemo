@@ -154,6 +154,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
   late final CavernTracker _cavernTracker;
 
+  Offset? _lastCarvePos; // world coords of the most recent carve point
+
   // ===== NEW: ray history (fading trail) =====
   static const int _rayHistLen = 10;
   final List<RayFrame?> _rayHistory = List<RayFrame?>.filled(_rayHistLen, null, growable: false);
@@ -337,8 +339,6 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       tol: 1e-4,
     );
     _policy?.setPotentialField(_pf);
-
-    _cavernTracker.reset();
   }
 
   void _reset() {
@@ -358,6 +358,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
       _rayHistory[i] = null;
     }
     _rayHistHead = 0;
+
+    _cavernTracker.reset();
 
     _rebuildPF();
     setState(() {});
@@ -713,6 +715,8 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
     if (!_carveMode) return;
     final e = _engine;
     if (e == null) return;
+
+    _lastCarvePos = p;
     final carved = TerrainCarver.carveCircle(
       terrain: e.terrain,
       cx: p.dx,
@@ -896,6 +900,56 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 
   bool get _canReload => _livePath != null && File(_livePath!).existsSync();
 
+  void _movePadToLastCarveAndRefresh() {
+    final e = _engine;
+    final p = _lastCarvePos;
+    if (e == null || p == null) return;
+
+    final cx = p.dx.clamp(0.0, e.cfg.worldW - 1.0);
+    final yGround = p.dy; //e.terrain.heightAt(cx);
+    final padW = () {
+      try {
+        final w = (e.terrain as dynamic).padWidth;
+        if (w is num) return w.toDouble();
+      } catch (_) {}
+      try {
+        final hw = (e.terrain as dynamic).padHalfWidth;
+        if (hw is num) return (2.0 * hw).toDouble();
+      } catch (_) {}
+      return 80.0;
+    }();
+
+    // First try: simple retag near the carve point
+    final before = e.terrain;
+    e.terrain = TerrainCarver.retagPadToNearestFlatEdge(
+      terrain: e.terrain,
+      cx: cx,
+      y: yGround,
+      targetWidth: padW,
+    );
+
+    // If retag didn't move (no suitable edge), DIG a shelf and retag again
+    final retagDidNothing = identical(e.terrain, before); // or detect via your own equality/hash
+    if (retagDidNothing) {
+      e.terrain = TerrainCarver.digRectShelfAndRetagPad(
+        terrain: e.terrain,
+        cx: cx,
+        y: yGround,
+        padWidth: padW,
+        padThickness: 18,
+        insetBelow: 10,
+      );
+    }
+
+    // Rebuild dependent structures
+    _rebuildPF();
+    _policy?.setPotentialField(_pf);
+    _policy?.resetPlanner();
+
+    setState(() {});
+    _toast('Pad moved near (${cx.toStringAsFixed(0)}, ${yGround.toStringAsFixed(0)})');
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -914,15 +968,15 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                   behavior: HitTestBehavior.opaque,
                   onTapDown: (d) => _carveAt(d.localPosition),
                   onTapUp: (_) {
-                    if (_terrainDirty) { _rebuildPF(); _terrainDirty = false; }
+                    if (_terrainDirty) { _movePadToLastCarveAndRefresh(); _terrainDirty = false; }
                   },
                   onPanStart: (d) => _carveAt(d.localPosition),
                   onPanUpdate: (d) => _carveAt(d.localPosition),
                   onPanEnd: (_) {
-                    if (_terrainDirty) { _rebuildPF(); _terrainDirty = false; }
+                    if (_terrainDirty) { _movePadToLastCarveAndRefresh(); _terrainDirty = false; }
                   },
                   onPanCancel: () {
-                    if (_terrainDirty) { _rebuildPF(); _terrainDirty = false; }
+                    if (_terrainDirty) { _movePadToLastCarveAndRefresh(); _terrainDirty = false; }
                   },
                   child: CustomPaint(
                     painter: GamePainter(
@@ -1038,6 +1092,7 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                                 ),
                               ),
                             ),
+                          /*
                           const SizedBox(width: 8),
                           Tooltip(
                             message: 'Live training iterations',
@@ -1067,13 +1122,18 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                               ),
                             ),
                           ),
+
+                           */
                         ],
                       ),
 
+                      /*
                       const SizedBox(height: 8),
 
                       // Live training HUD panel
                       _ProgressPanel(model: _progress),
+
+                       */
 
                       const SizedBox(height: 8),
 
@@ -1391,6 +1451,7 @@ class GamePainter extends CustomPainter {
     if (visMode != DebugVisMode.aiVision) {
       _paintTerrainPoly(canvas, size);
       _paintEdgesOverlay(canvas);
+      _paintPadMarker(canvas, terrain);
     }
 
     // Overlays
@@ -1451,6 +1512,13 @@ class GamePainter extends CustomPainter {
 
     final ground = Paint()..color = const Color(0xFFD8D8D8);
     canvas.drawPath(path, ground);
+  }
+
+  void _paintPadMarker(Canvas canvas, et.Terrain terr) {
+    final x = terr.padCenter.toDouble();
+    final y = terr.heightAt(x);
+    final p = Paint()..color = Colors.yellowAccent..style = PaintingStyle.fill;
+    canvas.drawCircle(Offset(x, y), 5, p);
   }
 
   void _paintEdgesOverlay(Canvas canvas) {

@@ -370,8 +370,8 @@ enum PolyEdgeKind { terrain, pad }
 class PolyEdge {
   final Vector2 a;
   final Vector2 b;
-  final PolyEdgeKind kind;
-  const PolyEdge(this.a, this.b, this.kind);
+  PolyEdgeKind kind;
+  PolyEdge(this.a, this.b, this.kind);
 }
 
 class PolyShape {
